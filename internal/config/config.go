@@ -74,11 +74,13 @@ func ResolveProjectPath(path string) (string, string, error) {
 		return "", "", err
 	}
 	if info.IsDir() {
-		configPath := filepath.Join(path, "config.yaml")
-		if _, err := os.Stat(configPath); err != nil {
-			return "", "", fmt.Errorf("find config.yaml in %s: %w", path, err)
+		for _, name := range []string{"config.yaml", "config.yml"} {
+			configPath := filepath.Join(path, name)
+			if _, err := os.Stat(configPath); err == nil {
+				return path, configPath, nil
+			}
 		}
-		return path, configPath, nil
+		return "", "", fmt.Errorf("find config.yaml or config.yml in %s", path)
 	}
 	return filepath.Dir(path), path, nil
 }

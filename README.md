@@ -28,7 +28,7 @@ go install .
 The CLI provides an interactive workflow or config based.
 
 ### 1. `codegen`
-Validates the project's `config.yaml` and generates the SQL schema, SQL views, and Go event structs.
+Validates the project's `config.yaml` or `config.yml` and generates the SQL schema, SQL views, and Go event structs.
 
 ```bash
 go run . codegen examples/uniswap
@@ -95,3 +95,11 @@ chains:
   - `database/`: ClickHouse client wrapper and stateful batched inserter.
   - `ingestion/`: Core indexing loop and checkpoint management.
   - `parser/`: Event decoders, JSONL parsers, and zero-reflection `abiunpack`.
+
+### `init` from scratch
+Scaffold a new project from a local ABI file.
+
+```bash
+go run . init contract-import local --abi erc20.json --name USDC --address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+```
+This automatically generates a `config.yaml` with the configured events.
