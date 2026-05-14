@@ -1,0 +1,27 @@
+name: polymarket
+ecosystem: evm
+chains:
+  - id: 137  # Polygon mainnet
+    start_block: 78000000
+    contracts:
+      - name: ConditionalTokens
+        address: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        events:
+          - event: ConditionPreparation(bytes32 indexed conditionId, address indexed oracle, bytes32 indexed questionId, uint256 outcomeSlotCount)
+          - event: ConditionResolution(bytes32 indexed conditionId, address indexed oracle, bytes32 indexed questionId, uint256 payoutDenominator, uint256[] payoutNumerators)
+          - event: PositionSplit(address indexed stakeholder, address collateralToken, bytes32 indexed parentCollectionId, bytes32 indexed conditionId, uint256[] partition, uint256 amount)
+          - event: PositionsMerge(address indexed stakeholder, address collateralToken, bytes32 indexed parentCollectionId, bytes32 indexed conditionId, uint256[] partition, uint256 amount)
+          - event: PayoutRedemption(address indexed redeemer, address indexed collateralToken, bytes32 indexed parentCollectionId, bytes32 conditionId, uint256[] indexSets, uint256 payout)
+      - name: Exchange
+        address: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+        events:
+          - event: OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)
+      - name: NegRiskAdapter
+        address: "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+        events:
+          - event: MarketPrepared(bytes32 indexed marketId, address indexed creator, uint256 feeBips, bytes data)
+          - event: QuestionPrepared(bytes32 indexed marketId, bytes32 indexed questionId, uint256 index, bytes data)
+          - event: PositionSplit(address indexed stakeholder, bytes32 indexed conditionId, uint256 amount)
+          - event: PositionsMerge(address indexed stakeholder, bytes32 indexed conditionId, uint256 amount)
+          - event: PositionsConverted(address indexed stakeholder, bytes32 indexed marketId, uint256 indexed indexSet, uint256 amount)
+          - event: PayoutRedemption(address indexed redeemer, bytes32 indexed conditionId, uint256[] amounts, uint256 payout)
