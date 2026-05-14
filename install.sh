@@ -18,8 +18,8 @@ GO_VERSION=$(go version | awk '{print $3}')
 echo "Found $GO_VERSION"
 
 # We use go install to download and build the binary
-echo "Running: go install github.com/franz101/sqd-go@latest"
-if ! go install github.com/franz101/sqd-go@latest; then
+echo "Running: GOPROXY=direct go install github.com/franz101/sqd-go@latest"
+if ! GOPROXY=direct go install github.com/franz101/sqd-go@latest; then
     echo "Fallback: cloning repository to build from source..."
     TMP_DIR=$(mktemp -d)
     git clone https://github.com/franz101/sqd-go.git "$TMP_DIR"
