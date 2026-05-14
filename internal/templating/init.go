@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/franz101/sqd-go-v2/internal/config"
+	"github.com/franz101/sqd-go/internal/config"
 	"gopkg.in/yaml.v3"
 )
 

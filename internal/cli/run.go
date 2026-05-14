@@ -14,10 +14,10 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/franz101/sqd-go-v2/internal/codegen"
-	"github.com/franz101/sqd-go-v2/internal/config"
-	"github.com/franz101/sqd-go-v2/internal/database"
-	"github.com/franz101/sqd-go-v2/internal/ingestion"
+	"github.com/franz101/sqd-go/internal/codegen"
+	"github.com/franz101/sqd-go/internal/config"
+	"github.com/franz101/sqd-go/internal/database"
+	"github.com/franz101/sqd-go/internal/ingestion"
 	"gopkg.in/yaml.v3"
 )
 

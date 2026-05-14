@@ -1,4 +1,4 @@
-# sqd-go-v2
+# sqd-go
 
 A high-performance EVM log indexer written in Go.
 
@@ -8,7 +8,7 @@ A high-performance EVM log indexer written in Go.
 The easiest way to install the CLI is using the installation script:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/franz101/sqd-go-v2/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/franz101/sqd-go/main/install.sh | bash
 ```
 *Note: Go is required to run the CLI and generate/compile the project code.*
 Install go from https://go.dev/dl/

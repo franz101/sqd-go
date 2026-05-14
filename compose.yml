@@ -1,4 +1,4 @@
-name: sqg-go
+name: sqd-go
 
 services:
   clickhouse:

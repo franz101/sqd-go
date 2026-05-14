@@ -2,7 +2,7 @@ BUILD_DIR := tmp
 
 .PHONY: dev-build build codegen-uniswap start-uniswap dev-uniswap restart-uniswap db-reset stop
 
-CLICKHOUSE_CONTAINER ?= sqd-go-v2-clickhouse-1
+CLICKHOUSE_CONTAINER ?= sqd-go-clickhouse-1
 CLICKHOUSE_PASSWORD ?= sqd-clickhouse
 CLICKHOUSE_DATABASE ?= case_1_lbtc_event_only
 
@@ -12,7 +12,7 @@ dev-build:
 
 build:
 	mkdir -p $(BUILD_DIR)
-	go build -o $(BUILD_DIR)/sqd-go-v2 .
+	go build -o $(BUILD_DIR)/sqd-go .
 
 # Uniswap example
 UNISWAP_DIR := examples/uniswap

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/franz101/sqd-go-v2/internal/config"
+	"github.com/franz101/sqd-go/internal/config"
 )
 
 func TestBuildEventDecoderKeepsContractFiltersSeparate(t *testing.T) {

@@ -11,10 +11,10 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/franz101/sqd-go-v2/internal/client"
-	"github.com/franz101/sqd-go-v2/internal/config"
-	"github.com/franz101/sqd-go-v2/internal/database"
-	"github.com/franz101/sqd-go-v2/internal/parser"
+	"github.com/franz101/sqd-go/internal/client"
+	"github.com/franz101/sqd-go/internal/config"
+	"github.com/franz101/sqd-go/internal/database"
+	"github.com/franz101/sqd-go/internal/parser"
 )
 
 type Options struct {

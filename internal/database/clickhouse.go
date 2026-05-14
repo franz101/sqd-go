@@ -12,7 +12,7 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/franz101/sqd-go-v2/internal/parser"
+	"github.com/franz101/sqd-go/internal/parser"
 	"github.com/holiman/uint256"
 )
 

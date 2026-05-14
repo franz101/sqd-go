@@ -1,10 +1,13 @@
-module github.com/franz101/sqd-go-v2
+module github.com/franz101/sqd-go
 
-go 1.24.4
+go 1.24.1
+
+toolchain go1.24.4
 
 require (
 	github.com/ClickHouse/ch-go v0.71.0
 	github.com/ethereum/go-ethereum v1.17.3
+	github.com/holiman/uint256 v1.3.2
 	github.com/klauspost/compress v1.18.6
 	github.com/valyala/fastjson v1.6.10
 	gopkg.in/yaml.v3 v3.0.1
@@ -21,7 +24,6 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-version v1.8.0 // indirect
-	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/pascaldekloe/name v1.0.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect

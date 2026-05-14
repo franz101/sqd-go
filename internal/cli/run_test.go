@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/franz101/sqd-go-v2/internal/config"
+	"github.com/franz101/sqd-go/internal/config"
 )
 
 const erc20ABI = `[
