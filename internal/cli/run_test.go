@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/franz101/sqd-go/internal/config"
@@ -120,8 +122,81 @@ func TestRunInitContractImportWritesConfig(t *testing.T) {
 	if !reflect.DeepEqual(gotEvents, wantEvents) {
 		t.Fatalf("events = %#v, want %#v", gotEvents, wantEvents)
 	}
+	for _, path := range []string{
+		filepath.Join(projectDir, ".env"),
+		filepath.Join(projectDir, "compose.yml"),
+		filepath.Join(projectDir, "abis", "erc20.json"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected scaffold file %s: %v", path, err)
+		}
+	}
 
 	if code := runInitContractImport(&parsedArgs{initSource: "local", initABI: abiPath, initName: "USDC", project: projectDir}); code != 1 {
 		t.Fatalf("second run exit = %d, want 1 for existing config", code)
+	}
+}
+
+func TestPromptInteractiveInitTemplate(t *testing.T) {
+	projectDir := filepath.Join(t.TempDir(), "demo")
+	input := strings.NewReader(projectDir + "\n2\n")
+	var out bytes.Buffer
+
+	req, err := promptInteractiveInit(input, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.ProjectDir != projectDir {
+		t.Fatalf("project dir = %q", req.ProjectDir)
+	}
+	if req.ProjectName != "demo" {
+		t.Fatalf("project name = %q", req.ProjectName)
+	}
+	if req.Option != initOptionERC20Template {
+		t.Fatalf("option = %d, want template", req.Option)
+	}
+	if !strings.Contains(out.String(), "Blockchain ecosystem: EVM") {
+		t.Fatalf("prompt output missing EVM ecosystem: %s", out.String())
+	}
+}
+
+func TestRunInitTemplateWritesProject(t *testing.T) {
+	projectDir := filepath.Join(t.TempDir(), "erc20-demo")
+	code := runInitTemplate(&parsedArgs{
+		initSource:   "erc20",
+		project:      projectDir,
+		initChainID:  "polygon",
+		initStartBlk: "123",
+	})
+	if code != 0 {
+		t.Fatalf("runInitTemplate exit = %d", code)
+	}
+
+	project, err := config.LoadProject(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := project.Config
+	if cfg.Name != "erc20-demo" {
+		t.Fatalf("name = %q", cfg.Name)
+	}
+	if got := cfg.Chains[0].ID; got != 137 {
+		t.Fatalf("chain id = %d", got)
+	}
+	if got := cfg.Chains[0].StartBlock; got != 123 {
+		t.Fatalf("start block = %d", got)
+	}
+	if got := len(cfg.Chains[0].Contracts[0].Events); got != 2 {
+		t.Fatalf("events = %d, want 2", got)
+	}
+	env, err := os.ReadFile(filepath.Join(projectDir, ".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(env), "CLICKHOUSE_NATIVE_PORT=9000") {
+		t.Fatalf(".env missing native port: %s", string(env))
+	}
+	if _, err := os.Stat(filepath.Join(projectDir, "compose.yml")); err != nil {
+		t.Fatalf("compose.yml missing: %v", err)
 	}
 }

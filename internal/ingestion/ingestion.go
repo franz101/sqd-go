@@ -308,7 +308,6 @@ func processChain(ctx context.Context, store *database.Store, chain *config.Chai
 			totalEvents += uint64(len(decodedEvents))
 		}
 
-
 		scanned := uint64(0)
 		if lastProcessed >= requestStartBlock {
 			scanned = lastProcessed - requestStartBlock + 1
@@ -330,7 +329,6 @@ func processChain(ctx context.Context, store *database.Store, chain *config.Chai
 			break
 		}
 	}
-
 
 	printProfile(profFetch, profParse, profDecode, profMarshal, profInsert, profIters, totalBlocks, totalEvents, startTime)
 	return nil
@@ -527,26 +525,12 @@ func splitEventArgs(args string) []string {
 	return out
 }
 
-func configAddresses(addr any) []string {
-	switch v := addr.(type) {
-	case string:
-		if strings.TrimSpace(v) == "" {
-			return nil
-		}
-		return []string{v}
-	case []any:
-		out := make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
-				out = append(out, s)
-			}
-		}
-		return out
-	case []string:
-		return v
-	default:
+func configAddresses(addr config.Address) []string {
+	// TODO check for pure string case and validate address length
+	if len(addr) == 0 {
 		return nil
 	}
+	return addr
 }
 
 func uniqueLower(used map[string]int, base string) string {

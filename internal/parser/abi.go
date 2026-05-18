@@ -261,21 +261,15 @@ func normalizeSolidityType(typ string) string {
 	}
 }
 
-func flattenAddresses(addr any) []string {
-	switch v := addr.(type) {
-	case string:
-		return []string{strings.ToLower(v)}
-	case []any:
-		var out []string
-		for _, a := range v {
-			if s, ok := a.(string); ok {
-				out = append(out, strings.ToLower(s))
-			}
-		}
-		return out
-	default:
+func flattenAddresses(addr config.Address) []string {
+	if len(addr) == 0 {
 		return nil
 	}
+	out := make([]string, len(addr))
+	for i, v := range addr {
+		out[i] = strings.ToLower(v)
+	}
+	return out
 }
 
 func normalizeParamValue(v any) any {

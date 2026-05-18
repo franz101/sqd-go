@@ -4,6 +4,10 @@ set -e
 
 echo "Installing sqd-go..."
 
+GO_PACKAGE="github.com/franz101/sqd-go"
+REPO_URL="https://github.com/franz101/sqd-go.git"
+BINARY_NAME="sqd-go"
+
 # Check if Go is installed
 if ! command -v go &> /dev/null; then
     echo "ERROR: 'go' could not be found."
@@ -17,23 +21,28 @@ fi
 GO_VERSION=$(go version | awk '{print $3}')
 echo "Found $GO_VERSION"
 
-# We use go install to download and build the binary
-echo "Running: GOPROXY=direct go install github.com/franz101/sqd-go@latest"
-if ! GOPROXY=direct go install github.com/franz101/sqd-go@latest; then
-    echo "Fallback: cloning repository to build from source..."
-    TMP_DIR=$(mktemp -d)
-    git clone https://github.com/franz101/sqd-go.git "$TMP_DIR"
-    cd "$TMP_DIR"
-    go install .
-    cd - > /dev/null
-    rm -rf "$TMP_DIR"
-fi
-
-# Determine GOPATH/bin
+# Determine GOPATH/bin before installing so every path installs the same binary name
 GOPATH=$(go env GOPATH)
 GOBIN=$(go env GOBIN)
 if [ -z "$GOBIN" ]; then
     GOBIN="$GOPATH/bin"
+fi
+mkdir -p "$GOBIN"
+
+# We use go install to download and build the binary
+echo "Running: GOPROXY=direct go install ${GO_PACKAGE}@latest"
+if ! GOPROXY=direct GOBIN="$GOBIN" go install "${GO_PACKAGE}@latest"; then
+    echo "Fallback: cloning repository to build from source..."
+    TMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TMP_DIR"' EXIT
+    git clone "$REPO_URL" "$TMP_DIR"
+    (
+        cd "$TMP_DIR"
+        echo "Running: go build -o ${GOBIN}/${BINARY_NAME} ."
+        go build -o "${GOBIN}/${BINARY_NAME}" .
+    )
+    rm -rf "$TMP_DIR"
+    trap - EXIT
 fi
 
 echo ""

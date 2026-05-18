@@ -40,8 +40,24 @@ type Chain struct {
 
 type ChainContractConfig struct {
 	Name    string        `yaml:"name" json:"name"`
-	Address any           `yaml:"address,omitempty" json:"address,omitempty"`
+	Address Address       `yaml:"address,omitempty" json:"address,omitempty"`
 	Events  []EventConfig `yaml:"events,omitempty" json:"events,omitempty"`
+}
+
+type Address []string
+
+func (a *Address) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err == nil {
+		*a = []string{s}
+		return nil
+	}
+	var slice []string
+	if err := value.Decode(&slice); err == nil {
+		*a = slice
+		return nil
+	}
+	return fmt.Errorf("line %d: address must be a string or a list of strings", value.Line)
 }
 
 type Project struct {
@@ -91,7 +107,10 @@ func LoadFile(path string) (*Config, error) {
 		return nil, err
 	}
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	// strict validation
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
