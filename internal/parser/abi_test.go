@@ -11,14 +11,14 @@ func TestBuildEventDecoderKeepsContractFiltersSeparate(t *testing.T) {
 	decoders, filters, err := BuildEventDecoder([]config.ChainContractConfig{
 		{
 			Name:    "TokenA",
-			Address: "0x0000000000000000000000000000000000000001",
+			Address: config.Address{"0x0000000000000000000000000000000000000001"},
 			Events: []config.EventConfig{{
 				Event: "Transfer(address indexed from, address indexed to, uint256 value)",
 			}},
 		},
 		{
 			Name:    "TokenB",
-			Address: "0x0000000000000000000000000000000000000002",
+			Address: config.Address{"0x0000000000000000000000000000000000000002"},
 			Events: []config.EventConfig{{
 				Event: "Approval(address indexed owner, address indexed spender, uint256 value)",
 			}},

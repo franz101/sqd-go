@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/franz101/sqd-go/internal/client"
 )
 
 func TestNextRequestRangeCursorOmitsToBlockWithLocalEnd(t *testing.T) {
@@ -65,5 +67,28 @@ func TestShouldWaitForEmptyCursorResponseWithEndBlock(t *testing.T) {
 
 	if shouldWaitForEmptyCursorResponse(&end) {
 		t.Fatal("empty cursor response with end block should stop")
+	}
+}
+
+func TestEmptyCursorCheckpointUsesFinalizedHead(t *testing.T) {
+	checkpoint, ok := emptyCursorCheckpoint(10, client.Head{
+		Finalized: &client.BlockRef{Number: 12, Hash: "0x12"},
+	})
+
+	if !ok {
+		t.Fatal("checkpoint should be available")
+	}
+	if checkpoint != 12 {
+		t.Fatalf("checkpoint = %d, want 12", checkpoint)
+	}
+}
+
+func TestEmptyCursorCheckpointIgnoresFinalizedHeadBeforeCurrentBlock(t *testing.T) {
+	checkpoint, ok := emptyCursorCheckpoint(10, client.Head{
+		Finalized: &client.BlockRef{Number: 9, Hash: "0x9"},
+	})
+
+	if ok {
+		t.Fatalf("checkpoint = %d, want no checkpoint", checkpoint)
 	}
 }

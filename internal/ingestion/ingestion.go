@@ -147,13 +147,14 @@ func processChain(ctx context.Context, store *database.Store, chain *config.Chai
 		}
 
 		fetchStart := time.Now()
-		raw, err := sqd.FetchRaw(ctx, currentBlock, toBlockPtr, filters)
+		response, err := sqd.Fetch(ctx, currentBlock, toBlockPtr, filters)
 		profFetch += time.Since(fetchStart)
 		if err != nil {
 			log.Printf("Chain %d: fetch %s error: %v", chain.ID, rangeLabel, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		raw := response.Raw
 
 		var decodedEvents []parser.DecodedEvent
 		responseBlockCount := uint64(0)
@@ -170,6 +171,18 @@ func processChain(ctx context.Context, store *database.Store, chain *config.Chai
 					}
 					log.Printf("Chain %d: empty response %s, reached end block %d, stopping", chain.ID, rangeLabel, endBlock)
 					break
+				}
+				if checkpoint, ok := emptyCursorCheckpoint(currentBlock, response.Head); ok {
+					if err := store.UpdateSyncState(ctx, chain.ID, checkpoint); err != nil {
+						return fmt.Errorf("update sync state %d: %w", checkpoint, err)
+					}
+					scanned := checkpoint - requestStartBlock + 1
+					totalBlocks += scanned
+					elapsed := time.Since(startTime)
+					rate := float64(totalBlocks) / elapsed.Seconds()
+					log.Printf("Chain %d: empty response %s, finalized head: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
+						chain.ID, rangeLabel, checkpoint, checkpoint, totalBlocks, totalEvents, rate)
+					currentBlock = checkpoint + 1
 				}
 				log.Printf("Chain %d: empty response %s, waiting for new blocks...", chain.ID, rangeLabel)
 				if err := waitForNextCursorPoll(ctx, cursorPollInterval); err != nil {
@@ -383,6 +396,13 @@ func waitForNextCursorPoll(ctx context.Context, interval time.Duration) error {
 
 func shouldWaitForEmptyCursorResponse(effectiveEndBlock *uint64) bool {
 	return effectiveEndBlock == nil
+}
+
+func emptyCursorCheckpoint(currentBlock uint64, head client.Head) (uint64, bool) {
+	if head.Finalized == nil || head.Finalized.Number < currentBlock {
+		return 0, false
+	}
+	return head.Finalized.Number, true
 }
 
 func max(a, b uint64) uint64 {

@@ -583,7 +583,13 @@ func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error
 	if len(topics) == 0 {
 		return nil, nil
 	}
-	logAddress := common.HexToAddress(address)
+`)
+	if dispatcherUsesAddress(events) {
+		b.WriteString("\tlogAddress := common.HexToAddress(address)\n")
+	} else {
+		b.WriteString("\t_ = address\n")
+	}
+	b.WriteString(`
 	topic0 := common.HexToHash(topics[0])
 `)
 	for i, ev := range events {
@@ -608,6 +614,15 @@ func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error
 	for _, ev := range events {
 		renderEventUnpackFunction(b, ev)
 	}
+}
+
+func dispatcherUsesAddress(events []eventSpec) bool {
+	for _, ev := range events {
+		if len(ev.ContractAddress) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func addressMatchExpr(eventIdx, addrCount int) string {
@@ -923,6 +938,14 @@ func bytesNSize(solType string) int {
 
 func addresses(addr any) []string {
 	switch v := addr.(type) {
+	case config.Address:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
 	case string:
 		if strings.TrimSpace(v) == "" {
 			return nil

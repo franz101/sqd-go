@@ -61,6 +61,9 @@ chains:
 	assertContains(t, goCode, "From  common.Address `json:\"from\"`")
 	assertContains(t, goCode, "Value uint256.Int    `json:\"value\"`")
 	assertContains(t, goCode, "func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error)")
+	assertContains(t, goCode, "var _addr0_0 = common.HexToAddress(\"0x8236a87084f8B84306f72007F36F2618A5634494\")")
+	assertContains(t, goCode, "logAddress := common.HexToAddress(address)")
+	assertContains(t, goCode, "topic0 == _topic0 && (logAddress == _addr0_0)")
 	assertContains(t, goCode, "func UnpackLBTCTransferLog(topics []string, data []byte) (*LBTCTransfer, error)")
 
 	inserter := readText(t, filepath.Join(root, "generated", "inserter.go"))
@@ -74,6 +77,31 @@ chains:
 	assertContains(t, processor, "type AddressPosition struct")
 	assertContains(t, processor, "func CustomProcessing(ctx context.Context, store Store, entities *Entities) error")
 	assertContains(t, processor, "func (s *MemoryState) SyncToClickHouse")
+}
+
+func TestGenerateOmitsLogAddressWhenNoContractAddressFilter(t *testing.T) {
+	root := t.TempDir()
+	configYAML := []byte(`name: no_address_filter
+chains:
+  - id: 1
+    start_block: 0
+    contracts:
+      - name: AnyTransfer
+        events:
+          - event: Transfer(address indexed from, address indexed to, uint256 value)
+`)
+	if err := os.WriteFile(filepath.Join(root, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Generate(root); err != nil {
+		t.Fatal(err)
+	}
+
+	goCode := readText(t, filepath.Join(root, "generated", "events.go"))
+
+	assertContains(t, goCode, "_ = address")
+	assertContains(t, goCode, "topic0 == _topic0 && true")
+	assertNotContains(t, goCode, "logAddress := common.HexToAddress(address)")
 }
 
 func readJSON(t *testing.T, path string, out any) {
@@ -100,5 +128,12 @@ func assertContains(t *testing.T, got, want string) {
 	t.Helper()
 	if !strings.Contains(got, want) {
 		t.Fatalf("expected output to contain %q\n\n%s", want, got)
+	}
+}
+
+func assertNotContains(t *testing.T, got, want string) {
+	t.Helper()
+	if strings.Contains(got, want) {
+		t.Fatalf("expected output not to contain %q\n\n%s", want, got)
 	}
 }
