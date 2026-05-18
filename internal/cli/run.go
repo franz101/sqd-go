@@ -14,13 +14,14 @@ import (
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-func runDev(path string, restart bool) int {
+func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr string) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return 1
 	}
+	applyOverrides(project.Config, startBlockStr, endBlockStr, chainIDStr)
 	loadEnv(filepath.Join(project.Root, ".env"))
 	outPath, err := codegen.GenerateProject(project)
 	if err != nil {
@@ -49,15 +50,16 @@ func runDev(path string, restart bool) int {
 		}()
 	}
 
-	return runStartPipeline(path, restart)
+	return runStartPipelineInternal(project, path, restart, outPath)
 }
 
-func runStartPipeline(path string, restart bool) int {
+func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, chainIDStr string) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return 1
 	}
+	applyOverrides(project.Config, startBlockStr, endBlockStr, chainIDStr)
 	loadEnv(filepath.Join(project.Root, ".env"))
 	outPath, err := codegen.GenerateProject(project)
 	if err != nil {
@@ -66,6 +68,43 @@ func runStartPipeline(path string, restart bool) int {
 	}
 	log.Printf("codegen: %s", outPath)
 
+	return runStartPipelineInternal(project, path, restart, outPath)
+}
+
+func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr string) {
+	if chainIDStr != "" {
+		id, err := chainIDFromName(chainIDStr)
+		if err == nil {
+			for i := range cfg.Chains {
+				cfg.Chains[i].ID = id
+			}
+		}
+	}
+	if startBlockStr != "" {
+		start, err := parseUintFlag("--start-block", startBlockStr, 0)
+		if err == nil {
+			for i := range cfg.Chains {
+				cfg.Chains[i].StartBlock = start
+			}
+		}
+	}
+	if endBlockStr != "" {
+		end, err := parseUintFlag("--end-block", endBlockStr, 0)
+		if err == nil {
+			if end == 0 {
+				for i := range cfg.Chains {
+					cfg.Chains[i].EndBlock = nil
+				}
+			} else {
+				for i := range cfg.Chains {
+					cfg.Chains[i].EndBlock = &end
+				}
+			}
+		}
+	}
+}
+
+func runStartPipelineInternal(project *config.Project, path string, restart bool, outPath string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -88,6 +127,7 @@ func runStartPipeline(path string, restart bool) int {
 
 	return 0
 }
+
 
 func runStop() int {
 	cf := findComposeFile(".")

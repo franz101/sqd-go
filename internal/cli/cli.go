@@ -22,6 +22,7 @@ type parsedArgs struct {
 	initAddress  string
 	initChainID  string
 	initStartBlk string
+	initEndBlk   string
 }
 
 func parseArgs(args []string) (*parsedArgs, error) {
@@ -63,6 +64,12 @@ func parseArgs(args []string) (*parsedArgs, error) {
 				return nil, fmt.Errorf("--start-block requires a value")
 			}
 			p.initStartBlk = args[i]
+		case "-e", "--end-block":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--end-block requires a value")
+			}
+			p.initEndBlk = args[i]
 		default:
 			if !strings.HasPrefix(a, "-") {
 				positional = append(positional, a)
@@ -126,17 +133,18 @@ func Run(args []string) int {
 
 	case "start":
 		if p.project == "" {
-			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart]")
+			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
 		}
-		return runStartPipeline(p.project, p.restart)
+		return runStartPipeline(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart)
+		return runDev(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID)
+
 
 	case "stop":
 		return runStop()
@@ -155,7 +163,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, false)
+		return runStartPipeline(p.command, false, p.initStartBlk, p.initEndBlk, p.initChainID)
 	}
 }
 
@@ -269,14 +277,16 @@ Flags:
   --abi, -a             (init) Path to ABI JSON file
   --name, -n            (init) Contract name
   --address, --addr     (init) Contract address (hex)
-  --blockchain, -b      (init) Chain ID (default: 1)
-  --start-block, -s     (init) Start block (default: 0)
+  --blockchain, -b      (init/start) Chain ID or name (default: 1)
+  --start-block, -s     (init/start) Start block (default: 0)
+  --end-block, -e       (start) End block (0 for infinite)
 
 Examples:
   sqd-go
   sqd-go init
   sqd-go codegen examples/uniswap
   sqd-go start examples/uniswap
+  sqd-go start examples/uniswap --blockchain polygon --start-block 80000000 --restart
   sqd-go dev examples/uniswap --restart
   sqd-go stop
   sqd-go init contract-import local --abi erc20.json --name USDC --address 0xA0...

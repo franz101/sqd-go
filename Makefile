@@ -34,3 +34,9 @@ db-reset:
 
 stop:
 	go run . stop
+
+polymarket-tail: build
+	@HEAD=$$(curl -s https://polygon-bor-rpc.publicnode.com -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' | jq -r .result | xargs printf "%d") && \
+	START_BLOCK=$$(($$HEAD - 2000)) && \
+	echo "Tailing 2000 blocks from Polygon head (starting at $$START_BLOCK)..." && \
+	$(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block $$START_BLOCK --end-block 0 --restart

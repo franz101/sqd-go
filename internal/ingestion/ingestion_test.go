@@ -1,6 +1,11 @@
 package ingestion
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
 
 func TestNextRequestRangeCursorOmitsToBlockWithLocalEnd(t *testing.T) {
 	end := uint64(20)
@@ -31,5 +36,34 @@ func TestNextRequestRangeBoundedUsesPageSizeAndEnd(t *testing.T) {
 	}
 	if label != "[10-20]" {
 		t.Fatalf("label = %q, want [10-20]", label)
+	}
+}
+
+func TestWaitForNextCursorPollReturnsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := waitForNextCursorPoll(ctx, time.Hour)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("wait returned after %v, want immediate context cancellation", elapsed)
+	}
+}
+
+func TestShouldWaitForEmptyCursorResponseWithoutEndBlock(t *testing.T) {
+	if !shouldWaitForEmptyCursorResponse(nil) {
+		t.Fatal("empty cursor response without end block should wait for new blocks")
+	}
+}
+
+func TestShouldWaitForEmptyCursorResponseWithEndBlock(t *testing.T) {
+	end := uint64(20)
+
+	if shouldWaitForEmptyCursorResponse(&end) {
+		t.Fatal("empty cursor response with end block should stop")
 	}
 }

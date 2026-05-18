@@ -31,6 +31,8 @@ type Options struct {
 	CursorMode         bool
 }
 
+const cursorPollInterval = 5 * time.Second
+
 func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	if opts.Restart {
 		if err := database.DropClickHouseDatabase(ctx, opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseUser, opts.ClickHousePassword, opts.ClickHouseDatabase); err != nil {
@@ -160,14 +162,22 @@ func processChain(ctx context.Context, store *database.Store, chain *config.Chai
 		lastProcessed := toBlock
 		if len(raw) == 0 {
 			if cursorMode {
-				if effectiveEndBlock != nil {
-					lastProcessed = *effectiveEndBlock
+				if !shouldWaitForEmptyCursorResponse(effectiveEndBlock) {
+					endBlock := *effectiveEndBlock
+					lastProcessed = endBlock
 					if err := store.UpdateSyncState(ctx, chain.ID, lastProcessed); err != nil {
 						return fmt.Errorf("update sync state %d: %w", lastProcessed, err)
 					}
+					log.Printf("Chain %d: empty response %s, reached end block %d, stopping", chain.ID, rangeLabel, endBlock)
+					break
 				}
-				log.Printf("Chain %d: empty response %s, stopping", chain.ID, rangeLabel)
-				break
+				log.Printf("Chain %d: empty response %s, waiting for new blocks...", chain.ID, rangeLabel)
+				if err := waitForNextCursorPoll(ctx, cursorPollInterval); err != nil {
+					log.Printf("Chain %d: interrupted at block %d", chain.ID, currentBlock)
+					printProfile(profFetch, profParse, profDecode, profMarshal, profInsert, profIters, totalBlocks, totalEvents, startTime)
+					return err
+				}
+				continue
 			}
 			if err := store.UpdateSyncState(ctx, chain.ID, lastProcessed); err != nil {
 				return fmt.Errorf("update sync state %d: %w", lastProcessed, err)
@@ -316,8 +326,8 @@ func processChain(ctx context.Context, store *database.Store, chain *config.Chai
 		elapsed := time.Since(startTime)
 		rate := float64(totalBlocks) / elapsed.Seconds()
 		if len(raw) > 0 {
-			log.Printf("Chain %d: %s scanned %d blocks, response headers: %d, event blocks: %d, events: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
-				chain.ID, rangeLabel, scanned, responseBlockCount, eventBlockCount, len(decodedEvents), lastProcessed, totalBlocks, totalEvents, rate)
+			log.Printf("Chain %d: %s scanned %d blocks, event blocks: %d, events: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
+				chain.ID, rangeLabel, scanned, eventBlockCount, len(decodedEvents), lastProcessed, totalBlocks, totalEvents, rate)
 		} else {
 			log.Printf("Chain %d: %s scanned %d blocks, empty response | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
 				chain.ID, rangeLabel, scanned, lastProcessed, totalBlocks, totalEvents, rate)
@@ -358,6 +368,21 @@ func pct(part, total time.Duration) float64 {
 		return 0
 	}
 	return float64(part) / float64(total) * 100
+}
+
+func waitForNextCursorPoll(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func shouldWaitForEmptyCursorResponse(effectiveEndBlock *uint64) bool {
+	return effectiveEndBlock == nil
 }
 
 func max(a, b uint64) uint64 {

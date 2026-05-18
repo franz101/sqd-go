@@ -108,7 +108,7 @@ func TestRunInitContractImportWritesConfig(t *testing.T) {
 		t.Fatalf("start block = %d", got)
 	}
 	contract := cfg.Chains[0].Contracts[0]
-	if got := contract.Address; got != "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" {
+	if got := contract.Address; len(got) != 1 || got[0] != "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" {
 		t.Fatalf("address = %#v", got)
 	}
 	gotEvents := make([]string, len(contract.Events))
