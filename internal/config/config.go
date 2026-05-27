@@ -19,6 +19,9 @@ type Config struct {
 	Chains          []Chain                `yaml:"chains" json:"chains"`
 	RollbackOnReorg *bool                  `yaml:"rollback_on_reorg,omitempty" json:"rollback_on_reorg,omitempty"`
 	RawEvents       *bool                  `yaml:"raw_events,omitempty" json:"raw_events,omitempty"`
+	OmitRawLogs     *bool                  `yaml:"omit_raw_logs,omitempty" json:"omit_raw_logs,omitempty"`
+	IncludeMetadata []string               `yaml:"include_metadata,omitempty" json:"include_metadata,omitempty"`
+	ExcludeMetadata []map[string]string    `yaml:"exclude_metadata,omitempty" json:"exclude_metadata,omitempty"`
 }
 
 type ForkMode string
@@ -60,8 +63,9 @@ type GlobalContractConfig struct {
 }
 
 type EventConfig struct {
-	Event string  `yaml:"event" json:"event"`
-	Name  *string `yaml:"name,omitempty" json:"name,omitempty"`
+	Event string   `yaml:"event" json:"event"`
+	Name  *string  `yaml:"name,omitempty" json:"name,omitempty"`
+	Omit  []string `yaml:"omit,omitempty" json:"omit,omitempty"`
 }
 
 type Chain struct {
@@ -146,7 +150,52 @@ func LoadFile(path string) (*Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}
+	cfg.ApplyExcludeMetadata()
 	return &cfg, nil
+}
+
+func (cfg *Config) ApplyExcludeMetadata() {
+	if cfg == nil || len(cfg.ExcludeMetadata) == 0 {
+		return
+	}
+	omittedFields := make(map[string][]string)
+	for _, m := range cfg.ExcludeMetadata {
+		for eventName, fieldName := range m {
+			omittedFields[strings.ToLower(eventName)] = append(omittedFields[strings.ToLower(eventName)], fieldName)
+		}
+	}
+	for i := range cfg.Chains {
+		for j := range cfg.Chains[i].Contracts {
+			for k := range cfg.Chains[i].Contracts[j].Events {
+				ev := &cfg.Chains[i].Contracts[j].Events[k]
+				declName := parseEventName(ev.Event)
+				if fields, ok := omittedFields[strings.ToLower(declName)]; ok {
+					for _, f := range fields {
+						found := false
+						for _, existing := range ev.Omit {
+							if strings.EqualFold(existing, f) {
+								found = true
+								break
+							}
+						}
+						if !found {
+							ev.Omit = append(ev.Omit, f)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func parseEventName(sig string) string {
+	sig = strings.TrimSpace(sig)
+	sig = strings.TrimPrefix(sig, "event ")
+	open := strings.IndexByte(sig, '(')
+	if open <= 0 {
+		return sig
+	}
+	return strings.TrimSpace(sig[:open])
 }
 
 func Validate(cfg *Config) error {
@@ -184,4 +233,23 @@ func Validate(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+func (cfg *Config) ShouldOmitRawLogs() bool {
+	if cfg == nil || cfg.OmitRawLogs == nil {
+		return false
+	}
+	return *cfg.OmitRawLogs
+}
+
+func (cfg *Config) MetadataIncluded(field string) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, f := range cfg.IncludeMetadata {
+		if strings.EqualFold(f, field) || strings.EqualFold(strings.ReplaceAll(f, "_", ""), strings.ReplaceAll(field, "_", "")) {
+			return true
+		}
+	}
+	return false
 }

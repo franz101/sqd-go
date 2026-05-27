@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -88,16 +89,22 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		if err := store.ApplySQLFile(ctx, filepath.Join(opts.GeneratedSQLDir, "schema.sql")); err != nil {
 			return fmt.Errorf("apply generated schema: %w", err)
 		}
+		customSchemaPath := filepath.Join(opts.GeneratedSQLDir, "custom_schema.sql")
+		if _, err := os.Stat(customSchemaPath); err == nil {
+			if err := store.ApplySQLFile(ctx, customSchemaPath); err != nil {
+				return fmt.Errorf("apply generated custom schema: %w", err)
+			}
+		}
 		if err := store.ApplySQLFile(ctx, filepath.Join(opts.GeneratedSQLDir, "views.sql")); err != nil {
 			return fmt.Errorf("apply generated views: %w", err)
 		}
-	} else if err := store.EnsureTablesWithCollapsing(ctx, forkMode.UsesCollapsingMergeTree()); err != nil {
+	} else if err := store.EnsureTablesWithCollapsingAndOmit(ctx, forkMode.UsesCollapsingMergeTree(), cfg.ShouldOmitRawLogs()); err != nil {
 		return fmt.Errorf("ensure tables: %w", err)
 	}
 	log.Printf("ClickHouse connected: %s:%d/%s (fork=%s)", opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseDatabase, forkMode)
 
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, proc); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, proc); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -105,7 +112,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, proc Processor) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, proc Processor) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -432,7 +439,7 @@ func processChain(ctx context.Context, store *database.Store, chain *config.Chai
 			var firstErr error
 
 			// 1. Logs insertion
-			if len(decodedEvents) > 0 {
+			if !cfg.ShouldOmitRawLogs() && len(decodedEvents) > 0 {
 				if err := baseInserter.InsertLogs(ctx, decodedEvents); err != nil {
 					firstErr = fmt.Errorf("InsertLogs: %w", err)
 				}
@@ -732,9 +739,24 @@ func buildTypedTableIndex(chain *config.Chain) (typedTableIndex, error) {
 				return index, fmt.Errorf("%s.%s: %w", contract.Name, event.Event, err)
 			}
 			viewName := uniqueLower(used, toSnake(contract.Name+"_"+name))
+
+			var filteredArgs []database.TypedEventArg
+			for _, arg := range args {
+				isOmitted := false
+				for _, o := range event.Omit {
+					if strings.EqualFold(o, arg.Name) || strings.EqualFold(strings.ReplaceAll(o, "_", ""), strings.ReplaceAll(arg.Name, "_", "")) {
+						isOmitted = true
+						break
+					}
+				}
+				if !isOmitted {
+					filteredArgs = append(filteredArgs, arg)
+				}
+			}
+
 			table := database.TypedEventTable{
 				Name: viewName + "_events",
-				Args: args,
+				Args: filteredArgs,
 			}
 			if len(addresses) == 0 {
 				index.byEvent[name] = table

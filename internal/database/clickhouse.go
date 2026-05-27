@@ -100,6 +100,10 @@ func (s *Store) EnsureTables(ctx context.Context) error {
 }
 
 func (s *Store) EnsureTablesWithCollapsing(ctx context.Context, collapsing bool) error {
+	return s.EnsureTablesWithCollapsingAndOmit(ctx, collapsing, false)
+}
+
+func (s *Store) EnsureTablesWithCollapsingAndOmit(ctx context.Context, collapsing bool, omitLogs bool) error {
 	db := quoteIdent(s.db)
 	engine := "MergeTree()"
 	signColumn := ""
@@ -117,18 +121,20 @@ func (s *Store) EnsureTablesWithCollapsing(ctx context.Context, collapsing bool)
 	if err := s.conn.Do(ctx, ch.Query{Body: blocksDDL}); err != nil {
 		return fmt.Errorf("create blocks: %w", err)
 	}
-	logsDDL := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s.logs (
-			chain_id UInt64, block_number UInt64,
-			block_timestamp DateTime64(3, 'UTC'), block_hash String,
-			transaction_hash FixedString(32), transaction_index UInt64, log_index UInt64,
-			address FixedString(20), event_name LowCardinality(String),
-			topic0 FixedString(32), params String,
-			%s
-			inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = %s ORDER BY (chain_id, block_number, transaction_index, log_index)`, db, signColumn, engine)
-	if err := s.conn.Do(ctx, ch.Query{Body: logsDDL}); err != nil {
-		return fmt.Errorf("create logs: %w", err)
+	if !omitLogs {
+		logsDDL := fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %s.logs (
+				chain_id UInt64, block_number UInt64,
+				block_timestamp DateTime64(3, 'UTC'), block_hash String,
+				transaction_hash FixedString(32), transaction_index UInt64, log_index UInt64,
+				address FixedString(20), event_name LowCardinality(String),
+				topic0 FixedString(32), params String,
+				%s
+				inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
+			) ENGINE = %s ORDER BY (chain_id, block_number, transaction_index, log_index)`, db, signColumn, engine)
+		if err := s.conn.Do(ctx, ch.Query{Body: logsDDL}); err != nil {
+			return fmt.Errorf("create logs: %w", err)
+		}
 	}
 	stateDDL := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s.sync_state (
@@ -296,16 +302,51 @@ func (s *Store) NewTypedInserter(table TypedEventTable) *TypedInserter {
 	in.colAddr.SetSize(20)
 	in.colTxHash.SetSize(32)
 
-	in.inputCols = []proto.InputColumn{
-		{Name: "chain_id", Data: &in.colChain},
-		{Name: "block_number", Data: &in.colBlock},
-		{Name: "block_timestamp", Data: &in.colTime},
-		{Name: "block_hash", Data: &in.colBHash},
-		{Name: "contract_address", Data: &in.colAddr},
-		{Name: "transaction_hash", Data: &in.colTxHash},
-		{Name: "transaction_index", Data: &in.colTxIdx},
-		{Name: "log_index", Data: &in.colLogIdx},
+	// Query system.columns using a background context to see which columns actually exist in the table!
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	existingCols := make(map[string]bool)
+	var name proto.ColStr
+	q := fmt.Sprintf(
+		"SELECT name FROM system.columns WHERE database = %s AND table = %s",
+		quoteString(s.db), quoteString(table.Name),
+	)
+	if err := s.conn.Do(ctx, ch.Query{
+		Body:   q,
+		Result: proto.Results{{Name: "name", Data: &name}},
+	}); err == nil && name.Rows() > 0 {
+		for i := 0; i < name.Rows(); i++ {
+			existingCols[name.Row(i)] = true
+		}
+	} else {
+		// Fallback: if query fails (e.g. database not initialized yet), assume all exist
+		existingCols = map[string]bool{
+			"chain_id": true, "block_number": true, "block_timestamp": true, "block_hash": true,
+			"contract_address": true, "transaction_hash": true, "transaction_index": true, "log_index": true,
+		}
 	}
+
+	var commonCols []proto.InputColumn
+	if existingCols["chain_id"] {
+		commonCols = append(commonCols, proto.InputColumn{Name: "chain_id", Data: &in.colChain})
+	}
+	commonCols = append(commonCols, proto.InputColumn{Name: "block_number", Data: &in.colBlock})
+	commonCols = append(commonCols, proto.InputColumn{Name: "block_timestamp", Data: &in.colTime})
+	if existingCols["block_hash"] {
+		commonCols = append(commonCols, proto.InputColumn{Name: "block_hash", Data: &in.colBHash})
+	}
+	if existingCols["contract_address"] {
+		commonCols = append(commonCols, proto.InputColumn{Name: "contract_address", Data: &in.colAddr})
+	}
+	if existingCols["transaction_hash"] {
+		commonCols = append(commonCols, proto.InputColumn{Name: "transaction_hash", Data: &in.colTxHash})
+	}
+	commonCols = append(commonCols, proto.InputColumn{Name: "transaction_index", Data: &in.colTxIdx})
+	commonCols = append(commonCols, proto.InputColumn{Name: "log_index", Data: &in.colLogIdx})
+
+	in.inputCols = commonCols
+
 	for _, arg := range table.Args {
 		col := newTypedValueColumn(arg)
 		in.valueCols = append(in.valueCols, col)
@@ -629,7 +670,16 @@ func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint6
 	}
 	for _, table := range tables {
 		if !table.HasSign {
-			return fmt.Errorf("rollback %s: table has block_number but no sign column for CollapsingMergeTree rollback", table.Name)
+			where := fmt.Sprintf("block_number > %d", lastBlock)
+			if table.HasChainID {
+				where = fmt.Sprintf("chain_id = %d AND %s", chainID, where)
+			}
+			q := fmt.Sprintf("DELETE FROM %s.%s WHERE %s SETTINGS lightweight_deletes_sync = 1", quoteIdent(s.db), quoteIdent(table.Name), where)
+			log.Printf("[ROLLBACK] Truncating non-collapsing table '%s' for blocks > %d (query: %s)", table.Name, lastBlock, q)
+			if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
+				return fmt.Errorf("rollback %s: %w", table.Name, err)
+			}
+			continue
 		}
 		columns, err := s.tableColumns(ctx, table.Name)
 		if err != nil {

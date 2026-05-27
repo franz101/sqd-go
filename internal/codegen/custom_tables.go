@@ -39,6 +39,38 @@ type customFieldSpec struct {
 
 func loadCustomTableSpecs(root string) ([]customTableSpec, error) {
 	path := filepath.Join(root, "custom_types.go")
+	return loadCustomTableSpecsFromFile(path)
+}
+
+func loadCustomSchemaSpecs(root string, configDir string) ([]customTableSpec, error) {
+	paths := []string{
+		filepath.Join(root, "custom_schema.go"),
+		filepath.Join(root, "generated", "custom_schema.go"),
+		filepath.Join(configDir, "custom_schema.go"),
+		filepath.Join(configDir, "generated", "custom_schema.go"),
+	}
+	// Deduplicate paths keeping the order
+	seen := make(map[string]bool)
+	var uniquePaths []string
+	for _, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		if !seen[abs] {
+			seen[abs] = true
+			uniquePaths = append(uniquePaths, p)
+		}
+	}
+	for _, path := range uniquePaths {
+		if _, err := os.Stat(path); err == nil {
+			return loadCustomTableSpecsFromFile(path)
+		}
+	}
+	return nil, nil
+}
+
+func loadCustomTableSpecsFromFile(path string) ([]customTableSpec, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -53,7 +85,7 @@ func loadCustomTableSpecs(root string) ([]customTableSpec, error) {
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, path, nil, parser.ParseComments)
 	if err != nil {
-		return nil, fmt.Errorf("parse custom types: %w", err)
+		return nil, fmt.Errorf("parse custom types/schema: %w", err)
 	}
 
 	var tables []customTableSpec
