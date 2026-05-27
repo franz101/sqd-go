@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -38,6 +39,17 @@ type TypedEventArg struct {
 	ColumnName     string
 	SolidityType   string
 	ClickHouseType string
+}
+
+type SyncCursor struct {
+	Number uint64 `json:"number"`
+	Hash   string `json:"hash"`
+}
+
+type SyncState struct {
+	Current       SyncCursor
+	Finalized     *SyncCursor
+	RollbackChain []SyncCursor
 }
 
 func NewClickHouse(ctx context.Context, host string, port int, user, password, db string) (*Store, error) {
@@ -84,13 +96,24 @@ func (s *Store) DB() string {
 }
 
 func (s *Store) EnsureTables(ctx context.Context) error {
+	return s.EnsureTablesWithCollapsing(ctx, false)
+}
+
+func (s *Store) EnsureTablesWithCollapsing(ctx context.Context, collapsing bool) error {
 	db := quoteIdent(s.db)
+	engine := "MergeTree()"
+	signColumn := ""
+	if collapsing {
+		engine = "CollapsingMergeTree(sign)"
+		signColumn = "sign Int8 DEFAULT 1,"
+	}
 	blocksDDL := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s.blocks (
 			chain_id UInt64, block_number UInt64,
 			block_timestamp DateTime64(3, 'UTC'), block_hash String,
+			%s
 			inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = MergeTree() ORDER BY (chain_id, block_number)`, db)
+		) ENGINE = %s ORDER BY (chain_id, block_number)`, db, signColumn, engine)
 	if err := s.conn.Do(ctx, ch.Query{Body: blocksDDL}); err != nil {
 		return fmt.Errorf("create blocks: %w", err)
 	}
@@ -101,14 +124,17 @@ func (s *Store) EnsureTables(ctx context.Context) error {
 			transaction_hash FixedString(32), transaction_index UInt64, log_index UInt64,
 			address FixedString(20), event_name LowCardinality(String),
 			topic0 FixedString(32), params String,
+			%s
 			inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = MergeTree() ORDER BY (chain_id, block_number, transaction_index, log_index)`, db)
+		) ENGINE = %s ORDER BY (chain_id, block_number, transaction_index, log_index)`, db, signColumn, engine)
 	if err := s.conn.Do(ctx, ch.Query{Body: logsDDL}); err != nil {
 		return fmt.Errorf("create logs: %w", err)
 	}
 	stateDDL := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s.sync_state (
-			chain_id UInt64, last_block UInt64,
+			chain_id UInt64, last_block UInt64, last_hash String,
+			finalized_block UInt64, finalized_hash String,
+			rollback_chain String,
 			updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
 		) ENGINE = MergeTree() ORDER BY (chain_id, updated_at)`, db)
 	if err := s.conn.Do(ctx, ch.Query{Body: stateDDL}); err != nil {
@@ -259,72 +285,116 @@ func (in *Inserter) InsertLogs(ctx context.Context, events []parser.DecodedEvent
 	})
 }
 
-func (in *Inserter) InsertTypedLogs(ctx context.Context, table TypedEventTable, events []parser.DecodedEvent) error {
+func (s *Store) NewTypedInserter(table TypedEventTable) *TypedInserter {
+	in := &TypedInserter{
+		store: s,
+		table: table,
+	}
+	in.colTime.WithPrecision(proto.Precision(3))
+	in.colTime.WithLocation(time.UTC)
+	in.colBHash.SetSize(32)
+	in.colAddr.SetSize(20)
+	in.colTxHash.SetSize(32)
+
+	in.inputCols = []proto.InputColumn{
+		{Name: "chain_id", Data: &in.colChain},
+		{Name: "block_number", Data: &in.colBlock},
+		{Name: "block_timestamp", Data: &in.colTime},
+		{Name: "block_hash", Data: &in.colBHash},
+		{Name: "contract_address", Data: &in.colAddr},
+		{Name: "transaction_hash", Data: &in.colTxHash},
+		{Name: "transaction_index", Data: &in.colTxIdx},
+		{Name: "log_index", Data: &in.colLogIdx},
+	}
+	for _, arg := range table.Args {
+		col := newTypedValueColumn(arg)
+		in.valueCols = append(in.valueCols, col)
+		in.inputCols = append(in.inputCols, col.input())
+	}
+
+	names := make([]string, 0, len(in.inputCols))
+	for _, col := range in.inputCols {
+		names = append(names, quoteIdent(col.Name))
+	}
+	in.query = fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES", quoteIdent(s.db), quoteIdent(table.Name), strings.Join(names, ", "))
+	return in
+}
+
+type TypedInserter struct {
+	store *Store
+	table TypedEventTable
+
+	colChain  proto.ColUInt64
+	colBlock  proto.ColUInt64
+	colTime   proto.ColDateTime64
+	colBHash  proto.ColFixedStr
+	colAddr   proto.ColFixedStr
+	colTxHash proto.ColFixedStr
+	colTxIdx  proto.ColUInt64
+	colLogIdx proto.ColUInt64
+
+	valueCols []typedValueColumn
+	inputCols []proto.InputColumn
+	query     string
+}
+
+func (in *TypedInserter) Insert(ctx context.Context, events []parser.DecodedEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	var (
-		colChain    proto.ColUInt64
-		colBlock    proto.ColUInt64
-		colTime     proto.ColDateTime64
-		colBHash    proto.ColFixedStr
-		colAddr     proto.ColFixedStr
-		colTxHash   proto.ColFixedStr
-		colTxIdx    proto.ColUInt64
-		colLogIdx   proto.ColUInt64
-		valueCols   []typedValueColumn
-		inputColumn []proto.InputColumn
-	)
-	colTime.WithPrecision(proto.Precision(3))
-	colTime.WithLocation(time.UTC)
-	colBHash.SetSize(32)
-	colAddr.SetSize(20)
-	colTxHash.SetSize(32)
+	total := len(events)
+	processed := 0
+	chunkSize := 10000
 
-	inputColumn = []proto.InputColumn{
-		{Name: "chain_id", Data: &colChain},
-		{Name: "block_number", Data: &colBlock},
-		{Name: "block_timestamp", Data: &colTime},
-		{Name: "block_hash", Data: &colBHash},
-		{Name: "contract_address", Data: &colAddr},
-		{Name: "transaction_hash", Data: &colTxHash},
-		{Name: "transaction_index", Data: &colTxIdx},
-		{Name: "log_index", Data: &colLogIdx},
-	}
-	for _, arg := range table.Args {
-		col := newTypedValueColumn(arg)
-		valueCols = append(valueCols, col)
-		inputColumn = append(inputColumn, col.input())
-	}
-
-	for _, ev := range events {
-		colChain.Append(ev.ChainID)
-		colBlock.Append(ev.BlockNumber)
-		colTime.Append(ev.BlockTimestamp)
-		colBHash.Append(common.HexToHash(ev.BlockHash).Bytes())
-		colAddr.Append(common.HexToAddress(ev.Address).Bytes())
-		colTxHash.Append(common.HexToHash(ev.TxHash).Bytes())
-		colTxIdx.Append(ev.TxIndex)
-		colLogIdx.Append(ev.LogIndex)
-		for i, arg := range table.Args {
-			valueCols[i].append(ev.Params[arg.Name])
-		}
-	}
-
-	names := make([]string, 0, len(inputColumn))
-	for _, col := range inputColumn {
-		names = append(names, quoteIdent(col.Name))
-	}
 	return in.store.conn.Do(ctx, ch.Query{
-		Body:  fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES", quoteIdent(in.store.db), quoteIdent(table.Name), strings.Join(names, ", ")),
-		Input: inputColumn,
+		Body:  in.query,
+		Input: in.inputCols,
+		OnInput: func(ctx context.Context) error {
+			in.colChain.Reset()
+			in.colBlock.Reset()
+			in.colTime.Reset()
+			in.colBHash.Reset()
+			in.colAddr.Reset()
+			in.colTxHash.Reset()
+			in.colTxIdx.Reset()
+			in.colLogIdx.Reset()
+			for _, col := range in.valueCols {
+				col.reset()
+			}
+
+			if processed >= total {
+				return io.EOF
+			}
+
+			end := processed + chunkSize
+			if end > total {
+				end = total
+			}
+
+			for _, ev := range events[processed:end] {
+				in.colChain.Append(ev.ChainID)
+				in.colBlock.Append(ev.BlockNumber)
+				in.colTime.Append(ev.BlockTimestamp)
+				in.colBHash.Append(common.HexToHash(ev.BlockHash).Bytes())
+				in.colAddr.Append(common.HexToAddress(ev.Address).Bytes())
+				in.colTxHash.Append(common.HexToHash(ev.TxHash).Bytes())
+				in.colTxIdx.Append(ev.TxIndex)
+				in.colLogIdx.Append(ev.LogIndex)
+				for i, arg := range in.table.Args {
+					in.valueCols[i].append(ev.Params[arg.Name])
+				}
+			}
+			processed = end
+			return nil
+		},
 	})
 }
 
 type typedValueColumn interface {
 	input() proto.InputColumn
 	append(any)
+	reset()
 }
 
 type fixedStringValueColumn struct {
@@ -345,6 +415,10 @@ func (c *fixedStringValueColumn) input() proto.InputColumn {
 
 func (c *fixedStringValueColumn) append(v any) {
 	c.col.Append(fixedStringBytes(v, c.size))
+}
+
+func (c *fixedStringValueColumn) reset() {
+	c.col.Reset()
 }
 
 func fixedStringBytes(v any, size int) []byte {
@@ -418,6 +492,10 @@ func (c *uint256ValueColumn) append(v any) {
 	}
 }
 
+func (c *uint256ValueColumn) reset() {
+	c.col.Reset()
+}
+
 type boolValueColumn struct {
 	name string
 	col  proto.ColUInt8
@@ -435,6 +513,10 @@ func (c *boolValueColumn) append(v any) {
 	c.col.Append(0)
 }
 
+func (c *boolValueColumn) reset() {
+	c.col.Reset()
+}
+
 type stringValueColumn struct {
 	name string
 	col  proto.ColStr
@@ -446,6 +528,10 @@ func (c *stringValueColumn) input() proto.InputColumn {
 
 func (c *stringValueColumn) append(v any) {
 	c.col.Append(fmt.Sprint(v))
+}
+
+func (c *stringValueColumn) reset() {
+	c.col.Reset()
 }
 
 func newTypedValueColumn(arg TypedEventArg) typedValueColumn {
@@ -480,21 +566,40 @@ func fixedStringSize(clickHouseType string) int {
 }
 
 func (s *Store) UpdateSyncState(ctx context.Context, chainID, lastBlock uint64) error {
-	var colChain, colLast proto.ColUInt64
+	return s.SaveSyncState(ctx, chainID, SyncState{Current: SyncCursor{Number: lastBlock}})
+}
+
+func (s *Store) SaveSyncState(ctx context.Context, chainID uint64, state SyncState) error {
+	var colChain, colLast, colFinalized proto.ColUInt64
+	var colLastHash, colFinalizedHash, colRollback proto.ColStr
 	colChain.Append(chainID)
-	colLast.Append(lastBlock)
+	colLast.Append(state.Current.Number)
+	colLastHash.Append(state.Current.Hash)
+	if state.Finalized != nil {
+		colFinalized.Append(state.Finalized.Number)
+		colFinalizedHash.Append(state.Finalized.Hash)
+	} else {
+		colFinalized.Append(0)
+		colFinalizedHash.Append("")
+	}
+	rollback, err := json.Marshal(state.RollbackChain)
+	if err != nil {
+		return fmt.Errorf("marshal rollback chain: %w", err)
+	}
+	colRollback.Append(string(rollback))
 	return s.conn.Do(ctx, ch.Query{
-		Body: fmt.Sprintf("INSERT INTO %s.sync_state (chain_id, last_block) VALUES", quoteIdent(s.db)),
+		Body: fmt.Sprintf("INSERT INTO %s.sync_state (chain_id, last_block, last_hash, finalized_block, finalized_hash, rollback_chain) VALUES", quoteIdent(s.db)),
 		Input: []proto.InputColumn{
-			{Name: "chain_id", Data: &colChain},
-			{Name: "last_block", Data: &colLast},
+			{Name: "chain_id", Data: &colChain}, {Name: "last_block", Data: &colLast},
+			{Name: "last_hash", Data: &colLastHash}, {Name: "finalized_block", Data: &colFinalized},
+			{Name: "finalized_hash", Data: &colFinalizedHash}, {Name: "rollback_chain", Data: &colRollback},
 		},
 	})
 }
 
 func (s *Store) TruncateSyncState(ctx context.Context, chainID, lastBlock uint64) error {
 	db := quoteIdent(s.db)
-	q := fmt.Sprintf("ALTER TABLE %s.sync_state DELETE WHERE chain_id = %d AND last_block < %d SETTINGS mutations_sync = 1", db, chainID, lastBlock)
+	q := fmt.Sprintf("DELETE FROM %s.sync_state WHERE chain_id = %d AND last_block < %d SETTINGS lightweight_deletes_sync = 1", db, chainID, lastBlock)
 	return s.conn.Do(ctx, ch.Query{Body: q})
 }
 
@@ -508,9 +613,51 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 		if table.HasChainID {
 			where = fmt.Sprintf("chain_id = %d AND %s", chainID, where)
 		}
-		q := fmt.Sprintf("ALTER TABLE %s.%s DELETE WHERE %s SETTINGS mutations_sync = 1", quoteIdent(s.db), quoteIdent(table.Name), where)
+		q := fmt.Sprintf("DELETE FROM %s.%s WHERE %s SETTINGS lightweight_deletes_sync = 1", quoteIdent(s.db), quoteIdent(table.Name), where)
+		log.Printf("[ROLLBACK] Truncating table '%s' for blocks > %d (query: DELETE FROM %s.%s WHERE %s)", table.Name, lastBlock, quoteIdent(s.db), quoteIdent(table.Name), where)
 		if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
-			return fmt.Errorf("truncate %s: %w", table.Name, err)
+			return fmt.Errorf("rollback %s: %w", table.Name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint64) error {
+	tables, err := s.tablesWithBlockNumber(ctx)
+	if err != nil {
+		return err
+	}
+	for _, table := range tables {
+		if !table.HasSign {
+			return fmt.Errorf("rollback %s: table has block_number but no sign column for CollapsingMergeTree rollback", table.Name)
+		}
+		columns, err := s.tableColumns(ctx, table.Name)
+		if err != nil {
+			return err
+		}
+		where := fmt.Sprintf("block_number > %d", lastBlock)
+		if table.HasChainID {
+			where = fmt.Sprintf("chain_id = %d AND %s", chainID, where)
+		}
+		quotedColumns := make([]string, 0, len(columns))
+		selectExprs := make([]string, 0, len(columns))
+		for _, column := range columns {
+			quoted := quoteIdent(column)
+			quotedColumns = append(quotedColumns, quoted)
+			if column == "sign" {
+				selectExprs = append(selectExprs, "toInt8(-sign) AS sign")
+				continue
+			}
+			selectExprs = append(selectExprs, quoted)
+		}
+		q := fmt.Sprintf(
+			"INSERT INTO %s.%s (%s) SELECT %s FROM %s.%s FINAL WHERE %s",
+			quoteIdent(s.db), quoteIdent(table.Name), strings.Join(quotedColumns, ", "),
+			strings.Join(selectExprs, ", "), quoteIdent(s.db), quoteIdent(table.Name), where,
+		)
+		log.Printf("[ROLLBACK] Collapsing table '%s' by inserting sign-flipped rows for blocks > %d (query: %s)", table.Name, lastBlock, q)
+		if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
+			return fmt.Errorf("collapse rollback %s: %w", table.Name, err)
 		}
 	}
 	return nil
@@ -519,20 +666,23 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 type blockNumberTable struct {
 	Name       string
 	HasChainID bool
+	HasSign    bool
 }
 
 func (s *Store) tablesWithBlockNumber(ctx context.Context) ([]blockNumberTable, error) {
 	var table proto.ColStr
 	var hasChain proto.ColUInt64
+	var hasSign proto.ColUInt64
 	q := fmt.Sprintf(`
 		SELECT
 			c.table AS table,
-			countIf(c.name = 'chain_id') AS has_chain
+			countIf(c.name = 'chain_id') AS has_chain,
+			countIf(c.name = 'sign') AS has_sign
 		FROM system.columns c
 		INNER JOIN system.tables t
 			ON c.database = t.database AND c.table = t.name
 		WHERE c.database = %s
-			AND c.name IN ('block_number', 'chain_id')
+			AND c.name IN ('block_number', 'chain_id', 'sign')
 			AND t.engine NOT LIKE '%%View'
 		GROUP BY c.table
 		HAVING countIf(c.name = 'block_number') > 0
@@ -544,6 +694,7 @@ func (s *Store) tablesWithBlockNumber(ctx context.Context) ([]blockNumberTable, 
 		Result: proto.Results{
 			{Name: "table", Data: &table},
 			{Name: "has_chain", Data: &hasChain},
+			{Name: "has_sign", Data: &hasSign},
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("list block tables: %w", err)
@@ -553,9 +704,80 @@ func (s *Store) tablesWithBlockNumber(ctx context.Context) ([]blockNumberTable, 
 		out = append(out, blockNumberTable{
 			Name:       table.Row(i),
 			HasChainID: hasChain.Row(i) > 0,
+			HasSign:    hasSign.Row(i) > 0,
 		})
 	}
 	return out, nil
+}
+
+func (s *Store) tableColumns(ctx context.Context, table string) ([]string, error) {
+	var name proto.ColStr
+	q := fmt.Sprintf(
+		`SELECT name
+		 FROM system.columns
+		 WHERE database = %s AND table = %s
+		 ORDER BY position`,
+		quoteString(s.db), quoteString(table),
+	)
+	if err := s.conn.Do(ctx, ch.Query{
+		Body:   q,
+		Result: proto.Results{{Name: "name", Data: &name}},
+	}); err != nil {
+		return nil, fmt.Errorf("list columns for %s: %w", table, err)
+	}
+	columns := make([]string, 0, name.Rows())
+	for i := 0; i < name.Rows(); i++ {
+		columns = append(columns, name.Row(i))
+	}
+	return columns, nil
+}
+
+func (s *Store) LastSyncState(ctx context.Context, chainID uint64) (*SyncState, bool, error) {
+	var (
+		lastBlock      proto.ColUInt64
+		lastHash       proto.ColStr
+		finalizedBlock proto.ColUInt64
+		finalizedHash  proto.ColStr
+		rollbackChain  proto.ColStr
+	)
+	err := s.conn.Do(ctx, ch.Query{
+		Body: fmt.Sprintf(
+			`SELECT last_block, last_hash, finalized_block, finalized_hash, rollback_chain
+			 FROM %s.sync_state
+			 WHERE chain_id = %d
+			 ORDER BY updated_at DESC
+			 LIMIT 1`,
+			quoteIdent(s.db), chainID,
+		),
+		Result: proto.Results{
+			{Name: "last_block", Data: &lastBlock},
+			{Name: "last_hash", Data: &lastHash},
+			{Name: "finalized_block", Data: &finalizedBlock},
+			{Name: "finalized_hash", Data: &finalizedHash},
+			{Name: "rollback_chain", Data: &rollbackChain},
+		},
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if lastBlock.Rows() == 0 {
+		return nil, false, nil
+	}
+	state := &SyncState{
+		Current: SyncCursor{
+			Number: lastBlock.Row(0),
+			Hash:   lastHash.Row(0),
+		},
+	}
+	if finalizedHash.Row(0) != "" {
+		state.Finalized = &SyncCursor{Number: finalizedBlock.Row(0), Hash: finalizedHash.Row(0)}
+	}
+	if raw := rollbackChain.Row(0); strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &state.RollbackChain); err != nil {
+			return nil, false, fmt.Errorf("decode rollback chain: %w", err)
+		}
+	}
+	return state, true, nil
 }
 
 func (s *Store) LastBlock(ctx context.Context, chainID uint64) (uint64, bool, error) {

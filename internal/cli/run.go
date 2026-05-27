@@ -8,13 +8,14 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
 
 	"github.com/franz101/sqd-go/internal/codegen"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr string) int {
+func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
@@ -50,10 +51,10 @@ func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr st
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, outPath)
+	return runStartPipelineInternal(project, path, restart, outPath, cpuprofile)
 }
 
-func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, chainIDStr string) int {
+func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -68,7 +69,7 @@ func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, cha
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, outPath)
+	return runStartPipelineInternal(project, path, restart, outPath, cpuprofile)
 }
 
 func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr string) {
@@ -104,9 +105,19 @@ func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr s
 	}
 }
 
-func runStartPipelineInternal(project *config.Project, path string, restart bool, outPath string) int {
+func runStartPipelineInternal(project *config.Project, path string, restart bool, outPath, cpuprofile string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	if cpuprofile != "" {
+		f, err := os.Create(cpuprofile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create cpu profile: %v\n", err)
+			return 1
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	opts := ingestion.Options{
 		ClickHouseHost:     envOrDefault("CLICKHOUSE_HOST", "127.0.0.1"),
@@ -127,7 +138,6 @@ func runStartPipelineInternal(project *config.Project, path string, restart bool
 
 	return 0
 }
-
 
 func runStop() int {
 	cf := findComposeFile(".")

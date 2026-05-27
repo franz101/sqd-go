@@ -14,10 +14,43 @@ type Config struct {
 	Description     *string                `yaml:"description,omitempty" json:"description,omitempty"`
 	Name            string                 `yaml:"name" json:"name"`
 	Ecosystem       *string                `yaml:"ecosystem,omitempty" json:"ecosystem,omitempty"`
+	Fork            ForkMode               `yaml:"fork,omitempty" json:"fork,omitempty"`
 	Contracts       []GlobalContractConfig `yaml:"contracts,omitempty" json:"contracts,omitempty"`
 	Chains          []Chain                `yaml:"chains" json:"chains"`
 	RollbackOnReorg *bool                  `yaml:"rollback_on_reorg,omitempty" json:"rollback_on_reorg,omitempty"`
 	RawEvents       *bool                  `yaml:"raw_events,omitempty" json:"raw_events,omitempty"`
+}
+
+type ForkMode string
+
+const (
+	ForkModeDefault    ForkMode = "default"
+	ForkModeSqd        ForkMode = "sqd"
+	ForkModeRingBuffer ForkMode = "ringbuffer"
+)
+
+func (cfg *Config) ForkMode() ForkMode {
+	if cfg == nil {
+		return ForkModeDefault
+	}
+	mode := ForkMode(strings.TrimSpace(strings.ToLower(string(cfg.Fork))))
+	if mode == "" {
+		return ForkModeDefault
+	}
+	return mode
+}
+
+func (m ForkMode) UsesCollapsingMergeTree() bool {
+	return m == "" || m == ForkModeDefault
+}
+
+func (m ForkMode) Valid() bool {
+	switch m {
+	case "", ForkModeDefault, ForkModeSqd, ForkModeRingBuffer:
+		return true
+	default:
+		return false
+	}
 }
 
 type GlobalContractConfig struct {
@@ -122,6 +155,9 @@ func Validate(cfg *Config) error {
 	}
 	if strings.TrimSpace(cfg.Name) == "" {
 		return fmt.Errorf("name is required")
+	}
+	if mode := cfg.ForkMode(); !mode.Valid() {
+		return fmt.Errorf("fork must be default, sqd, or ringbuffer")
 	}
 	if len(cfg.Chains) == 0 {
 		return fmt.Errorf("at least one chain is required")

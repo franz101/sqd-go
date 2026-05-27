@@ -113,3 +113,62 @@ func TestFixedStringHexRoundTripMatchesCanonicalString(t *testing.T) {
 		})
 	}
 }
+
+func TestStringValueColumnAppend(t *testing.T) {
+	col := &stringValueColumn{name: "params"}
+
+	// Test append
+	col.append(`{"foo": "bar"}`)
+	col.append(`{"hello": "world; semicolon"}`)
+
+	if col.col.Rows() != 2 {
+		t.Fatalf("expected 2 rows, got %d", col.col.Rows())
+	}
+
+	if got := col.col.Row(0); got != `{"foo": "bar"}` {
+		t.Errorf("expected first row to be %q, got %q", `{"foo": "bar"}`, got)
+	}
+
+	if got := col.col.Row(1); got != `{"hello": "world; semicolon"}` {
+		t.Errorf("expected second row to be %q, got %q", `{"hello": "world; semicolon"}`, got)
+	}
+
+	// Test reset
+	col.reset()
+	if col.col.Rows() != 0 {
+		t.Fatalf("expected 0 rows after reset, got %d", col.col.Rows())
+	}
+}
+
+func TestSplitSQLStatements(t *testing.T) {
+	sqlString := `
+		-- This is a comment
+		CREATE TABLE IF NOT EXISTS test_db.table1 (
+			id FixedString(32),
+			name String
+		) ENGINE = ReplacingMergeTree(block_number)
+		ORDER BY id;
+
+		-- Another comment
+		INSERT INTO test_db.table1 (id, name) VALUES ('0x123', 'semicolon; inside; string');
+
+		SELECT * FROM test_db.table1;
+	`
+
+	statements := splitSQLStatements(sqlString)
+	if len(statements) != 3 {
+		t.Fatalf("expected 3 statements, got %d: %#v", len(statements), statements)
+	}
+
+	if !strings.Contains(statements[0], "CREATE TABLE IF NOT EXISTS test_db.table1") {
+		t.Errorf("statement 0 does not match: %q", statements[0])
+	}
+
+	if !strings.Contains(statements[1], "semicolon; inside; string") {
+		t.Errorf("statement 1 does not preserve semicolon inside quotes: %q", statements[1])
+	}
+
+	if statements[2] != "SELECT * FROM test_db.table1" {
+		t.Errorf("statement 2 mismatch, got %q", statements[2])
+	}
+}

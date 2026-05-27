@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
@@ -54,6 +55,48 @@ func TestFetchRawIncludesBoundedToBlock(t *testing.T) {
 	}
 	if got["toBlock"] != float64(20) {
 		t.Fatalf("toBlock = %#v, want 20", got["toBlock"])
+	}
+}
+
+func TestFetchWithParentIncludesForkCursorAndAllBlocks(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := New(server.URL)
+	defer c.Close()
+	if _, err := c.FetchWithParent(context.Background(), 11, nil, "0xparent", true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got["parentBlockHash"] != "0xparent" {
+		t.Fatalf("parentBlockHash = %#v, want 0xparent", got["parentBlockHash"])
+	}
+	if got["includeAllBlocks"] != true {
+		t.Fatalf("includeAllBlocks = %#v, want true", got["includeAllBlocks"])
+	}
+}
+
+func TestFetchParsesForkConflict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"previousBlocks":[{"number":10,"hash":"0x10"},{"number":11,"hash":"0x11a"}]}`))
+	}))
+	defer server.Close()
+
+	c := New(server.URL)
+	defer c.Close()
+	_, err := c.FetchWithParent(context.Background(), 12, nil, "0x11", true, nil)
+	var fork *ForkError
+	if !errors.As(err, &fork) {
+		t.Fatalf("err = %v, want ForkError", err)
+	}
+	if len(fork.PreviousBlocks) != 2 || fork.PreviousBlocks[1].Number != 11 || fork.PreviousBlocks[1].Hash != "0x11a" {
+		t.Fatalf("previous blocks = %#v", fork.PreviousBlocks)
 	}
 }
 

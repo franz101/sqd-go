@@ -304,8 +304,121 @@ func normalizeParamValue(v any) any {
 		return t.Hex()
 	case []byte:
 		return "0x" + hex.EncodeToString(t)
+
+	// Fixed-size byte arrays (common for bytes32/bytes20/etc.)
+	case [32]byte:
+		return "0x" + hex.EncodeToString(t[:])
+	case [20]byte:
+		return "0x" + hex.EncodeToString(t[:])
+	case [16]byte:
+		return "0x" + hex.EncodeToString(t[:])
+	case [8]byte:
+		return "0x" + hex.EncodeToString(t[:])
+	case [4]byte:
+		return "0x" + hex.EncodeToString(t[:])
+	case [64]byte:
+		return "0x" + hex.EncodeToString(t[:])
+
+	// Slices of integers
+	case []*big.Int:
+		out := make([]*uint256.Int, len(t))
+		for i, x := range t {
+			if x != nil {
+				n := new(uint256.Int)
+				n.SetFromBig(x)
+				out[i] = n
+			}
+		}
+		return out
+	case []big.Int:
+		out := make([]*uint256.Int, len(t))
+		for i, x := range t {
+			n := new(uint256.Int)
+			n.SetFromBig(&x)
+			out[i] = n
+		}
+		return out
+	case []*uint256.Int:
+		out := make([]string, len(t))
+		for i, x := range t {
+			if x != nil {
+				out[i] = x.Dec()
+			}
+		}
+		return out
+	case []uint256.Int:
+		out := make([]string, len(t))
+		for i, x := range t {
+			out[i] = x.Dec()
+		}
+		return out
+
+	// Slices of other EVM types
+	case []common.Address:
+		out := make([]string, len(t))
+		for i, x := range t {
+			out[i] = x.Hex()
+		}
+		return out
+	case []common.Hash:
+		out := make([]string, len(t))
+		for i, x := range t {
+			out[i] = x.Hex()
+		}
+		return out
+	case []string:
+		return t
+	case []bool:
+		return t
+	case [][]byte:
+		out := make([]string, len(t))
+		for i, x := range t {
+			out[i] = "0x" + hex.EncodeToString(x)
+		}
+		return out
+
+	// Fixed-width integer types
+	case uint8:
+		return uint64(t)
+	case uint16:
+		return uint64(t)
+	case uint32:
+		return uint64(t)
+	case uint64:
+		return t
+	case int8:
+		return int64(t)
+	case int16:
+		return int64(t)
+	case int32:
+		return int64(t)
+	case int64:
+		return t
+
+	// Pointers to standard primitives/EVM types
+	case *string:
+		if t == nil {
+			return nil
+		}
+		return *t
+	case *bool:
+		if t == nil {
+			return nil
+		}
+		return *t
+	case *common.Address:
+		if t == nil {
+			return nil
+		}
+		return t.Hex()
+	case *common.Hash:
+		if t == nil {
+			return nil
+		}
+		return t.Hex()
 	}
 
+	// Rare fallback using reflect for arbitrary/custom/nested types (e.g. tuples)
 	rv := reflect.ValueOf(v)
 	if !rv.IsValid() {
 		return nil

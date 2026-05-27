@@ -23,6 +23,7 @@ type parsedArgs struct {
 	initChainID  string
 	initStartBlk string
 	initEndBlk   string
+	cpuprofile   string
 }
 
 func parseArgs(args []string) (*parsedArgs, error) {
@@ -70,6 +71,12 @@ func parseArgs(args []string) (*parsedArgs, error) {
 				return nil, fmt.Errorf("--end-block requires a value")
 			}
 			p.initEndBlk = args[i]
+		case "--cpuprofile":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--cpuprofile requires a value")
+			}
+			p.cpuprofile = args[i]
 		default:
 			if !strings.HasPrefix(a, "-") {
 				positional = append(positional, a)
@@ -99,7 +106,10 @@ func parseArgs(args []string) (*parsedArgs, error) {
 
 func Run(args []string) int {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	loadEnv(".env")
+	loadEnv(".env") // cwd
+	if exe, err := os.Executable(); err == nil {
+		loadEnv(filepath.Join(filepath.Dir(exe), ".env")) // binary dir
+	}
 
 	p, err := parseArgs(args)
 	if err != nil {
@@ -136,15 +146,14 @@ func Run(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
 		}
-		return runStartPipeline(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID)
+		return runStartPipeline(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID)
-
+		return runDev(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
 
 	case "stop":
 		return runStop()
@@ -163,7 +172,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, false, p.initStartBlk, p.initEndBlk, p.initChainID)
+		return runStartPipeline(p.command, false, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
 	}
 }
 

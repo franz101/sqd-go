@@ -130,6 +130,87 @@ func TestProcessorStateHandleForkToFinalizedHeadClearsUnfinalizedHeads(t *testin
 	}
 }
 
+func TestProcessorStateRollbackForkReturnsSafeCursor(t *testing.T) {
+	var state processorState
+	state.init(refPtr(4, "0x4"), []client.BlockRef{
+		ref(5, "0x5"),
+		ref(6, "0x6"),
+		ref(7, "0x7"),
+	})
+
+	safe, err := state.rollbackFork([]client.BlockRef{
+		ref(5, "0x5"),
+		ref(6, "0x6a"),
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if safe != ref(5, "0x5") {
+		t.Fatalf("safe = %#v, want block 5", safe)
+	}
+	want := []client.BlockRef{ref(5, "0x5")}
+	if !sameBlockRefs(state.unfinalizedHeads, want) {
+		t.Fatalf("unfinalized heads = %#v, want %#v", state.unfinalizedHeads, want)
+	}
+}
+
+func TestProcessorStateRollbackForkFallsBackToFinalizedHighWatermark(t *testing.T) {
+	var state processorState
+	state.init(refPtr(10, "0x10"), []client.BlockRef{
+		ref(11, "0x11"),
+		ref(12, "0x12"),
+	})
+
+	safe, err := state.rollbackFork([]client.BlockRef{
+		ref(8, "0x8"),
+		ref(9, "0x9"),
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if safe != ref(10, "0x10") {
+		t.Fatalf("safe = %#v, want finalized block 10", safe)
+	}
+	if len(state.unfinalizedHeads) != 0 {
+		t.Fatalf("unfinalized heads = %#v, want empty", state.unfinalizedHeads)
+	}
+}
+
+func TestProcessorStateApplyBatchTracksOnlyUnfinalizedRollbackChain(t *testing.T) {
+	var state processorState
+	state.applyBatch(client.Head{Finalized: refPtr(6, "0x6")}, []client.BlockRef{
+		ref(5, "0x5"),
+		ref(6, "0x6"),
+		ref(7, "0x7"),
+		ref(8, "0x8"),
+	})
+
+	if state.finalizedHead == nil || *state.finalizedHead != ref(6, "0x6") {
+		t.Fatalf("finalized head = %#v, want block 6", state.finalizedHead)
+	}
+	want := []client.BlockRef{ref(7, "0x7"), ref(8, "0x8")}
+	if !sameBlockRefs(state.rollbackChain(), want) {
+		t.Fatalf("rollback chain = %#v, want %#v", state.rollbackChain(), want)
+	}
+}
+
+func TestProcessorStateApplyBatchDoesNotJumpFinalizedBeyondReturnedBlocks(t *testing.T) {
+	var state processorState
+	state.applyBatch(client.Head{Finalized: refPtr(100, "0x100")}, []client.BlockRef{
+		ref(5, "0x5"),
+		ref(6, "0x6"),
+	})
+
+	if state.finalizedHead == nil || *state.finalizedHead != ref(6, "0x6") {
+		t.Fatalf("finalized head = %#v, want last returned block 6", state.finalizedHead)
+	}
+	if state.head() == nil || *state.head() != ref(6, "0x6") {
+		t.Fatalf("head = %#v, want block 6", state.head())
+	}
+}
+
 func TestProcessorStateHandleForkWithoutFinalizedHeadCanDropAllUnfinalizedHeads(t *testing.T) {
 	var state processorState
 	state.init(nil, []client.BlockRef{

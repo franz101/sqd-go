@@ -24,6 +24,7 @@ type Query struct {
 	Type             string      `json:"type"`
 	FromBlock        uint64      `json:"fromBlock"`
 	ToBlock          *uint64     `json:"toBlock,omitempty"`
+	ParentBlockHash  string      `json:"parentBlockHash,omitempty"`
 	IncludeAllBlocks bool        `json:"includeAllBlocks"`
 	Logs             []LogFilter `json:"logs,omitempty"`
 	Fields           Fields      `json:"fields,omitempty"`
@@ -44,6 +45,18 @@ type Head struct {
 type Response struct {
 	Raw  []byte
 	Head Head
+}
+
+type ForkError struct {
+	PreviousBlocks []BlockRef
+}
+
+func (e *ForkError) Error() string {
+	if len(e.PreviousBlocks) == 0 {
+		return "sqd fork detected"
+	}
+	last := e.PreviousBlocks[len(e.PreviousBlocks)-1]
+	return fmt.Sprintf("sqd fork detected, latest portal block sample is %d/%s", last.Number, last.Hash)
 }
 
 func DefaultEVMFields() Fields {
@@ -90,9 +103,14 @@ func (c *Client) FetchRaw(ctx context.Context, fromBlock uint64, toBlock *uint64
 }
 
 func (c *Client) Fetch(ctx context.Context, fromBlock uint64, toBlock *uint64, logs []LogFilter) (Response, error) {
+	return c.FetchWithParent(ctx, fromBlock, toBlock, "", false, logs)
+}
+
+func (c *Client) FetchWithParent(ctx context.Context, fromBlock uint64, toBlock *uint64, parentBlockHash string, includeAllBlocks bool, logs []LogFilter) (Response, error) {
 	q := Query{
 		Type: "evm", FromBlock: fromBlock, ToBlock: toBlock,
-		IncludeAllBlocks: false, Logs: logs, Fields: DefaultEVMFields(),
+		ParentBlockHash: parentBlockHash, IncludeAllBlocks: includeAllBlocks,
+		Logs: logs, Fields: DefaultEVMFields(),
 	}
 	body, err := json.Marshal(q)
 	if err != nil {
@@ -114,6 +132,13 @@ func (c *Client) Fetch(ctx context.Context, fromBlock uint64, toBlock *uint64, l
 	response := Response{Head: parseHeadFromHeaders(resp.Header)}
 	if resp.StatusCode == http.StatusNoContent {
 		return response, nil
+	}
+	if resp.StatusCode == http.StatusConflict {
+		fork, err := parseForkError(resp.Body)
+		if err != nil {
+			return Response{}, err
+		}
+		return Response{}, fork
 	}
 	if resp.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -142,6 +167,16 @@ func (c *Client) Fetch(ctx context.Context, fromBlock uint64, toBlock *uint64, l
 	c.decodeBuf = decompressed
 	response.Raw = decompressed
 	return response, nil
+}
+
+func parseForkError(r io.Reader) (*ForkError, error) {
+	var body struct {
+		PreviousBlocks []BlockRef `json:"previousBlocks"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r, 1<<20)).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode sqd fork response: %w", err)
+	}
+	return &ForkError{PreviousBlocks: body.PreviousBlocks}, nil
 }
 
 func parseHeadFromHeaders(headers http.Header) Head {

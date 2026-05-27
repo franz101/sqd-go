@@ -135,7 +135,7 @@ func writeProject(root string, cfg *config.Config, apiToken string) (string, err
 	if err := os.WriteFile(filepath.Join(root, "schema.graphql"), []byte("type Event @entity {\n  id: ID!\n}\n"), 0o644); err != nil {
 		return "", err
 	}
-	env := "CLICKHOUSE_HTTP_PORT=8135\nCLICKHOUSE_NATIVE_PORT=9003\nCLICKHOUSE_USER=default\nCLICKHOUSE_PASSWORD=sqd-clickhouse\n"
+	env := "CLICKHOUSE_HTTP_PORT=8123\nCLICKHOUSE_NATIVE_PORT=9000\nCLICKHOUSE_USER=default\nCLICKHOUSE_PASSWORD=sqd-clickhouse\n"
 	if apiToken != "" {
 		env += "SQD_API_TOKEN=" + apiToken + "\n"
 	}
