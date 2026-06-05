@@ -106,11 +106,17 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 }
 
 func runStartPipelineInternal(project *config.Project, path string, restart, noResume, protoMode, v3Mode, coldCache bool, outPath, cpuprofile string, pageSizeStr string) int {
+	if v3Mode {
+		// V3 builds on the proto path and the cold tier, adding the in-RAM
+		// negative-lookup filter on top, so it implies both.
+		protoMode = true
+		coldCache = true
+	}
 	if protoMode {
 		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
 	}
 	if v3Mode {
-		log.Printf("V3 DISCOVERY MODE ENABLED: auto-prefetch key discovery")
+		log.Printf("V3 ENABLED: cold-tier negative-lookup filter (a provably-new key skips the Pebble probe + ClickHouse SELECT)")
 	}
 	SetProtoMode(protoMode)
 	SetV3Mode(v3Mode)
@@ -157,6 +163,7 @@ func runStartPipelineInternal(project *config.Project, path string, restart, noR
 		CursorMode:         true,
 		PageSize:           pageSize,
 		ColdCache:          coldCache || (project.Config.ColdCache != nil && *project.Config.ColdCache),
+		ColdNegativeFilter: v3Mode,
 	}
 	if opts.ColdCache {
 		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")

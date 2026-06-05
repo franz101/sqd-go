@@ -20,7 +20,7 @@ type hotStateSpec struct {
 	batchType string
 }
 
-func generateHotStateGo(tables []customTableSpec) ([]byte, error) {
+func generateHotStateGo(tables []customTableSpec, events []eventSpec) ([]byte, error) {
 	var b bytes.Buffer
 	specs := hotStateSpecs(tables)
 
@@ -29,7 +29,7 @@ func generateHotStateGo(tables []customTableSpec) ([]byte, error) {
 package generated
 
 `)
-	renderHotStateImports(&b, tables)
+	renderHotStateImports(&b, tables, events)
 
 	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n\n")
 	for _, spec := range specs {
@@ -45,7 +45,7 @@ package generated
 		renderBatchResolver(&b, spec)
 	}
 	renderHotStateType(&b, specs)
-	renderHotStateHelpers(&b, tables)
+	renderHotStateHelpers(&b, tables, events)
 
 	formatted, err := format.Source(b.Bytes())
 	if err != nil {
@@ -54,7 +54,7 @@ package generated
 	return formatted, nil
 }
 
-func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec) {
+func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
 		`"context"`:                                            "",
 		`"fmt"`:                                                "",
@@ -90,6 +90,12 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec) {
 				imports[`"github.com/franz101/sqd-go/drafts/protomath"`] = ""
 			}
 		}
+	}
+	// Event views (ProtoEventBlock) reference the uint256 hot-state helpers for any
+	// event with a uint256/uint256[] arg, even when no custom/hot-state table uses
+	// uint256 — so the import must follow event usage too.
+	if eventsUseUint256(events) || eventsUseUint256Slice(events) {
+		imports[`"github.com/holiman/uint256"`] = ""
 	}
 	b.WriteString("import (\n")
 	for _, imp := range sortedImportKeys(imports) {
@@ -680,6 +686,44 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString("\treturn firstErr\n}\n\n")
 	}
 
+	// EnableColdNegativeFilter / ColdFilterSkips: the V3 cold-tier negative
+	// Bloom filter. EnableColdCache alone gives V2 behaviour (every hot+cold
+	// miss probes Pebble); additionally calling EnableColdNegativeFilter makes a
+	// provably-new key skip the Pebble probe entirely.
+	if len(coldSpecs) == 0 {
+		b.WriteString("func (s *HotState) EnableColdNegativeFilter(bits uint64) {}\n\n")
+		b.WriteString("func (s *HotState) ColdFilterSkips() uint64 { return 0 }\n\n")
+	} else {
+		b.WriteString("// EnableColdNegativeFilter attaches an in-memory negative-lookup Bloom filter\n")
+		b.WriteString("// to every cold tier (the V3 optimization): a hot+cold miss for a provably-new\n")
+		b.WriteString("// key skips the Pebble probe (and, when authoritative, the ClickHouse SELECT)\n")
+		b.WriteString("// entirely. Call once, after EnableColdCache.\n")
+		b.WriteString("func (s *HotState) EnableColdNegativeFilter(bits uint64) {\n")
+		b.WriteString("\tif s == nil {\n\t\treturn\n\t}\n")
+		for _, spec := range coldSpecs {
+			b.WriteString("\tif s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold != nil {\n\t\ts.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold.EnableNegativeFilter(bits)\n\t}\n")
+		}
+		b.WriteString("}\n\n")
+
+		b.WriteString("// ColdFilterSkips reports how many cold-tier Pebble Gets the V3 negative\n")
+		b.WriteString("// filter avoided across all cold caches.\n")
+		b.WriteString("func (s *HotState) ColdFilterSkips() uint64 {\n")
+		b.WriteString("\tif s == nil {\n\t\treturn 0\n\t}\n")
+		b.WriteString("\tvar n uint64\n")
+		for _, spec := range coldSpecs {
+			b.WriteString("\tif s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold != nil {\n\t\tn += s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold.FilterSkips()\n\t}\n")
+		}
+		b.WriteString("\treturn n\n}\n\n")
+	}
+
 	b.WriteString("func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {\n")
 	for _, spec := range specs {
 		if spec.table.IsEvent {
@@ -791,7 +835,7 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		}
 }
 
-func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec) {
+func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	// Shared FNV-1a byte fold used by every clock cache's flat index (A3). The
 	// index is a pointer-free open-chained hash over an arena (buckets []int32 head
 	// + next []int32 chain), so the GC scans two flat integer slices instead of the
@@ -810,7 +854,8 @@ func clockHash64(seed uint64, b []byte) uint64 {
 		b.WriteString("\nfunc hotStateBool(v bool) uint8 {\n\tif v {\n\t\treturn 1\n\t}\n\treturn 0\n}\n")
 		b.WriteString("\nfunc hotStateBoolSQL(v bool) string {\n\tif v {\n\t\treturn \"1\"\n\t}\n\treturn \"0\"\n}\n")
 	}
-	if customTablesUseUint256(tables) || customTablesUseUint256Slice(tables) {
+	if customTablesUseUint256(tables) || customTablesUseUint256Slice(tables) ||
+		eventsUseUint256(events) || eventsUseUint256Slice(events) {
 		b.WriteString(`
 func hotStateUInt256(v uint256.Int) proto.UInt256 {
 	return proto.UInt256{
@@ -866,7 +911,7 @@ func hotStateHashSlice(values [][]byte) []common.Hash {
 }
 `)
 	}
-	if customTablesUseUint256Slice(tables) {
+	if customTablesUseUint256Slice(tables) || eventsUseUint256Slice(events) {
 		b.WriteString(`
 func hotStateUInt256Slice(values []uint256.Int, scratch []proto.UInt256) []proto.UInt256 {
 	scratch = scratch[:0]
@@ -1223,6 +1268,25 @@ func customTablesUseHashSlice(tables []customTableSpec) bool {
 
 func customTablesUseUint256Slice(tables []customTableSpec) bool {
 	return customTablesUseType(tables, "[]uint256.Int")
+}
+
+func eventsUseUint256(events []eventSpec) bool {
+	return eventsUseType(events, "uint256.Int")
+}
+
+func eventsUseUint256Slice(events []eventSpec) bool {
+	return eventsUseType(events, "[]uint256.Int")
+}
+
+func eventsUseType(events []eventSpec, typ string) bool {
+	for _, ev := range events {
+		for _, arg := range ev.Args {
+			if arg.GoType == typ {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func customTablesUseType(tables []customTableSpec, typ string) bool {

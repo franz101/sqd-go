@@ -174,7 +174,7 @@ func GenerateProject(project *config.Project) (string, error) {
 	hotstatePath := filepath.Join(goOutDir, "hotstate.go")
 	statePath := filepath.Join(goOutDir, "state.go")
 	if len(hotStateTables) > 0 {
-		hotStateCode, err := generateHotStateGo(hotStateTables)
+		hotStateCode, err := generateHotStateGo(hotStateTables, events)
 		if err != nil {
 			return "", err
 		}

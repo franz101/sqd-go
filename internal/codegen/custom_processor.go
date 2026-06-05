@@ -646,6 +646,16 @@ func (p *Processor) EnableColdCache(dir string, authoritative bool) error {
 	return p.State.HotState.EnableColdCache(dir, authoritative, 0, 0)
 }
 
+// EnableColdNegativeFilter turns on the V3 in-RAM negative-lookup Bloom filter
+// over the cold tier: a hot+cold miss for a provably-new key skips even the Pebble
+// probe. No-op if state is nil or the cold tier isn't enabled.
+func (p *Processor) EnableColdNegativeFilter(bits uint64) {
+	if p == nil || p.State == nil || p.State.HotState == nil {
+		return
+	}
+	p.State.HotState.EnableColdNegativeFilter(bits)
+}
+
 // CloseColdCache releases the cold tier (and its off-heap Pebble buffers). Called
 // by the ingestion layer on exit.
 func (p *Processor) CloseColdCache() error {
