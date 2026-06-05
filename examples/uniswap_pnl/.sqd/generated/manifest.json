@@ -1,0 +1,23 @@
+{
+  "name": "case_1_lbtc_event_only",
+  "fork": "default",
+  "config_path": "examples/uniswap_pnl/config.yaml",
+  "chains": [
+    {
+      "id": 1,
+      "start_block": 0,
+      "end_block": 22200000,
+      "contracts": [
+        {
+          "name": "LBTC",
+          "events": [
+            "Transfer(address indexed from, address indexed to, uint256 value)"
+          ],
+          "address": [
+            "0x8236a87084f8B84306f72007F36F2618A5634494"
+          ]
+        }
+      ]
+    }
+  ]
+}

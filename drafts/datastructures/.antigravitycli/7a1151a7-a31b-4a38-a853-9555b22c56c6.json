@@ -1,0 +1,14 @@
+{
+  "id":  "7a1151a7-a31b-4a38-a853-9555b22c56c6",
+  "name":  "/home/dev/CODING/polymarket_lowram/sqd-go-v2/internal/datastructures",
+  "projectResources":  {
+    "resources":  [
+      {
+        "gitFolder":  {
+          "folderUri":  "file:///home/dev/CODING/polymarket_lowram/sqd-go-v2/internal/datastructures",
+          "allowWrite":  true
+        }
+      }
+    ]
+  }
+}

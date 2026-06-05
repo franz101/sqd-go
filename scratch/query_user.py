@@ -1,0 +1,46 @@
+import urllib.request
+import json
+import struct
+
+user_addr = "0x3cf3e8d5427aed066a7a5926980600f6c3cf87b3"
+user_hex = user_addr[2:].lower()
+
+query = f"""
+SELECT 
+    hex(token_id) as tid_hex, 
+    amount, 
+    avg_price, 
+    realized_pn_l, 
+    total_bought,
+    block_number
+FROM polymarket.memory_user_positions 
+WHERE hex(user) = '{user_hex.upper()}'
+"""
+
+url = "http://localhost:8135/?database=polymarket&query=" + urllib.parse.quote(query)
+req = urllib.request.Request(url, headers={"X-ClickHouse-User": "default", "X-ClickHouse-Key": "sqd-clickhouse"})
+
+try:
+    with urllib.request.urlopen(req) as response:
+        res = response.read().decode('utf-8')
+        lines = res.strip().split('\n')
+        print(f"Total positions: {len(lines)}")
+        print("TID_Hex | Decimal_TID | Amount | Avg_Price | Realized_PnL | Total_Bought | Block")
+        for line in lines:
+            if not line: continue
+            parts = line.split('\t')
+            tid_hex = parts[0]
+            # Convert 32 bytes hex to large integer
+            tid_dec = int(tid_hex, 16)
+            amount = float(parts[1])
+            avg_price = float(parts[2])
+            realized_pnl = float(parts[3])
+            total_bought = float(parts[4])
+            block = int(parts[5])
+            
+            # Print if tid starts with some known prefix or just matches
+            tid_str = str(tid_dec)
+            if tid_str.startswith("846843517956627") or tid_str.startswith("955748196818242") or tid_str.startswith("875978179608361") or tid_str.startswith("215548718222198") or tid_str.startswith("113682471054698") or tid_str.startswith("613817941185649") or tid_str.startswith("736064805309795") or tid_str.startswith("722470655095963") or tid_str.startswith("115350632289540") or tid_str.startswith("742033237775332"):
+                print(f"{tid_hex} | {tid_dec} | {amount} | {avg_price} | {realized_pnl} | {total_bought} | {block}")
+except Exception as e:
+    print("Error:", e)

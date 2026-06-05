@@ -1,0 +1,59 @@
+matic:
+  contracts:
+    ConditionalTokens:
+      address: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045'
+      transactionHash: '0xf822536aff16fdb8df59bc9c0b5854c5bec4b9a76484ea9d6944908ced563389'
+      startBlock: 4023686
+    FixedProductMarketMakerFactory:
+      address: '0x8B9805A2f595B6705e74F7310829f2d299D21522'
+      transactionHash: '0x1af1b88e36bb0289f6e037e00d01b26bed997ce7a0406ebafce07dcf766ce7c6'
+      startBlock: 4023693
+    Exchange:
+      address: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E'
+      transactionHash: '0x35423c49cb07c9ccecad9af20df52cccdeff0d46f833d438de8b02f2504aed22'
+      startBlock: 33605403
+    NegRiskExchange:
+      address: '0xC5d563A36AE78145C45a50134d48A1215220f80a'
+      transactionHash: '0x5935e680b186f72b6db932ce351dd6f0288b1e056ab8d0d307c5146606879369'
+      startBlock: 50505492
+    NegRiskAdapter:
+      address: '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
+      transactionHash: '0x192214f14b05d4404271a8d54d633d840277ba7b96df853417eb3fce274af2b9'
+      startBlock: 50505403
+    NegRiskOperator:
+      address: '0x71523d0f655B41E805Cec45b17163f528B59B820'
+    NegRiskWrappedCollateral:
+      address: '0x3A3BD7bb9528E159577F7C2e685CC81A765002E2'
+    UmaSportsOracle:
+      address: '0xb21182d0494521Cf45DbbeEbb5A3ACAAb6d22093'
+      transactionHash: '0xb0cc39f6c2a66a9545a1918724f3e38b8e61b0f7e5282ab1154351a18dc4e0a4'
+      startBlock: 68931384
+    USDC:
+      address: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'
+      transactionHash: '0x51103659d8827d6d24732d1168de73390f4f387d58a8281944241657f1bc61d7'
+      startBlock: 5013591
+    ProxyWalletFactory:
+      address: '0xaB45c5A4B0c941a2F231C04C3f49182e1A254052'
+      transactionHash: '0xda92d52957b2f8eb6f3f66e20a24a21f99e544e1cb2bc15b643beb3344eb4d99'
+      startBlock: 4022827
+    ProxyWalletImplementation:
+      address: '0x44e999d5c2F66Ef0861317f9A4805AC2e90aEB4f'
+      transactionHash: '0xda92d52957b2f8eb6f3f66e20a24a21f99e544e1cb2bc15b643beb3344eb4d99'
+      startBlock: 4022827
+    RelayHub:
+      address: '0xD216153c06E857cD7f72665E0aF1d7D82172F494'
+      transactionHash: '0x34159122fb20e9ee0c2e1b1b6ad59018a47403e473ffffcd5a401ec6428dfb79'
+      startBlock: 3764531
+    SafeProxyFactory:
+      address: '0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b'
+      transactionHash: '0xddcfc612da555656acb1ac68d50a64cd07a8f9a84af534410567d781c49dfe5f'
+      startBlock: 19426226
+    FeeModule:
+      address: '0xE3f18aCc55091e2c48d883fc8C8413319d4Ab7b0'
+      transactionHash: '0xe9d5e02e2ba0c51c1da1088f225b53bc77fed0cd59d38e7c432eb42142618b80'
+      startBlock: 75253526
+    NegRiskFeeModule:
+      address: '0xB768891e3130F6dF18214Ac804d4DB76c2C37730'
+      transactionHash: '0x98056b5440ec9dd2eb2380ab7f7ca20e0f8e6a1afa095bf9038ec2f1fb808b04'
+      startBlock: 75253721
+  networkName: matic
