@@ -132,8 +132,10 @@ func (p *ParallelJSONLParser) Parse(data []byte, onBlock func(*Block) error) err
 }
 
 func BenchmarkParserComparison(b *testing.B) {
-	// Load actual exchange_orderfilled.jsonl file
-	filePath := "/home/dev/CODING/polymarket_lowram/sqd-go/samples/exchange_orderfilled.jsonl"
+	filePath := os.Getenv("JSONL_BENCH_FILE")
+	if filePath == "" {
+		b.Skip("set JSONL_BENCH_FILE to benchmark a local sample file")
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		b.Skipf("sample file not found: %v", err)

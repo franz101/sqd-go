@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/franz101/sqd-go/internal/config"
 )
 
 type hotStateSpec struct {
@@ -31,11 +33,15 @@ package generated
 
 	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n\n")
 	for _, spec := range specs {
-		renderHotStateEntity(&b, spec.table)
+		if !spec.table.IsEvent {
+			renderHotStateEntity(&b, spec.table)
+		}
 		renderClockKey(&b, spec)
 		renderClockCache(&b, spec)
-		renderCustomBatch(&b, spec)
-		renderClockRecover(&b, spec)
+		if !spec.table.IsEvent {
+			renderCustomBatch(&b, spec)
+			renderClockRecover(&b, spec)
+		}
 		renderBatchResolver(&b, spec)
 	}
 	renderHotStateType(&b, specs)
@@ -50,17 +56,24 @@ package generated
 
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec) {
 	imports := map[string]string{
-		`"context"`:                           "",
-		`"fmt"`:                               "",
-		`"strings"`:                           "",
-		`"sync"`:                              "",
-		`"sync/atomic"`:                       "",
-		`"github.com/ClickHouse/ch-go"`:       "",
-		`"github.com/ClickHouse/ch-go/proto"`: "",
+		`"context"`:                                            "",
+		`"fmt"`:                                                "",
+		`"strings"`:                                            "",
+		`"sync"`:                                               "",
+		`"sync/atomic"`:                                        "",
+		`"github.com/ClickHouse/ch-go"`:                        "",
+		`"github.com/ClickHouse/ch-go/proto"`:                  "",
+		`"github.com/franz101/sqd-go/internal/coldcache"`:      "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""
 		imports[`"math/big"`] = ""
+	}
+	if customTablesUseColdCache(tables) {
+		// Cold tier (Pebble) stores pointer-free hot values as raw bytes; the
+		// unsafe memcpy is zero-transformation and filepath builds the per-cache dir.
+		imports[`"path/filepath"`] = ""
+		imports[`"unsafe"`] = ""
 	}
 	for _, table := range tables {
 		for _, field := range table.Fields {
@@ -73,6 +86,8 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec) {
 				imports[`"github.com/holiman/uint256"`] = ""
 			case strings.Contains(field.Type, "decimal."):
 				imports[`"github.com/shopspring/decimal"`] = ""
+			case strings.Contains(field.Type, "protomath."):
+				imports[`"github.com/franz101/sqd-go/drafts/protomath"`] = ""
 			}
 		}
 	}
@@ -93,11 +108,12 @@ func renderHotStateEntity(b *bytes.Buffer, table customTableSpec) {
 		b.WriteString("\t")
 		b.WriteString(field.Name)
 		b.WriteString(" ")
-		b.WriteString(field.Type)
+		b.WriteString(memoryGoType(field, table.IsEvent))
 		b.WriteString(" `ch:")
 		b.WriteString(strconv.Quote("name=" + field.ColumnName + ";type=" + field.ColumnType))
 		b.WriteString("`\n")
 	}
+	b.WriteString("\tTombstone bool `ch:\"-\"`\n")
 	b.WriteString("}\n\n")
 }
 
@@ -147,49 +163,192 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(valueType)
 	b.WriteString("\n\treferenced uint32\n\tinUse uint32\n}\n\n")
 
-	b.WriteString("type ")
-	b.WriteString(spec.cacheType)
-	b.WriteString(" struct {\n\titems sync.Map\n\tring []")
-	b.WriteString(spec.entryType)
-	b.WriteString("\n\tcapacity uint64\n\thand uint64\n\tsize uint64\n}\n\n")
+	// Cache struct. The index is a pointer-free chained hash over an arena (A3):
+	// buckets[h] = ring index of a chain head (-1 = empty); next[ringIdx] = next
+	// ring index in the same bucket (-1 = end). Replaces a sync.Map[key]idx whose
+	// boxed key+idx interfaces were ~3 GC-scanned objects per live entry. Single
+	// writer (one processor goroutine) => the index needs no locking; the CLOCK
+	// entry flags stay atomic so concurrent readers (if ever reintroduced) still see
+	// torn-free flag transitions.
+	fmt.Fprintf(b, `type %[1]s struct {
+	buckets  []int32
+	next     []int32
+	ring     []%[2]s
+	mask     uint32
+	capacity uint64
+	hand     uint64
+	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
+}
 
-	b.WriteString("func New")
-	b.WriteString(spec.cacheType)
-	b.WriteString("(capacity uint64) *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(" {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n\treturn &")
-	b.WriteString(spec.cacheType)
-	b.WriteString("{ring: make([]")
-	b.WriteString(spec.entryType)
-	b.WriteString(", capacity), capacity: capacity}\n}\n\n")
+func New%[1]s(capacity uint64) *%[1]s {
+	if capacity == 0 {
+		capacity = DefaultClockCacheCapacity
+	}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &%[1]s{
+		ring:     make([]%[2]s, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Set(value ")
-	b.WriteString(valueType)
-	b.WriteString(") {\n\tc.SetByKey(New")
-	b.WriteString(spec.keyType)
-	b.WriteString("(value), value)\n}\n\n")
+`, spec.cacheType, spec.entryType)
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") SetByKey(key ")
-	b.WriteString(spec.keyType)
-	b.WriteString(", value ")
-	b.WriteString(valueType)
-	b.WriteString(") {\n\tif idxVal, ok := c.items.Load(key); ok {\n\t\tidx := idxVal.(uint64)\n\t\te := &c.ring[idx]\n\t\tif atomic.LoadUint32(&e.inUse) == 1 && e.key == key {\n\t\t\te.value = value\n\t\t\tatomic.StoreUint32(&e.referenced, 1)\n\t\t\treturn\n\t\t}\n\t}\n\tfor {\n\t\thand := atomic.AddUint64(&c.hand, 1)\n\t\tidx := (hand - 1) % c.capacity\n\t\te := &c.ring[idx]\n\t\tif atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {\n\t\t\tif atomic.LoadUint32(&e.referenced) == 1 {\n\t\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\t\tatomic.StoreUint32(&e.inUse, 1)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tc.items.Delete(e.key)\n\t\t\te.key = key\n\t\t\te.value = value\n\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\tc.items.Store(key, idx)\n\t\t\tatomic.StoreUint32(&e.inUse, 1)\n\t\t\treturn\n\t\t}\n\t\tif atomic.LoadUint32(&e.inUse) == 0 {\n\t\t\tif atomic.CompareAndSwapUint32(&e.inUse, 0, 2) {\n\t\t\t\te.key = key\n\t\t\t\te.value = value\n\t\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\t\tc.items.Store(key, idx)\n\t\t\t\tatomic.AddUint64(&c.size, 1)\n\t\t\t\tatomic.StoreUint32(&e.inUse, 1)\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n}\n\n")
+	// keyHash folds every key field's bytes (all keys are common.Hash/Address byte
+	// arrays) into a bucket index.
+	fmt.Fprintf(b, "func (c *%s) keyHash(key %s) uint32 {\n\th := uint64(1469598103934665603)\n", spec.cacheType, spec.keyType)
+	for _, field := range keyFields {
+		fmt.Fprintf(b, "\th = clockHash64(h, key.%s[:])\n", field.Name)
+	}
+	b.WriteString("\treturn uint32(h^(h>>32)) & c.mask\n}\n\n")
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Get(key ")
-	b.WriteString(spec.keyType)
-	b.WriteString(") (")
-	b.WriteString(valueType)
-	b.WriteString(", bool) {\n\tidxVal, ok := c.items.Load(key)\n\tif !ok {\n\t\treturn ")
-	b.WriteString(valueType)
-	b.WriteString("{}, false\n\t}\n\tidx := idxVal.(uint64)\n\te := &c.ring[idx]\n\tif atomic.LoadUint32(&e.inUse) == 1 && e.key == key {\n\t\tatomic.StoreUint32(&e.referenced, 1)\n\t\treturn e.value, true\n\t}\n\treturn ")
-	b.WriteString(valueType)
-	b.WriteString("{}, false\n}\n\n")
+	fmt.Fprintf(b, `func (c *%[1]s) idxLookup(key %[2]s) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *%[1]s) idxInsert(key %[2]s, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *%[1]s) idxUnlink(key %[2]s) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
+}
+
+`, spec.cacheType, spec.keyType)
+
+	coldOn := entityUsesCold(spec.table)
+	// spill: on CLOCK eviction, write the victim (value or tombstone) to the cold
+	// tier BEFORE overwriting it, so a later re-reference is served from disk and a
+	// dirty-but-evicted entry isn't lost before Commit reads it.
+	spill := ""
+	if coldOn {
+		spill = "\t\t\tif c.cold != nil {\n" +
+			"\t\t\t\tc.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))\n" +
+			"\t\t\t}\n"
+	}
+	fmt.Fprintf(b, `func (c *%[1]s) Set(value %[3]s) {
+	c.SetByKey(New%[2]s(value), value)
+}
+
+func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			e.value = value
+			atomic.StoreUint32(&e.referenced, 1)
+			return
+		}
+	}
+	for {
+		hand := atomic.AddUint64(&c.hand, 1)
+		idx := (hand - 1) %% c.capacity
+		e := &c.ring[idx]
+		if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
+			if atomic.LoadUint32(&e.referenced) == 1 {
+				atomic.StoreUint32(&e.referenced, 0)
+				atomic.StoreUint32(&e.inUse, 1)
+				continue
+			}
+%[4]s			c.idxUnlink(e.key)
+			e.key = key
+			e.value = value
+			atomic.StoreUint32(&e.referenced, 0)
+			c.idxInsert(key, uint32(idx))
+			atomic.StoreUint32(&e.inUse, 1)
+			return
+		}
+		if atomic.LoadUint32(&e.inUse) == 0 {
+			if atomic.CompareAndSwapUint32(&e.inUse, 0, 2) {
+				e.key = key
+				e.value = value
+				atomic.StoreUint32(&e.referenced, 0)
+				c.idxInsert(key, uint32(idx))
+				atomic.AddUint64(&c.size, 1)
+				atomic.StoreUint32(&e.inUse, 1)
+				return
+			}
+		}
+	}
+}
+
+`, spec.cacheType, spec.keyType, valueType, spill)
+
+	if coldOn {
+		// Cold-consult on hot miss: an evicted entry (spilled on eviction) is served
+		// from Pebble (~8µs) instead of a ClickHouse round-trip (~1.9ms), then
+		// promoted back into the hot ring. A cold tombstone round-trips as a value
+		// with Tombstone=true, which the state-level Get treats as "absent".
+		fmt.Fprintf(b, `func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
+	}
+	if c.cold != nil {
+		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			var v %[3]s
+			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+			c.SetByKey(key, v)
+			return v, true
+		}
+	}
+	return %[3]s{}, false
+}
+
+`, spec.cacheType, spec.keyType, valueType)
+	} else {
+		fmt.Fprintf(b, `func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
+	idx, ok := c.idxLookup(key)
+	if !ok {
+		return %[3]s{}, false
+	}
+	e := &c.ring[idx]
+	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+		atomic.StoreUint32(&e.referenced, 1)
+		return e.value, true
+	}
+	return %[3]s{}, false
+}
+
+`, spec.cacheType, spec.keyType, valueType)
+	}
 
 	if len(keyFields) > 0 {
 		b.WriteString("func (c *")
@@ -212,29 +371,77 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString("})\n}\n\n")
 	}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Delete(key ")
-	b.WriteString(spec.keyType)
-	b.WriteString(") bool {\n\tidxVal, ok := c.items.Load(key)\n\tif !ok {\n\t\treturn false\n\t}\n\tidx := idxVal.(uint64)\n\te := &c.ring[idx]\n\tif atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {\n\t\tif e.key == key {\n\t\t\tc.items.Delete(key)\n\t\t\te.key = ")
-	b.WriteString(spec.keyType)
-	b.WriteString("{}\n\t\t\te.value = ")
-	b.WriteString(valueType)
-	b.WriteString("{}\n\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\tatomic.AddUint64(&c.size, ^uint64(0))\n\t\t\treturn true\n\t\t}\n\t\tatomic.StoreUint32(&e.inUse, 1)\n\t}\n\treturn false\n}\n\n")
+	// coldDel mirrors a hard delete into the cold tier so a rolled-back key cannot
+	// resurrect from disk on a later miss.
+	coldDel := ""
+	if coldOn {
+		coldDel = "\t\t\tif c.cold != nil {\n" +
+			"\t\t\t\tc.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))\n" +
+			"\t\t\t}\n"
+	}
+	fmt.Fprintf(b, `func (c *%[1]s) Delete(key %[2]s) bool {
+	idx, ok := c.idxLookup(key)
+	if !ok {
+		return false
+	}
+	e := &c.ring[idx]
+	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
+		if e.key == key {
+			c.idxUnlink(key)
+%[4]s			e.key = %[2]s{}
+			e.value = %[3]s{}
+			atomic.StoreUint32(&e.referenced, 0)
+			atomic.AddUint64(&c.size, ^uint64(0))
+			return true
+		}
+		atomic.StoreUint32(&e.inUse, 1)
+	}
+	return false
+}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Range(fn func(")
-	b.WriteString(spec.keyType)
-	b.WriteString(", ")
-	b.WriteString(valueType)
-	b.WriteString(") bool) {\n\tif fn == nil {\n\t\treturn\n\t}\n\tc.items.Range(func(keyAny, idxAny any) bool {\n\t\tkey, ok := keyAny.(")
-	b.WriteString(spec.keyType)
-	b.WriteString(")\n\t\tif !ok {\n\t\t\treturn true\n\t\t}\n\t\tidx, ok := idxAny.(uint64)\n\t\tif !ok || idx >= c.capacity {\n\t\t\treturn true\n\t\t}\n\t\te := &c.ring[idx]\n\t\tif atomic.LoadUint32(&e.inUse) == 1 && e.key == key {\n\t\t\treturn fn(key, e.value)\n\t\t}\n\t\treturn true\n\t})\n}\n\n")
+func (c *%[1]s) Range(fn func(%[2]s, %[3]s) bool) {
+	if fn == nil {
+		return
+	}
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
+		}
+	}
+}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Len() uint64 {\n\treturn atomic.LoadUint64(&c.size)\n}\n\n")
+func (c *%[1]s) AppendValues(dst []%[3]s) []%[3]s {
+	if c == nil {
+		return dst
+	}
+	if atomic.LoadUint64(&c.size) == 0 {
+		return dst
+	}
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := 0; i < int(limit); i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			dst = append(dst, e.value)
+		}
+	}
+	return dst
+}
+
+func (c *%[1]s) Len() uint64 {
+	return atomic.LoadUint64(&c.size)
+}
+
+`, spec.cacheType, spec.keyType, valueType, coldDel)
 }
 
 func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
@@ -303,7 +510,7 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(spec.table.GoTypeName)
 	b.WriteString(") {\n")
 	for _, field := range spec.table.Fields {
-		for _, line := range batchAppendLines(field) {
+		for _, line := range batchAppendLines(field, spec.table.IsEvent) {
 			b.WriteString("\t")
 			b.WriteString(line)
 			b.WriteString("\n")
@@ -319,7 +526,10 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(spec.batchType)
 	b.WriteString(") Insert(ctx context.Context, conn *ch.Client, db string) error {\n\tif b.Rows() == 0 {\n\t\treturn nil\n\t}\n\treturn conn.Do(ctx, ch.Query{Body: fmt.Sprintf(")
 	b.WriteString(strconv.Quote("INSERT INTO %s.%s " + customInsertColumnList(spec.table) + " VALUES"))
-	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input})\n}\n\n")
+	// wait_for_async_insert MUST be 1: hot-state commits are read back on
+	// prefetch/recovery/rollback. With wait=0 (fire-and-forget) a SELECT after
+	// Commit can miss un-flushed rows, returning stale/partial state under load.
+	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: \"async_insert\", Value: \"1\", Important: true}, {Key: \"wait_for_async_insert\", Value: \"1\", Important: true}}})\n}\n\n")
 }
 
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
@@ -361,7 +571,7 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString("\t\t\t\t")
 		b.WriteString(field.Name)
 		b.WriteString(": ")
-		b.WriteString(resultValueExpr(field))
+		b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 		b.WriteString(",\n")
 	}
 	b.WriteString("\t\t\t}\n\t\t\tc.Set(item)\n\t\t}\n\t\treturn nil\n\t}})\n}\n\n")
@@ -382,7 +592,20 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString("Resolver *")
 		b.WriteString(resolverType)
 		b.WriteString("\n")
+
+		if !spec.table.IsEvent {
+			b.WriteString("\tdirty")
+			b.WriteString(spec.baseName)
+			b.WriteString(" map[")
+			b.WriteString(spec.keyType)
+			b.WriteString("]struct{}\n")
+		}
 	}
+	b.WriteString("\tmu sync.Mutex\n")
+	b.WriteString("\t// coldAuthoritative is set when the cold tier was opened against an empty\n")
+	b.WriteString("\t// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,\n")
+	b.WriteString("\t// so the lazy state Get skips the ClickHouse point-SELECT entirely.\n")
+	b.WriteString("\tcoldAuthoritative bool\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -393,6 +616,13 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(": New")
 		b.WriteString(spec.cacheType)
 		b.WriteString("(capacity),\n")
+		if !spec.table.IsEvent {
+			b.WriteString("\t\tdirty")
+			b.WriteString(spec.baseName)
+			b.WriteString(": make(map[")
+			b.WriteString(spec.keyType)
+			b.WriteString("]struct{}),\n")
+		}
 	}
 	b.WriteString("\t}\n")
 	for _, spec := range specs {
@@ -407,18 +637,178 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	}
 	b.WriteString("\treturn state\n}\n\n")
 
+	// EnableColdCache / CloseColdCache: attach the Pebble cold tier to every
+	// pointer-free entity. authoritative=true (from-genesis, empty ClickHouse) lets
+	// the lazy Get skip ClickHouse on a hot+cold miss. Default-off — callers that
+	// never enable it get byte-for-byte the prior behaviour.
+	var coldSpecs []hotStateSpec
+	for _, spec := range specs {
+		if entityUsesCold(spec.table) {
+			coldSpecs = append(coldSpecs, spec)
+		}
+	}
+	if len(coldSpecs) == 0 {
+		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n\treturn nil\n}\n\n")
+		b.WriteString("func (s *HotState) CloseColdCache() error {\n\treturn nil\n}\n\n")
+	} else {
+		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n")
+		b.WriteString("\tif s == nil {\n\t\treturn nil\n\t}\n")
+		b.WriteString("\tvar err error\n")
+		for _, spec := range coldSpecs {
+			b.WriteString("\tif s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold, err = coldcache.Open(filepath.Join(dir, ")
+			b.WriteString(strconv.Quote(spec.baseName))
+			b.WriteString("), cacheBytes, memTableBytes); err != nil {\n\t\treturn err\n\t}\n")
+		}
+		b.WriteString("\ts.coldAuthoritative = authoritative\n")
+		b.WriteString("\treturn nil\n}\n\n")
+
+		b.WriteString("func (s *HotState) CloseColdCache() error {\n")
+		b.WriteString("\tif s == nil {\n\t\treturn nil\n\t}\n")
+		b.WriteString("\tvar firstErr error\n")
+		for _, spec := range coldSpecs {
+			b.WriteString("\tif s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold != nil {\n\t\tif e := s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold.Close(); e != nil && firstErr == nil {\n\t\t\tfirstErr = e\n\t\t}\n\t\ts.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold = nil\n\t}\n")
+		}
+		b.WriteString("\ts.coldAuthoritative = false\n")
+		b.WriteString("\treturn firstErr\n}\n\n")
+	}
+
 	b.WriteString("func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {\n")
 	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
 		b.WriteString("\tif err := s.")
 		b.WriteString(spec.baseName)
 		b.WriteString(".Recover(ctx, conn, db); err != nil {\n\t\treturn err\n\t}\n")
 	}
+	b.WriteString("\treturn nil\n}\n\n")
+
+	// Generate Update methods
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("func (s *HotState) Update")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString("(value ")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString(") {\n")
+		b.WriteString("\ts.mu.Lock()\n")
+		b.WriteString("\tdefer s.mu.Unlock()\n")
+		b.WriteString("\ts.")
+		b.WriteString(spec.baseName)
+		b.WriteString(".Set(value)\n")
+		b.WriteString("\ts.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString("[New")
+		b.WriteString(spec.keyType)
+		b.WriteString("(value)] = struct{}{}\n")
+		b.WriteString("}\n\n")
+	}
+
+	// Generate Commit method
+	b.WriteString("func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error {\n")
+	b.WriteString("\ts.mu.Lock()\n")
+	b.WriteString("\tdefer s.mu.Unlock()\n")
+	b.WriteString("\tif conn == nil {\n")
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\t\tclear(s.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString(")\n")
+	}
+	b.WriteString("\t\treturn nil\n")
+	b.WriteString("\t}\n")
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\tif len(s.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString(") > 0 {\n")
+		b.WriteString("\t\tbatch := New")
+		b.WriteString(spec.batchType)
+		b.WriteString("()\n")
+		b.WriteString("\t\tfor key := range s.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString(" {\n")
+		b.WriteString("\t\t\tif val, ok := s.")
+		b.WriteString(spec.baseName)
+		b.WriteString(".Get(key); ok {\n")
+		b.WriteString("\t\t\t\tbatch.Append(val)\n")
+		b.WriteString("\t\t\t}\n")
+		b.WriteString("\t\t}\n")
+		b.WriteString("\t\tif err := batch.Insert(ctx, conn, db); err != nil {\n")
+		b.WriteString("\t\t\treturn err\n")
+		b.WriteString("\t\t}\n")
+		b.WriteString("\t\tclear(s.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString(")\n")
+		b.WriteString("\t}\n")
+	}
 	b.WriteString("\treturn nil\n}\n")
+
+		// Generate Restore methods for journal rollback
+		for _, spec := range specs {
+			if spec.table.IsEvent {
+				continue
+			}
+			b.WriteString("func (s *HotState) Restore")
+			b.WriteString(spec.table.GoTypeName)
+			b.WriteString("(key ")
+			b.WriteString(spec.keyType)
+			b.WriteString(", value ")
+			b.WriteString(spec.table.GoTypeName)
+			b.WriteString(", had bool) {\n")
+			b.WriteString("\ts.mu.Lock()\n")
+			b.WriteString("\tdefer s.mu.Unlock()\n")
+			b.WriteString("\tif had {\n")
+			b.WriteString("\t\ts.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".SetByKey(key, value)\n")
+			b.WriteString("\t\ts.dirty")
+			b.WriteString(spec.baseName)
+			b.WriteString("[key] = struct{}{}\n")
+			b.WriteString("\t\treturn\n")
+			b.WriteString("\t}\n")
+			b.WriteString("\ts.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".Delete(key)\n")
+			b.WriteString("\tdelete(s.dirty")
+			b.WriteString(spec.baseName)
+			b.WriteString(", key)\n")
+			b.WriteString("}\n\n")
+		}
 }
 
 func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec) {
+	// Shared FNV-1a byte fold used by every clock cache's flat index (A3). The
+	// index is a pointer-free open-chained hash over an arena (buckets []int32 head
+	// + next []int32 chain), so the GC scans two flat integer slices instead of the
+	// millions of boxed interface objects a sync.Map[key]idx allocated.
+	b.WriteString(`
+func clockHash64(seed uint64, b []byte) uint64 {
+	h := seed
+	for _, x := range b {
+		h ^= uint64(x)
+		h *= 1099511628211
+	}
+	return h
+}
+`)
 	if customTablesUseBool(tables) {
 		b.WriteString("\nfunc hotStateBool(v bool) uint8 {\n\tif v {\n\t\treturn 1\n\t}\n\treturn 0\n}\n")
+		b.WriteString("\nfunc hotStateBoolSQL(v bool) string {\n\tif v {\n\t\treturn \"1\"\n\t}\n\treturn \"0\"\n}\n")
 	}
 	if customTablesUseUint256(tables) || customTablesUseUint256Slice(tables) {
 		b.WriteString(`
@@ -436,35 +826,24 @@ func hotStateUint256(v proto.UInt256) uint256.Int {
 	}
 	if customTablesUseDecimal(tables) {
 		b.WriteString(`
-func hotStateDecimal128(d decimal.Decimal, scale int) proto.Decimal128 {
-	v := d.Mul(decimal.NewFromInt(1).Shift(int32(scale)))
-	i := v.BigInt()
-	neg := i.Sign() < 0
-	if neg {
-		i = new(big.Int).Abs(i)
-	}
-	raw := i.Bytes()
-	var res [16]byte
-	copy(res[16-len(raw):], raw)
-	low := binary.BigEndian.Uint64(res[8:16])
-	high := binary.BigEndian.Uint64(res[0:8])
-	if neg {
-		low = ^low
-		high = ^high
-		low++
-		if low == 0 {
-			high++
-		}
-	}
-	return proto.Decimal128{Low: low, High: high}
+func hotStateDecimalToDecimal256(d decimal.Decimal) protomath.Decimal256 {
+	out, _ := protomath.FromDecimal256ScaledBigInt(d.Shift(18).BigInt())
+	return out
 }
 
-func hotStateDecimalFromString(raw string) decimal.Decimal {
-	v, err := decimal.NewFromString(raw)
-	if err != nil {
-		return decimal.Zero
+func hotStateDecimalFromDecimal256(v protomath.Decimal256) decimal.Decimal {
+	return decimal.NewFromBigInt(v.ScaledBig(), -18)
+}
+`)
 	}
-	return v
+	if customTablesUseType(tables, "protomath.Decimal256") {
+		b.WriteString(`
+type decimal256Col struct {
+	proto.ColDecimal256
+}
+
+func (c *decimal256Col) Type() proto.ColumnType {
+	return proto.ColumnType("Decimal(76, 18)")
 }
 `)
 	}
@@ -523,7 +902,12 @@ func hotStateSpecs(tables []customTableSpec) []hotStateSpec {
 	used := make(map[string]int)
 	specs := make([]hotStateSpec, 0, len(tables))
 	for _, table := range tables {
-		base := uniqueExported(used, customClockBaseName(table.GoTypeName))
+		var base string
+		if table.BaseName != "" {
+			base = uniqueExported(used, table.BaseName)
+		} else {
+			base = uniqueExported(used, customClockBaseName(table.GoTypeName))
+		}
 		specs = append(specs, hotStateSpec{
 			table:     table,
 			baseName:  base,
@@ -538,20 +922,7 @@ func hotStateSpecs(tables []customTableSpec) []hotStateSpec {
 
 func customClockBaseName(typeName string) string {
 	name := strings.TrimPrefix(customTableEntityName(typeName), "Memory")
-	switch {
-	case strings.HasSuffix(name, "UserPosition"):
-		return "Positions"
-	case strings.HasSuffix(name, "Position"):
-		return pluralizeGoName(strings.TrimSuffix(name, "Position") + "Position")
-	case strings.HasSuffix(name, "Market"):
-		return pluralizeGoName(name)
-	case strings.HasSuffix(name, "Condition"):
-		return pluralizeGoName(name)
-	case strings.HasSuffix(name, "Event"):
-		return pluralizeGoName(name)
-	default:
-		return pluralizeGoName(name)
-	}
+	return pluralizeGoName(name)
 }
 
 func pluralizeGoName(name string) string {
@@ -612,6 +983,29 @@ func batchScratchType(field customFieldSpec) string {
 	}
 }
 
+// memoryGoType returns the in-memory Go type for a hot-state value-struct field,
+// which may differ from the schema/source type to keep the rings pointer-free
+// (A2). Timestamps are stored as int64 unix-millis in memory — the ClickHouse
+// column stays DateTime64(3, 'UTC') — so MemoryUserPosition et al. carry no
+// *time.Location pointer and the GC skips the whole ring backing array on every
+// mark, instead of scanning all N entries. Conversions happen at Append/Recover
+// (see batchAppendLines / resultValueExpr) and at assignment (state.go Save).
+func memoryGoType(field customFieldSpec, isEvent bool) string {
+	// Event value-structs embed EventMeta (shared with the ingestion/handler layer,
+	// where BlockTimestamp is a time.Time), so they keep time.Time. Only the derived
+	// entity rings (UserPositions et al.) — the ones that grow to capacity — are
+	// converted to int64 to make their backing arrays pointer-free.
+	if isEvent {
+		return field.Type
+	}
+	switch field.Type {
+	case "time.Time":
+		return "int64"
+	default:
+		return field.Type
+	}
+}
+
 func batchColumnType(field customFieldSpec) string {
 	switch field.Type {
 	case "bool", "uint8":
@@ -643,7 +1037,9 @@ func batchColumnType(field customFieldSpec) string {
 	case "uint256.Int":
 		return "proto.ColUInt256"
 	case "decimal.Decimal":
-		return "proto.ColDecimal128"
+		return "decimal256Col"
+	case "protomath.Decimal256":
+		return "decimal256Col"
 	case "[]common.Hash":
 		return "*proto.ColArr[[]byte]"
 	case "[]uint256.Int":
@@ -656,9 +1052,6 @@ func batchColumnType(field customFieldSpec) string {
 }
 
 func resultColumnType(field customFieldSpec) string {
-	if field.Type == "decimal.Decimal" {
-		return "proto.ColStr"
-	}
 	return batchColumnType(field)
 }
 
@@ -696,8 +1089,8 @@ func initLines(prefix string, field customFieldSpec) []string {
 func batchInputData(field customFieldSpec) string {
 	col := "b." + batchColumnField(field)
 	switch field.Type {
-	case "decimal.Decimal":
-		return "proto.Wrap(&" + col + ", 18)"
+	case "decimal.Decimal", "protomath.Decimal256":
+		return "&" + col
 	case "[]common.Hash", "[]uint256.Int", "[]string":
 		return col
 	default:
@@ -708,6 +1101,8 @@ func batchInputData(field customFieldSpec) string {
 func resultData(field customFieldSpec) string {
 	col := batchColumnField(field)
 	switch field.Type {
+	case "decimal.Decimal", "protomath.Decimal256":
+		return "&" + col
 	case "[]common.Hash", "[]uint256.Int", "[]string":
 		return col
 	default:
@@ -723,9 +1118,15 @@ func batchColumnRowsExpr(field customFieldSpec) string {
 	return col + ".Rows()"
 }
 
-func batchAppendLines(field customFieldSpec) []string {
+func batchAppendLines(field customFieldSpec, isEvent bool) []string {
 	col := "b." + batchColumnField(field)
 	value := "item." + field.Name
+	if !isEvent && field.Type == "time.Time" {
+		// In-memory value is int64 unix-millis (A2); the DateTime64(3) column's raw
+		// units are also milliseconds, so append the raw value directly — no
+		// time.Time is constructed on the hot insert path.
+		return []string{col + ".AppendRaw(proto.DateTime64(" + value + "))"}
+	}
 	switch field.Type {
 	case "common.Address", "common.Hash":
 		return []string{col + ".Append(" + value + ".Bytes())"}
@@ -734,7 +1135,9 @@ func batchAppendLines(field customFieldSpec) []string {
 	case "[]byte":
 		return []string{col + ".AppendBytes(" + value + ")"}
 	case "decimal.Decimal":
-		return []string{col + ".Append(hotStateDecimal128(" + value + ", 18))"}
+		return []string{col + ".Append(hotStateDecimalToDecimal256(" + value + ").Proto())"}
+	case "protomath.Decimal256":
+		return []string{col + ".Append(" + value + ".Proto())"}
 	case "uint256.Int":
 		return []string{col + ".Append(hotStateUInt256(" + value + "))"}
 	case "[]common.Hash":
@@ -746,8 +1149,14 @@ func batchAppendLines(field customFieldSpec) []string {
 	}
 }
 
-func resultValueExpr(field customFieldSpec) string {
+func resultValueExpr(field customFieldSpec, isEvent bool) string {
 	col := batchColumnField(field)
+	if !isEvent && field.Type == "time.Time" {
+		// Recover path (cold): read the DateTime64 instant back as int64 unix-millis
+		// to match the in-memory representation (A2). UnixMilli is timezone-
+		// independent, so it round-trips the millisecond raw value exactly.
+		return col + ".Row(i).UnixMilli()"
+	}
 	switch field.Type {
 	case "common.Address":
 		return "common.BytesToAddress(" + col + ".Row(i))"
@@ -758,7 +1167,9 @@ func resultValueExpr(field customFieldSpec) string {
 	case "[]byte":
 		return "append([]byte(nil), " + col + ".RowBytes(i)...)"
 	case "decimal.Decimal":
-		return "hotStateDecimalFromString(" + col + ".Row(i))"
+		return "hotStateDecimalFromDecimal256(protomath.Decimal256(" + col + ".Row(i)))"
+	case "protomath.Decimal256":
+		return "protomath.Decimal256(" + col + ".Row(i))"
 	case "uint256.Int":
 		return "hotStateUint256(" + col + ".Row(i))"
 	case "[]common.Hash":
@@ -781,11 +1192,7 @@ func customInsertColumnList(table customTableSpec) string {
 func recoverQuery(table customTableSpec) string {
 	selects := make([]string, 0, len(table.Fields))
 	for _, field := range table.Fields {
-		if field.Type == "decimal.Decimal" {
-			selects = append(selects, "toString("+quoteSQLIdent(field.ColumnName)+") AS "+quoteSQLIdent(field.ColumnName))
-		} else {
-			selects = append(selects, quoteSQLIdent(field.ColumnName))
-		}
+		selects = append(selects, quoteSQLIdent(field.ColumnName))
 	}
 	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY " + strings.Join(quotedColumns(table.PrimaryKey), ", ")
 }
@@ -829,6 +1236,49 @@ func customTablesUseType(tables []customTableSpec, typ string) bool {
 	return false
 }
 
+// isPointerFreeEntity reports whether the entity's in-memory value AND key are
+// free of pointers/slices/strings, so they can be stored in the Pebble cold tier
+// as raw bytes via unsafe memcpy (zero-transformation). Slice-bearing entities
+// (e.g. Array(UInt256) payouts, Array(FixedString(32)) question_ids) are excluded
+// and keep the ClickHouse-fallback lazy-load path. Note: memoryGoType maps
+// time.Time -> int64 for non-event entities, so timestamps don't disqualify them.
+func isPointerFreeEntity(table customTableSpec) bool {
+	notFlat := func(t string) bool {
+		return strings.HasPrefix(t, "[]") || strings.HasPrefix(t, "*") ||
+			strings.HasPrefix(t, "map[") || strings.Contains(t, "string") ||
+			t == "time.Time"
+	}
+	for _, field := range table.Fields {
+		if notFlat(memoryGoType(field, table.IsEvent)) {
+			return false
+		}
+	}
+	for _, field := range table.keyFields() {
+		if notFlat(field.Type) {
+			return false
+		}
+	}
+	return true
+}
+
+// entityUsesCold reports whether a (non-event, pointer-free) entity participates
+// in the Pebble cold tier. Events are append-only (no lazy Get-by-key), so they
+// never need it.
+func entityUsesCold(table customTableSpec) bool {
+	return !table.IsEvent && isPointerFreeEntity(table)
+}
+
+// customTablesUseColdCache reports whether any entity can use the cold tier;
+// drives the "unsafe" + "path/filepath" imports in the generated hot state.
+func customTablesUseColdCache(tables []customTableSpec) bool {
+	for _, table := range tables {
+		if entityUsesCold(table) {
+			return true
+		}
+	}
+	return false
+}
+
 func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	resolverType := spec.table.GoTypeName + "BatchResolver"
 	cacheType := spec.cacheType
@@ -859,6 +1309,11 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(keyType)
 	b.WriteString(") {\n\tif _, ok := r.cache.Get(key); !ok {\n\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
 
+	b.WriteString("// Pending reports how many missed keys are queued for the next Resolve.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") Pending() int {\n\treturn len(r.misses)\n}\n\n")
+
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
 	b.WriteString(") Resolve(ctx context.Context, conn *ch.Client, db string) error {\n")
@@ -881,26 +1336,22 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	if len(keyFields) > 1 {
 		b.WriteString("\tvar values []string\n")
 		b.WriteString("\tfor _, key := range uniqueList {\n")
-		b.WriteString("\t\tvalues = append(values, fmt.Sprintf(\"(\")")
+		b.WriteString("\t\tvalues = append(values, \"(\"")
 		for i, field := range keyFields {
 			if i > 0 {
 				b.WriteString(" + \", \"")
 			}
-			if field.Type == "common.Address" || field.Type == "common.Hash" {
-				b.WriteString(fmt.Sprintf(" + fmt.Sprintf(\"unhex('%%s')\", strings.TrimPrefix(key.%s.Hex(), \"0x\"))", field.Name))
-			} else if field.Type == "string" {
-				b.WriteString(fmt.Sprintf(" + fmt.Sprintf(\"'%%s'\", strings.ReplaceAll(key.%s, \"'\", \"''\"))", field.Name))
-			} else {
-				b.WriteString(fmt.Sprintf(" + fmt.Sprintf(\"%%d\", key.%s)", field.Name))
-			}
+			b.WriteString(" + ")
+			b.WriteString(keySQLValueExpr("key."+field.Name, field))
 		}
 		b.WriteString(" + \")\")\n")
 		b.WriteString("\t}\n\n")
 
-		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s FINAL WHERE %s IN (%%s)",
+		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s WHERE %s IN (%%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY %s",
 			customSelectColumnList(spec.table),
 			spec.table.Name,
 			customInsertColumnList(customTableSpec{Columns: keyColumns(keyFields)}),
+			keyColumnExpressionList(keyFields),
 		)
 		b.WriteString(fmt.Sprintf("\tqueryStr := fmt.Sprintf(%s, quoteIdent(db), strings.Join(values, \", \"))\n\n",
 			strconv.Quote(queryBody),
@@ -909,19 +1360,16 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString("\tvar values []string\n")
 		b.WriteString("\tfor _, key := range uniqueList {\n")
 		keyField := keyFields[0]
-		if keyField.Type == "common.Address" || keyField.Type == "common.Hash" {
-			b.WriteString(fmt.Sprintf("\t\tvalues = append(values, fmt.Sprintf(\"unhex('%%s')\", strings.TrimPrefix(key.%s.Hex(), \"0x\")))\n", keyField.Name))
-		} else if keyField.Type == "string" {
-			b.WriteString(fmt.Sprintf("\t\tvalues = append(values, fmt.Sprintf(\"'%%s'\", strings.ReplaceAll(key.%s, \"'\", \"''\")))\n", keyField.Name))
-		} else {
-			b.WriteString(fmt.Sprintf("\t\tvalues = append(values, fmt.Sprintf(\"%%d\", key.%s))\n", keyField.Name))
-		}
+		b.WriteString("\t\tvalues = append(values, ")
+		b.WriteString(keySQLValueExpr("key."+keyField.Name, keyField))
+		b.WriteString(")\n")
 		b.WriteString("\t}\n\n")
 
-		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s FINAL WHERE %s IN (%%s)",
+		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s WHERE %s IN (%%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY %s",
 			customSelectColumnList(spec.table),
 			spec.table.Name,
 			quoteSQLIdent(keyField.ColumnName),
+			keyColumnExpressionList(keyFields),
 		)
 		b.WriteString(fmt.Sprintf("\tqueryStr := fmt.Sprintf(%s, quoteIdent(db), strings.Join(values, \", \"))\n\n",
 			strconv.Quote(queryBody),
@@ -956,6 +1404,9 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	}
 	b.WriteString("\t}\n")
 
+	b.WriteString("\tfoundKeys := make(map[")
+	b.WriteString(keyType)
+	b.WriteString("]struct{})\n")
 	b.WriteString("\tq := ch.Query{\n")
 	b.WriteString("\t\tBody:   queryStr,\n")
 	b.WriteString("\t\tResult: results,\n")
@@ -964,31 +1415,92 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\t\t\t\titem := ")
 	b.WriteString(valueType)
 	b.WriteString("{\n")
-	for _, field := range spec.table.Fields {
-		b.WriteString("\t\t\t\t\t")
-		b.WriteString(field.Name)
-		b.WriteString(": ")
-		b.WriteString(resultValueExpr(field))
-		b.WriteString(",\n")
+	if spec.table.IsEvent {
+		b.WriteString("\t\t\t\t\tEventMeta: EventMeta{\n")
+		for _, field := range spec.table.Fields {
+			if field.Name == "BlockNumber" || field.Name == "BlockTimestamp" || field.Name == "TransactionIndex" || field.Name == "LogIndex" {
+				b.WriteString("\t\t\t\t\t\t")
+				b.WriteString(field.Name)
+				b.WriteString(": ")
+				b.WriteString(resultValueExpr(field, spec.table.IsEvent))
+				b.WriteString(",\n")
+			}
+		}
+		b.WriteString("\t\t\t\t\t},\n")
+		for _, field := range spec.table.Fields {
+			if !(field.Name == "BlockNumber" || field.Name == "BlockTimestamp" || field.Name == "TransactionIndex" || field.Name == "LogIndex") {
+				b.WriteString("\t\t\t\t\t")
+				b.WriteString(field.Name)
+				b.WriteString(": ")
+				b.WriteString(resultValueExpr(field, spec.table.IsEvent))
+				b.WriteString(",\n")
+			}
+		}
+	} else {
+		for _, field := range spec.table.Fields {
+			b.WriteString("\t\t\t\t\t")
+			b.WriteString(field.Name)
+			b.WriteString(": ")
+			b.WriteString(resultValueExpr(field, spec.table.IsEvent))
+			b.WriteString(",\n")
+		}
 	}
 	b.WriteString("\t\t\t\t}\n")
 	b.WriteString("\t\t\t\tr.cache.Set(item)\n")
+	b.WriteString("\t\t\t\tfoundKeys[New")
+	b.WriteString(keyType)
+	b.WriteString("(item)] = struct{}{}\n")
 	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t\treturn nil\n")
 	b.WriteString("\t\t},\n")
 	b.WriteString("\t}\n")
-	b.WriteString("\treturn conn.Do(ctx, q)\n")
+	b.WriteString("\tif err := conn.Do(ctx, q); err != nil {\n\t\treturn err\n\t}\n")
+	b.WriteString("\tfor _, key := range uniqueList {\n")
+	b.WriteString("\t\tif _, found := foundKeys[key]; !found {\n")
+	b.WriteString("\t\t\ttombstone := ")
+	b.WriteString(valueType)
+	b.WriteString("{Tombstone: true}\n")
+	for _, field := range keyFields {
+		b.WriteString("\t\t\ttombstone.")
+		b.WriteString(field.Name)
+		b.WriteString(" = key.")
+		b.WriteString(field.Name)
+		b.WriteString("\n")
+	}
+	b.WriteString("\t\t\tr.cache.SetByKey(key, tombstone)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn nil\n")
 	b.WriteString("}\n\n")
+}
+
+func keySQLValueExpr(expr string, field customFieldSpec) string {
+	switch field.Type {
+	case "common.Address", "common.Hash":
+		return fmt.Sprintf("fmt.Sprintf(\"unhex('%%s')\", strings.TrimPrefix(%s.Hex(), \"0x\"))", expr)
+	case "string":
+		return fmt.Sprintf("fmt.Sprintf(\"'%%s'\", strings.ReplaceAll(%s, \"'\", \"''\"))", expr)
+	case "bool":
+		return fmt.Sprintf("hotStateBoolSQL(%s)", expr)
+	case "uint256.Int":
+		return expr + ".Dec()"
+	case "decimal.Decimal":
+		return fmt.Sprintf("fmt.Sprintf(\"'%%s'\", %s.String())", expr)
+	case "protomath.Decimal256":
+		return fmt.Sprintf("fmt.Sprintf(\"'%%s'\", %s.String(protomath.Decimal256Scale18))", expr)
+	case "float32", "float64":
+		return fmt.Sprintf("fmt.Sprintf(\"%%v\", %s)", expr)
+	case "time.Time":
+		return fmt.Sprintf("fmt.Sprintf(\"'%%s'\", %s.UTC().Format(time.RFC3339Nano))", expr)
+	default:
+		return fmt.Sprintf("fmt.Sprintf(\"%%d\", %s)", expr)
+	}
 }
 
 func customSelectColumnList(table customTableSpec) string {
 	selects := make([]string, 0, len(table.Fields))
 	for _, field := range table.Fields {
-		if field.Type == "decimal.Decimal" {
-			selects = append(selects, "toString("+quoteSQLIdent(field.ColumnName)+") AS "+quoteSQLIdent(field.ColumnName))
-		} else {
-			selects = append(selects, quoteSQLIdent(field.ColumnName))
-		}
+		selects = append(selects, quoteSQLIdent(field.ColumnName))
 	}
 	return strings.Join(selects, ", ")
 }
@@ -1001,3 +1513,33 @@ func keyColumns(fields []customFieldSpec) []customColumnSpec {
 	return out
 }
 
+func keyColumnExpressionList(fields []customFieldSpec) string {
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		out = append(out, quoteSQLIdent(field.ColumnName))
+	}
+	return strings.Join(out, ", ")
+}
+
+func findStateEventSpec(events []eventSpec, state config.StateConfig) (*eventSpec, error) {
+	if state.SourceTable != "" {
+		for _, ev := range events {
+			if ev.TableName == state.SourceTable {
+				return &ev, nil
+			}
+		}
+	}
+	// Try to resolve from state.Name
+	for _, ev := range events {
+		if strings.EqualFold(ev.EventName, state.Name) || strings.EqualFold(ev.GoTypeName, state.Name) {
+			return &ev, nil
+		}
+	}
+	// Fallback: try to see if any event table contains the state name
+	for _, ev := range events {
+		if strings.Contains(strings.ToLower(ev.TableName), strings.ToLower(state.Name)) {
+			return &ev, nil
+		}
+	}
+	return nil, fmt.Errorf("source table or event matching %q not found in event tables", state.Name)
+}

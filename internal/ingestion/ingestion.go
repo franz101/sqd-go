@@ -9,15 +9,16 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/parser"
+	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
 
 type Options struct {
@@ -30,6 +31,7 @@ type Options struct {
 	StartBlock         uint64
 	BlockCount         uint64
 	Restart            bool
+	NoResume           bool
 	GeneratedSQLDir    string
 	CursorMode         bool
 	ForkMode           config.ForkMode
@@ -37,9 +39,24 @@ type Options struct {
 	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
 	StateLoader        func(blockNumber uint64) error // called on startup to load processor state from database
 	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
+	// ColdCache enables a Pebble-backed cold tier under the hot caches (finalized
+	// backfill only). It removes the per-miss ClickHouse point-SELECT: an evicted
+	// entry is served from local disk, and on a from-genesis run a hot+cold miss is
+	// provably new so ClickHouse is skipped entirely. Default off.
+	ColdCache    bool
+	ColdCacheDir string // base directory for cold-tier files (default os.TempDir()/sqd-coldcache)
 }
 
-const cursorPollInterval = 5 * time.Second
+const (
+	cursorPollInterval = 5 * time.Second
+	statsInterval      = 10 * time.Second
+
+	// Adaptive page sizing: when pageSize=0, grow page size based on performance
+	// Target ~20k blocks/second processing rate
+	targetBlocksPerSec  = 20000
+	minAdaptivePageSize = 5000
+	maxAdaptivePageSize = 100000
+)
 
 type CustomLog struct {
 	ChainID          uint64
@@ -60,13 +77,23 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	// Resolve effective processor: use Processor interface if set, otherwise fall back to callbacks
 	proc := opts.Processor
 	if proc == nil {
+		var restoreFn func(uint64) (uint64, error)
+		if opts.StateRestorer != nil {
+			restoreFn = func(blockNumber uint64) (uint64, error) {
+				if err := opts.StateRestorer(blockNumber); err != nil {
+					return 0, err
+				}
+				return blockNumber, nil
+			}
+		}
 		proc = ProcessorFunc{
 			ProcessFn:        opts.CustomProcessor,
-			RestoreToBlockFn: opts.StateRestorer,
+			RestoreToBlockFn: restoreFn,
 			LoadFromDBFn:     opts.StateLoader,
 		}
 	}
-	if opts.Restart {
+	resetStore := opts.Restart || opts.NoResume
+	if resetStore {
 		if err := database.DropClickHouseDatabase(ctx, opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseUser, opts.ClickHousePassword, opts.ClickHouseDatabase); err != nil {
 			return fmt.Errorf("drop clickhouse database: %w", err)
 		}
@@ -86,25 +113,35 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	}
 
 	if opts.GeneratedSQLDir != "" {
-		if err := store.ApplySQLFile(ctx, filepath.Join(opts.GeneratedSQLDir, "schema.sql")); err != nil {
+		if err := store.ApplySQLFileWithDatabase(ctx, filepath.Join(opts.GeneratedSQLDir, "schema.sql"), cfg.Name); err != nil {
 			return fmt.Errorf("apply generated schema: %w", err)
 		}
 		customSchemaPath := filepath.Join(opts.GeneratedSQLDir, "custom_schema.sql")
 		if _, err := os.Stat(customSchemaPath); err == nil {
-			if err := store.ApplySQLFile(ctx, customSchemaPath); err != nil {
+			if err := store.ApplySQLFileWithDatabase(ctx, customSchemaPath, cfg.Name); err != nil {
 				return fmt.Errorf("apply generated custom schema: %w", err)
 			}
 		}
-		if err := store.ApplySQLFile(ctx, filepath.Join(opts.GeneratedSQLDir, "views.sql")); err != nil {
-			return fmt.Errorf("apply generated views: %w", err)
+		viewsPath := filepath.Join(opts.GeneratedSQLDir, "views.sql")
+		if _, err := os.Stat(viewsPath); err == nil {
+			if err := store.ApplySQLFileWithDatabase(ctx, viewsPath, cfg.Name); err != nil {
+				return fmt.Errorf("apply generated views: %w", err)
+			}
 		}
-	} else if err := store.EnsureTablesWithCollapsingAndOmit(ctx, forkMode.UsesCollapsingMergeTree(), cfg.ShouldOmitRawLogs()); err != nil {
+	} else if err := store.EnsureTablesWithOptions(ctx, forkMode.UsesCollapsingMergeTree(), database.EnsureTablesOptions{
+		StoreBlocks: cfg.ShouldStoreBlocks(),
+		StoreLogs:   cfg.ShouldStoreRawLogs(),
+	}); err != nil {
 		return fmt.Errorf("ensure tables: %w", err)
 	}
 	log.Printf("ClickHouse connected: %s:%d/%s (fork=%s)", opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseDatabase, forkMode)
 
+	coldDir := opts.ColdCacheDir
+	if opts.ColdCache && coldDir == "" {
+		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
+	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, proc); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.NoResume || opts.Restart, proc, opts.ColdCache, coldDir); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -112,7 +149,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, proc Processor) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, noResume bool, proc Processor, coldCache bool, coldDir string) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -126,42 +163,51 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		return fmt.Errorf("build typed tables: %w", err)
 	}
 	log.Printf("Chain %d: %d event types, %d filter(s)", chain.ID, len(decoders), len(filters))
-
+	storeBlocks := cfg.ShouldStoreBlocks()
 	currentBlock := chain.StartBlock
 	if flagStartBlock > 0 {
 		currentBlock = flagStartBlock
 	}
 	state := NewForkTracker(forkMode)
 	if cursorMode {
-		saved, hasSaved, err := store.LastSyncState(ctx, chain.ID)
-		if err != nil {
-			return fmt.Errorf("read sync state: %w", err)
+		if noResume {
+			log.Printf("Chain %d: resume disabled; starting from configured block %d", chain.ID, currentBlock)
+		} else {
+			saved, hasSaved, err := store.LastSyncState(ctx, chain.ID)
+			if err != nil {
+				return fmt.Errorf("read sync state: %w", err)
+			}
+			if recovery, ok := selectRecoveryBase(saved, hasSaved); ok {
+				if currentBlock > recovery.Number+1 {
+					log.Printf("Chain %d: gap detected between recovery checkpoint %d and requested start block %d; starting a new fork tracker segment", chain.ID, recovery.Number, currentBlock)
+					state.Init(nil, nil, nil)
+				} else {
+					state.Init(recovery.TrackerCurrent, recovery.TrackerFinalized, recovery.TrackerRollbackChain)
+				}
+				if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, recovery.Number); err != nil {
+					return fmt.Errorf("rollback after recovery checkpoint %d: %w", recovery.Number, err)
+				}
+				if err := store.SaveSyncState(ctx, chain.ID, recoverySyncState(recovery)); err != nil {
+					return fmt.Errorf("save recovery checkpoint %d: %w", recovery.Number, err)
+				}
+				if recovery.Number >= currentBlock {
+					currentBlock = recovery.Number + 1
+				}
+				if recovery.FromFinalized {
+					log.Printf("Chain %d: recovered from finalized checkpoint %d", chain.ID, recovery.Number)
+				} else {
+					log.Printf("Chain %d: recovered from current checkpoint %d", chain.ID, recovery.Number)
+				}
+				// Load processor state from database at the recovery checkpoint
+				log.Printf("[LOAD STATE] Loading processor state from ClickHouse database at block %d...", recovery.Number)
+				if err := proc.LoadFromDatabase(recovery.Number); err != nil {
+					log.Printf("[LOAD STATE] State load from ClickHouse at block %d failed: %v (will rebuild from events)", recovery.Number, err)
+				} else {
+					log.Printf("[LOAD STATE] Processor state loaded successfully from ClickHouse database at block %d", recovery.Number)
+				}
+			}
 		}
-		if recovery, ok := selectRecoveryBase(saved, hasSaved); ok {
-			state.Init(recovery.TrackerCurrent, recovery.TrackerFinalized, recovery.TrackerRollbackChain)
-			if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, recovery.Number); err != nil {
-				return fmt.Errorf("rollback after recovery checkpoint %d: %w", recovery.Number, err)
-			}
-			if err := store.SaveSyncState(ctx, chain.ID, recoverySyncState(recovery)); err != nil {
-				return fmt.Errorf("save recovery checkpoint %d: %w", recovery.Number, err)
-			}
-			if recovery.Number >= currentBlock {
-				currentBlock = recovery.Number + 1
-			}
-			if recovery.FromFinalized {
-				log.Printf("Chain %d: recovered from finalized checkpoint %d", chain.ID, recovery.Number)
-			} else {
-				log.Printf("Chain %d: recovered from current checkpoint %d", chain.ID, recovery.Number)
-			}
-			// Load processor state from database at the recovery checkpoint
-			log.Printf("[LOAD STATE] Loading processor state from ClickHouse database at block %d...", recovery.Number)
-			if err := proc.LoadFromDatabase(recovery.Number); err != nil {
-				log.Printf("[LOAD STATE] State load from ClickHouse at block %d failed: %v (will rebuild from events)", recovery.Number, err)
-			} else {
-				log.Printf("[LOAD STATE] Processor state loaded successfully from ClickHouse database at block %d", recovery.Number)
-			}
-		}
-	} else {
+	} else if !noResume {
 		last, hasLast, err := store.LastBlock(ctx, chain.ID)
 		if err != nil {
 			return fmt.Errorf("read last block: %w", err)
@@ -173,6 +219,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			if last >= currentBlock {
 				currentBlock = last + 1
 			}
+		} else if currentBlock > 0 {
+			// No durable checkpoint, but a crash may have left committed-ahead hot
+			// state from a partially-processed run (hot state commits at a cadence,
+			// the checkpoint is written after). Truncate everything >= the start block
+			// so re-processing from currentBlock is idempotent and never double-applies.
+			if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, currentBlock-1); err != nil {
+				return fmt.Errorf("truncate orphaned state before start %d: %w", currentBlock, err)
+			}
 		}
 	}
 	effectiveEndBlock := chain.EndBlock
@@ -180,6 +234,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		end := currentBlock + blockCountLimit - 1
 		effectiveEndBlock = minEndBlock(effectiveEndBlock, end)
 	}
+	// pageSize == 0 means dynamic paging (unrestricted block ranges)
 	if cursorMode {
 		if effectiveEndBlock != nil {
 			log.Printf("Chain %d: starting from block %d (cursor mode, local stop at %d)", chain.ID, currentBlock, *effectiveEndBlock)
@@ -187,9 +242,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			log.Printf("Chain %d: starting from block %d (cursor mode)", chain.ID, currentBlock)
 		}
 	} else {
-		if pageSize == 0 {
-			pageSize = 1000
-		}
 		log.Printf("Chain %d: starting from block %d", chain.ID, currentBlock)
 	}
 
@@ -197,14 +249,78 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	defer sqd.Close()
 	jsonl := parser.NewFastJSONLParser(1024)
 	replayBuf := NewReplayBuffer(8192) // ~8K blocks of replay capacity
+	// No-data-loss (Invariant 0): if the processor reports a durable commit
+	// horizon, the persisted checkpoint is gated so it never leads that horizon.
+	// On crash the run resumes from durable state and re-fetches the cheap gap.
+	committedReporter, _ := proc.(CommitHorizonReporter)
+	flusher, _ := proc.(Flusher)
+	// durableCheckpoint is the highest block number written to sync_state so far.
+	var durableCheckpoint uint64
+	// Fork-recovery snapshots are only needed in cursor mode (reorgs above the
+	// finalized head). In finalized backfill they are pure GC/memory churn, so
+	// disable them — the single biggest in-memory cost in backfill.
+	if sc, ok := proc.(SnapshotController); ok {
+		sc.SetSnapshotsEnabled(cursorMode)
+	}
+	// Cold tier (Pebble): an evicted hot entry is served from local disk instead of
+	// a ClickHouse point-SELECT. Authoritative iff ClickHouse holds no rows for this
+	// chain at start (fresh / --restart): a hot+cold miss is then provably new and
+	// the per-miss SELECT is skipped entirely. On resume-with-data it stays
+	// non-authoritative — still serving re-referenced evictions from disk, but never
+	// skipping a needed lookup. Reorg-safe: any state recovery (RestoreToBlock /
+	// LoadFromDatabase) detaches the cold tier, so post-reorg reads fall back to the
+	// rolled-back ClickHouse.
+	if coldCache {
+		if cc, ok := proc.(ColdCacheProcessor); ok {
+			_, hasAny, err := store.LastBlock(ctx, chain.ID)
+			if err != nil {
+				return fmt.Errorf("cold cache: probe last block: %w", err)
+			}
+			authoritative := !hasAny
+			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
+			if err := cc.EnableColdCache(dir, authoritative); err != nil {
+				return fmt.Errorf("enable cold cache: %w", err)
+			}
+			defer func() { _ = cc.CloseColdCache() }()
+			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
+		} else {
+			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
+		}
+	}
+	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
+	useParseDecodeV2 := os.Getenv("SQD_PARSE_DECODE_V2") != "" && fastJSONLOK
+	if os.Getenv("SQD_PARSE_DECODE_V2") != "" && !fastJSONLOK {
+		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 requested, but processor does not implement FastJSONLProcessor; using default processor path", chain.ID)
+	}
+	if useParseDecodeV2 {
+		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 enabled for custom processor", chain.ID)
+	}
 	totalBlocks, totalEvents := uint64(0), uint64(0)
 	startTime := time.Now()
 	var memBefore, memAfter runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
 
 	// profiling accumulators
-	var profFetch, profParse, profDecode, profMarshal, profInsert time.Duration
-	profIters := 0
+	var profFetchNanos, profParseNanos, profDecodeNanos, profMarshalNanos, profInsertNanos, profCustomNanos atomic.Int64
+	var profConsumerWaitNanos, profProducerBackpressureNanos atomic.Int64
+	var profIters atomic.Int64
+	defer func() {
+		runtime.ReadMemStats(&memAfter)
+		printProfile(
+			time.Duration(profFetchNanos.Load()),
+			time.Duration(profParseNanos.Load()),
+			time.Duration(profDecodeNanos.Load()),
+			time.Duration(profMarshalNanos.Load()),
+			time.Duration(profInsertNanos.Load()),
+			time.Duration(profCustomNanos.Load()),
+			time.Duration(profConsumerWaitNanos.Load()),
+			time.Duration(profProducerBackpressureNanos.Load()),
+			int(profIters.Load()),
+			atomic.LoadUint64(&totalBlocks),
+			atomic.LoadUint64(&totalEvents),
+			startTime, memBefore, memAfter,
+		)
+	}()
 
 	baseInserter := store.NewInserter()
 	typedInserters := make(map[string]*database.TypedInserter)
@@ -215,43 +331,534 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		typedInserters[table.Name] = store.NewTypedInserter(table)
 	}
 
-	for {
+	var currentConsumerBlock atomic.Uint64
+	currentConsumerBlock.Store(currentBlock)
+
+	type producerSignal struct {
+		forkErr *client.ForkError
+		err     error
+	}
+	type producerAdvance struct {
+		nextBlock  uint64
+		parentHash string
+	}
+	errChan := make(chan producerSignal, 1)
+	finalizedChan := make(chan *client.BlockRef, 100)
+
+	var prodCancel context.CancelFunc
+	var producerDone bool
+	var producerAdvanceChan chan producerAdvance
+
+	var startProd func(startBlk uint64, initialParent string)
+	startProd = func(startBlk uint64, initialParent string) {
+		if prodCancel != nil {
+			prodCancel()
+		}
+		producerDone = false
+		advanceChan := make(chan producerAdvance, 1)
+		producerAdvanceChan = advanceChan
+		var prodCtx context.Context
+		prodCtx, prodCancel = context.WithCancel(ctx)
+
+		go func(pCtx context.Context, pBlock uint64, pHash string, advance <-chan producerAdvance) {
+			var lastFinalized uint64
+			// Adaptive page sizing: when pageSize=0, use this instead of nil
+			var adaptivePageSize uint64 = minAdaptivePageSize
+			sentSignal := false
+			sendSignal := func(sig producerSignal) {
+				sentSignal = true
+				select {
+				case errChan <- sig:
+				case <-pCtx.Done():
+				}
+			}
+
+			defer func() {
+				if sentSignal {
+					return
+				}
+				select {
+				case errChan <- producerSignal{}:
+				case <-pCtx.Done():
+				}
+			}()
+
+			for {
+				select {
+				case <-pCtx.Done():
+					return
+				default:
+				}
+
+				// Backpressure check: wait if producer is too far ahead of consumer
+				cBlock := currentConsumerBlock.Load()
+				if pBlock >= cBlock && pBlock-cBlock >= uint64(replayBuf.capacity)-100 {
+					waitStart := time.Now()
+					select {
+					case <-pCtx.Done():
+						profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+						return
+					case <-time.After(10 * time.Millisecond):
+					}
+					profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+					continue
+				}
+
+				toBlockPtr, rangeLabel, ok := nextProducerRequestRange(pBlock, pageSize, adaptivePageSize, lastFinalized, effectiveEndBlock, cursorMode)
+				if !ok {
+					return
+				}
+
+				t0 := time.Now()
+				response, err := sqd.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
+				profFetchNanos.Add(int64(time.Since(t0)))
+
+				if err != nil {
+					var forkErr *client.ForkError
+					if cursorMode && errors.As(err, &forkErr) {
+						sendSignal(producerSignal{forkErr: forkErr})
+						return
+					}
+					log.Printf("Chain %d: fetch %s error: %v, retrying...", chain.ID, rangeLabel, err)
+					select {
+					case <-pCtx.Done():
+						return
+					case <-time.After(5 * time.Second):
+					}
+					continue
+				}
+
+				if response.Head.Finalized != nil && response.Head.Finalized.Number > lastFinalized {
+					lastFinalized = response.Head.Finalized.Number
+				}
+
+				raw := response.Raw
+				if len(raw) == 0 {
+					if cursorMode {
+						if !shouldWaitForEmptyCursorResponse(effectiveEndBlock) {
+							return
+						}
+						select {
+						case finalizedChan <- response.Head.Finalized:
+						case <-pCtx.Done():
+							return
+						}
+						select {
+						case <-pCtx.Done():
+							return
+						case <-time.After(cursorPollInterval):
+						}
+						continue
+					}
+					return
+				}
+
+				type decodedBlock struct {
+					number      uint64
+					hash        string
+					timestamp   time.Time
+					events      []parser.DecodedEvent
+					logs        []CustomLog
+					typedEvents map[string][]parser.DecodedEvent
+					raw         []byte
+				}
+
+				parseStart := time.Now()
+				var decodeDur time.Duration
+				var decodedBlocks []decodedBlock
+				var dataScratch []byte
+				err = jsonl.ParseWithLine(raw, func(block *parser.Block, rawLine []byte) error {
+					if effectiveEndBlock != nil && block.Header.Number > *effectiveEndBlock {
+						return nil
+					}
+					blockHash := strings.Clone(block.Header.Hash)
+					blockTS := time.Unix(int64(block.Header.Timestamp), 0).UTC()
+
+					var blockEvents []parser.DecodedEvent
+					var blockCustomLogs []CustomLog
+					blockTypedEvents := make(map[string][]parser.DecodedEvent)
+
+					for _, lg := range block.Logs {
+						if len(lg.Topics) == 0 {
+							continue
+						}
+						d0 := time.Now()
+						topic0 := abiunpack.DecodeTopicHash(lg.Topics[0])
+						def, ok := decoders[topic0]
+						if !ok {
+							decodeDur += time.Since(d0)
+							continue
+						}
+						if !def.MatchesAddress(lg.Address) {
+							decodeDur += time.Since(d0)
+							continue
+						}
+						dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
+						ev, err := def.Decode(lg.Address, lg.Topics, dataScratch)
+						decodeDur += time.Since(d0)
+						if err != nil {
+							continue
+						}
+						ev.ChainID = chain.ID
+						ev.BlockNumber = block.Header.Number
+						ev.BlockTimestamp = blockTS
+						ev.BlockHash = blockHash
+						ev.TxHash = strings.Clone(lg.TransactionHash)
+						ev.TxIndex = lg.TransactionIndex
+						ev.LogIndex = lg.LogIndex
+						ev.Address = strings.Clone(lg.Address)
+						blockEvents = append(blockEvents, *ev)
+
+						if !useParseDecodeV2 {
+							blockCustomLogs = append(blockCustomLogs, CustomLog{
+								ChainID:          chain.ID,
+								BlockNumber:      block.Header.Number,
+								BlockTimestamp:   blockTS,
+								BlockHash:        blockHash,
+								ContractAddress:  strings.Clone(lg.Address),
+								TransactionHash:  strings.Clone(lg.TransactionHash),
+								TransactionIndex: lg.TransactionIndex,
+								LogIndex:         lg.LogIndex,
+								Topics:           cloneStrings(lg.Topics),
+								Data:             strings.Clone(lg.Data),
+							})
+						}
+
+						if table, ok := typedTables.lookup(ev.Address, ev.EventName); ok {
+							blockTypedEvents[table.Name] = append(blockTypedEvents[table.Name], *ev)
+						}
+					}
+
+					var blockRaw []byte
+					if useParseDecodeV2 {
+						blockRaw = rawLine
+					}
+					decodedBlocks = append(decodedBlocks, decodedBlock{
+						number:      block.Header.Number,
+						hash:        blockHash,
+						timestamp:   blockTS,
+						events:      blockEvents,
+						logs:        blockCustomLogs,
+						typedEvents: blockTypedEvents,
+						raw:         blockRaw,
+					})
+					return nil
+				})
+				if err != nil {
+					sendSignal(producerSignal{err: err})
+					return
+				}
+
+				batchStartBlock := pBlock
+				var lastBlockNumber uint64
+				for idx, db := range decodedBlocks {
+					// Backpressure check: wait if producer is too far ahead of consumer
+					for {
+						cBlock := currentConsumerBlock.Load()
+						if db.number >= cBlock && db.number-cBlock >= uint64(replayBuf.capacity)-100 {
+							waitStart := time.Now()
+							select {
+							case <-pCtx.Done():
+								profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+								return
+							case <-time.After(10 * time.Millisecond):
+							}
+							profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+							continue
+						}
+						break
+					}
+
+					isLastInBatch := (idx == len(decodedBlocks)-1)
+					replayBuf.Write(chain.ID, db.number, db.hash, db.timestamp, db.events, db.logs, db.typedEvents, response.Head.Finalized, isLastInBatch, rangeLabel, batchStartBlock, db.raw)
+					lastBlockNumber = db.number
+					pHash = db.hash
+				}
+
+				profParseNanos.Add(int64(time.Since(parseStart)))
+				profDecodeNanos.Add(int64(decodeDur))
+				profIters.Add(1)
+
+				if len(decodedBlocks) > 0 {
+					select {
+					case next := <-advance:
+						log.Printf("[CURSOR DEBUG] pBlock: %d -> lastBlockNumber: %d -> consumer next: %d (blocks in batch: %d)", pBlock, lastBlockNumber, next.nextBlock, len(decodedBlocks))
+						pBlock = next.nextBlock
+						pHash = next.parentHash
+					case <-pCtx.Done():
+						return
+					}
+				} else {
+					// No blocks decoded, advance by 1 to retry
+					pBlock++
+				}
+			}
+		}(prodCtx, startBlk, initialParent, advanceChan)
+	}
+
+	// Start the initial producer
+	parentHash := ""
+	if cursorMode {
+		if head := state.Head(); head != nil {
+			parentHash = head.Hash
+		}
+	}
+	var currentConsumerBlockVal uint64 = currentBlock
+	currentConsumerBlock.Store(currentConsumerBlockVal)
+	startProd(currentBlock, parentHash)
+	defer func() {
+		if prodCancel != nil {
+			prodCancel()
+		}
+	}()
+
+	var batchEventBlocks uint64
+	var batchEventsCount uint64
+	statsTicker := time.NewTicker(statsInterval)
+	defer statsTicker.Stop()
+	lastStatsTime := startTime
+	lastStatsBlocks := uint64(0)
+	lastStatsEvents := uint64(0)
+	lastCheckpoint := currentBlock
+	if lastCheckpoint > 0 {
+		lastCheckpoint--
+	}
+	logStats := func(reason string) {
+		now := time.Now()
+		totalBlockCount := atomic.LoadUint64(&totalBlocks)
+		totalEventCount := atomic.LoadUint64(&totalEvents)
+		interval := now.Sub(lastStatsTime)
+		if interval <= 0 {
+			interval = time.Nanosecond
+		}
+		elapsed := now.Sub(startTime)
+		if elapsed <= 0 {
+			elapsed = time.Nanosecond
+		}
+		deltaBlocks := totalBlockCount - lastStatsBlocks
+		deltaEvents := totalEventCount - lastStatsEvents
+		log.Printf("Chain %d: stats %s | checkpoint: %d | next: %d | buffered: %d | +%d blocks, +%d events in %s | %.1f blk/s (avg %.1f) | total: %d blocks, %d events",
+			chain.ID, reason, lastCheckpoint, currentConsumerBlockVal, replayBuf.Len(),
+			deltaBlocks, deltaEvents, interval.Round(time.Millisecond),
+			float64(deltaBlocks)/interval.Seconds(), float64(totalBlockCount)/elapsed.Seconds(),
+			totalBlockCount, totalEventCount)
+		lastStatsTime = now
+		lastStatsBlocks = totalBlockCount
+		lastStatsEvents = totalEventCount
+	}
+
+	var batchBlockRows []database.BlockRow
+	var batchDecodedEvents []parser.DecodedEvent
+	batchTypedEvents := make(map[string][]parser.DecodedEvent)
+	var batchCustomLogs []CustomLog
+	var batchRawJSONL []byte
+	var pendingBatchBlocks uint64
+	resetBatch := func() {
+		batchBlockRows = batchBlockRows[:0]
+		batchDecodedEvents = batchDecodedEvents[:0]
+		for k := range batchTypedEvents {
+			delete(batchTypedEvents, k)
+		}
+		batchCustomLogs = batchCustomLogs[:0]
+		batchRawJSONL = batchRawJSONL[:0]
+		batchEventBlocks = 0
+		batchEventsCount = 0
+		pendingBatchBlocks = 0
+	}
+	sendProducerAdvance := func(nextBlock uint64, parentHash string) error {
+		if producerAdvanceChan == nil {
+			return nil
+		}
 		select {
+		case producerAdvanceChan <- producerAdvance{nextBlock: nextBlock, parentHash: parentHash}:
+			return nil
 		case <-ctx.Done():
-			log.Printf("Chain %d: interrupted at block %d", chain.ID, currentBlock)
-			// print profile
-			runtime.ReadMemStats(&memAfter)
-			printProfile(profFetch, profParse, profDecode, profMarshal, profInsert, profIters, totalBlocks, totalEvents, startTime, memBefore, memAfter)
 			return ctx.Err()
-		default:
+		}
+	}
+
+	for {
+		if entry, ok := replayBuf.GetBlock(currentConsumerBlockVal); ok {
+			// Accumulate data for batch insertion
+			if len(entry.events) > 0 {
+				if storeBlocks {
+					batchBlockRows = append(batchBlockRows, entry.blockRow)
+				}
+				batchDecodedEvents = append(batchDecodedEvents, entry.events...)
+			}
+			for tableName, events := range entry.typedEvents {
+				batchTypedEvents[tableName] = append(batchTypedEvents[tableName], events...)
+			}
+			if useParseDecodeV2 {
+				if len(entry.raw) > 0 {
+					batchRawJSONL = append(batchRawJSONL, entry.raw...)
+					batchRawJSONL = append(batchRawJSONL, '\n')
+				}
+			} else {
+				batchCustomLogs = append(batchCustomLogs, entry.logs...)
+			}
+
+			if cursorMode {
+				blockRef := client.BlockRef{Number: entry.number, Hash: entry.hash}
+				state.ApplyBatch(entry.finalized, []client.BlockRef{blockRef})
+			}
+
+			if len(entry.events) > 0 {
+				batchEventBlocks++
+				batchEventsCount += uint64(len(entry.events))
+			}
+
+			atomic.AddUint64(&totalEvents, uint64(len(entry.events)))
+			atomic.AddUint64(&totalBlocks, 1)
+			pendingBatchBlocks++
+
+			if entry.isLastInBatch {
+				insertStart := time.Now()
+
+				// 1. Logs insertion
+				if cfg.ShouldStoreRawLogs() && len(batchDecodedEvents) > 0 {
+					if err := baseInserter.InsertLogs(ctx, batchDecodedEvents); err != nil {
+						return fmt.Errorf("InsertLogs: %w", err)
+					}
+				}
+
+				// 2. Typed events insertion
+				for tableName, events := range batchTypedEvents {
+					if len(events) == 0 {
+						continue
+					}
+					inserter := typedInserters[tableName]
+					if inserter == nil {
+						return fmt.Errorf("missing TypedInserter for %s", tableName)
+					}
+					if err := inserter.Insert(ctx, events); err != nil {
+						return fmt.Errorf("InsertTypedLogs(%s): %w", tableName, err)
+					}
+				}
+
+				// 3. Optional block ledger insertion
+				if storeBlocks && len(batchBlockRows) > 0 {
+					if err := baseInserter.InsertBlocks(ctx, batchBlockRows); err != nil {
+						return fmt.Errorf("InsertBlocks: %w", err)
+					}
+				}
+				profInsertNanos.Add(int64(time.Since(insertStart)))
+
+				if err := sendProducerAdvance(entry.number+1, entry.hash); err != nil {
+					return err
+				}
+
+				// 4. Custom Processor
+				if useParseDecodeV2 && len(batchRawJSONL) > 0 {
+					procStart := time.Now()
+					if _, err := fastJSONLProc.ProcessJSONL(ctx, store, batchRawJSONL); err != nil {
+						return fmt.Errorf("custom processor v2 error: %w", err)
+					}
+					profCustomNanos.Add(int64(time.Since(procStart)))
+				} else if proc != nil && len(batchCustomLogs) > 0 {
+					procStart := time.Now()
+					if err := proc.Process(ctx, store, batchCustomLogs); err != nil {
+						return fmt.Errorf("custom processor error: %w", err)
+					}
+					profCustomNanos.Add(int64(time.Since(procStart)))
+				}
+
+				if cursorMode {
+					current := state.Current()
+					if current != nil {
+						if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
+							return fmt.Errorf("update sync state %d: %w", entry.number, err)
+						}
+						if entry.number%10 == 0 {
+							if err := store.TruncateSyncState(ctx, chain.ID, current.Number); err != nil {
+								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+							}
+						}
+					}
+				} else {
+					// Gate the checkpoint to the durable (committed) horizon: it must
+					// never lead durable state. With a periodic commit cadence the
+					// checkpoint lags by up to the cadence (blocks/time), which a crash
+					// re-fetches cheaply and re-processes idempotently (rollbackAfterBlock
+					// truncates anything beyond the checkpoint).
+					checkpointBlock := entry.number
+					if committedReporter != nil {
+						if c := committedReporter.CommittedBlock(); c < checkpointBlock {
+							checkpointBlock = c
+						}
+					}
+					// No-data-loss invariant (backfill): the durable checkpoint must never
+					// lead the finalized head, so a crash always resumes from a finalized
+					// block and the re-fetched gap can't be re-orged out from under us. The
+					// producer already caps backfill requests at the finalized head; this
+					// clamp makes the guarantee local and independent of that logic. The
+					// gap (even ~10k blocks) is a cheap HTTP re-fetch on resume.
+					if entry.finalized != nil && entry.finalized.Number < checkpointBlock {
+						checkpointBlock = entry.finalized.Number
+					}
+					if checkpointBlock > durableCheckpoint {
+						// Make event-table rows for blocks <= checkpointBlock durable before
+						// the checkpoint advances past them, so a crash can't drop them.
+						if err := store.FlushAsyncInserts(ctx); err != nil {
+							return fmt.Errorf("flush async inserts before checkpoint %d: %w", checkpointBlock, err)
+						}
+						if err := store.UpdateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+							return fmt.Errorf("update sync state %d: %w", checkpointBlock, err)
+						}
+						durableCheckpoint = checkpointBlock
+						if checkpointBlock%10 == 0 {
+							if err := store.TruncateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+							}
+						}
+					}
+				}
+
+				scanned := entry.number - entry.requestStartBlock + 1
+				elapsed := time.Now().Sub(startTime)
+				rate := float64(atomic.LoadUint64(&totalBlocks)) / elapsed.Seconds()
+				log.Printf("Chain %d: %s scanned %d blocks, event blocks: %d, events: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
+					chain.ID, entry.rangeLabel, scanned, batchEventBlocks, batchEventsCount, entry.number, atomic.LoadUint64(&totalBlocks), atomic.LoadUint64(&totalEvents), rate)
+
+				lastCheckpoint = entry.number
+				resetBatch()
+			}
+
+			currentConsumerBlockVal = entry.number + 1
+			currentConsumerBlock.Store(currentConsumerBlockVal)
+
+			select {
+			case <-statsTicker.C:
+				logStats("periodic")
+			default:
+			}
+
+			if effectiveEndBlock != nil && currentConsumerBlockVal > *effectiveEndBlock {
+				break
+			}
+			continue
 		}
 
-		requestStartBlock := currentBlock
-		toBlockPtr, rangeLabel, ok := nextRequestRange(currentBlock, pageSize, effectiveEndBlock, cursorMode)
-		if !ok {
+		if producerDone {
+			// Checked the buffer, it's empty, and the producer has completed cleanly
 			break
 		}
-		toBlock := uint64(0)
-		if toBlockPtr != nil {
-			toBlock = *toBlockPtr
-		}
 
-		fetchStart := time.Now()
-		parentHash := ""
-		if cursorMode {
-			if head := state.Head(); head != nil {
-				parentHash = head.Hash
-			}
-		}
-		response, err := sqd.FetchWithParent(ctx, currentBlock, toBlockPtr, parentHash, cursorMode, filters)
-		profFetch += time.Since(fetchStart)
-		if err != nil {
-			var forkErr *client.ForkError
-			if cursorMode && errors.As(err, &forkErr) {
-				log.Printf("[FORK DETECTED] Chain %d: fork detected at block %d! Previous blocks sent by portal: %v", chain.ID, currentBlock, forkErr.PreviousBlocks)
+		waitStart := time.Now()
+		select {
+		case <-ctx.Done():
+			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
+			log.Printf("Chain %d: interrupted at block %d", chain.ID, currentConsumerBlockVal)
+			return ctx.Err()
+
+		case sig := <-errChan:
+			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
+			if sig.forkErr != nil {
+				forkErr := sig.forkErr
+				log.Printf("[FORK DETECTED] Chain %d: fork detected! Previous blocks sent by portal: %v", chain.ID, forkErr.PreviousBlocks)
 				safe, ok := state.HandleFork(forkErr.PreviousBlocks)
 				if !ok {
-					return fmt.Errorf("process fork at %d: unable to find common fork cursor", currentBlock)
+					return fmt.Errorf("process fork: unable to find common fork cursor")
 				}
 				log.Printf("[FORK DETECTED] Common ancestor successfully resolved at safe block %d (hash: %s)", safe.Number, safe.Hash)
 				log.Printf("[ROLLBACK] Starting database rollback to safe block %d (mode: %s)...", safe.Number, forkMode)
@@ -263,302 +870,126 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 				log.Printf("[ROLLBACK] Database rollback completed successfully and fork state saved for block %d", safe.Number)
 
-				// Restore custom processor state before fetching canonical blocks again.
 				log.Printf("[LOAD STATE] Restoring processor state to safe block %d...", safe.Number)
-				if err := proc.RestoreToBlock(safe.Number); err != nil {
+				restoredBlock, err := proc.RestoreToBlock(safe.Number)
+				if err != nil {
 					log.Printf("[LOAD STATE] Processor state restore to block %d failed: %v. Attempting fallback state load from ClickHouse database...", safe.Number, err)
 					if err := proc.LoadFromDatabase(safe.Number); err != nil {
 						return fmt.Errorf("restore processor state after fork at %d: %w", safe.Number, err)
-					} else {
-						log.Printf("[LOAD STATE] Processor state loaded successfully from ClickHouse database at block %d", safe.Number)
 					}
-				} else {
-					log.Printf("[LOAD STATE] Processor state restored successfully to safe block %d", safe.Number)
+					restoredBlock = safe.Number
 				}
 
-				currentBlock = safe.Number + 1
-				log.Printf("[FORK RECOVERY] Resuming canonical fetch from block %d with parent hash %s", currentBlock, safe.Hash)
+				if restoredBlock < safe.Number {
+					log.Printf("[ROLLBACK] Replaying blocks %d to %d from replay buffer to catch up custom processor state...", restoredBlock+1, safe.Number)
+					for bNum := restoredBlock + 1; bNum <= safe.Number; bNum++ {
+						entry, ok := replayBuf.GetBlock(bNum)
+						if !ok {
+							log.Printf("[ROLLBACK] Replay buffer cache miss for block %d during catch up. Attempting fallback state load from ClickHouse database...", bNum)
+							if err := proc.LoadFromDatabase(safe.Number); err != nil {
+								return fmt.Errorf("restore processor state after fork at %d: %w", safe.Number, err)
+							}
+							break
+						}
+						// Process through fastJSONLProc or custom processor
+						if useParseDecodeV2 && len(entry.raw) > 0 {
+							if _, err := fastJSONLProc.ProcessJSONL(ctx, store, append(entry.raw, '\n')); err != nil {
+								return fmt.Errorf("custom processor v2 replay error at block %d: %w", bNum, err)
+							}
+						} else if proc != nil && len(entry.logs) > 0 {
+							if err := proc.Process(ctx, store, entry.logs); err != nil {
+								return fmt.Errorf("custom processor replay error at block %d: %w", bNum, err)
+							}
+						}
+					}
+				}
+
+
+				replayBuf.PruneAfter(safe.Number)
+				if pendingBatchBlocks > 0 {
+					log.Printf("[ROLLBACK] Discarding %d uncommitted batch block(s) after fork rollback", pendingBatchBlocks)
+					resetBatch()
+				}
+
+				currentConsumerBlockVal = safe.Number + 1
+				currentConsumerBlock.Store(currentConsumerBlockVal)
+				startProd(currentConsumerBlockVal, safe.Hash)
 				continue
 			}
-			log.Printf("Chain %d: fetch %s error: %v", chain.ID, rangeLabel, err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		raw := response.Raw
-
-		var decodedEvents []parser.DecodedEvent
-		responseBlockCount := uint64(0)
-		eventBlockCount := uint64(0)
-
-		lastProcessed := toBlock
-		if len(raw) == 0 {
-			if cursorMode {
-				if !shouldWaitForEmptyCursorResponse(effectiveEndBlock) {
-					endBlock := *effectiveEndBlock
-					log.Printf("Chain %d: empty response %s, reached end block %d, stopping", chain.ID, rangeLabel, endBlock)
-					break
-				}
-				state.ApplyBatch(response.Head.Finalized, nil)
-				if current := state.Current(); current != nil {
-					if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
-						return fmt.Errorf("update sync state %d: %w", current.Number, err)
-					}
-				}
-				log.Printf("Chain %d: empty response %s, waiting for new blocks...", chain.ID, rangeLabel)
-				if err := waitForNextCursorPoll(ctx, cursorPollInterval); err != nil {
-					log.Printf("Chain %d: interrupted at block %d", chain.ID, currentBlock)
-					runtime.ReadMemStats(&memAfter)
-					printProfile(profFetch, profParse, profDecode, profMarshal, profInsert, profIters, totalBlocks, totalEvents, startTime, memBefore, memAfter)
-					return err
-				}
-				continue
-			}
-			if err := store.UpdateSyncState(ctx, chain.ID, lastProcessed); err != nil {
-				return fmt.Errorf("update sync state %d: %w", lastProcessed, err)
-			}
-			log.Printf("Chain %d: empty response %s, advancing", chain.ID, rangeLabel)
-		} else {
-			typedEvents := make(map[string][]parser.DecodedEvent)
-			typedSpecs := make(map[string]database.TypedEventTable)
-			var customLogs []CustomLog
-			var blockRows []database.BlockRow
-			var blockRefs []client.BlockRef
-			maxSeenBlock := uint64(0)
-			seenBeyondEnd := false
-
-			parseStart := time.Now()
-			var decodeDur, marshalDur time.Duration
-			err = jsonl.Parse(raw, func(block *parser.Block) error {
-				if block.Header.Number > maxSeenBlock {
-					maxSeenBlock = block.Header.Number
-				}
-				if effectiveEndBlock != nil && block.Header.Number > *effectiveEndBlock {
-					seenBeyondEnd = true
-					return nil
-				}
-				blockRefs = append(blockRefs, client.BlockRef{
-					Number: block.Header.Number,
-					Hash:   strings.Clone(block.Header.Hash),
-				})
-				responseBlockCount++
-				blockHash := strings.Clone(block.Header.Hash)
-				blockTS := time.Unix(int64(block.Header.Timestamp), 0).UTC()
-				blockRow := database.BlockRow{
-					ChainID:        chain.ID,
-					BlockNumber:    block.Header.Number,
-					BlockTimestamp: blockTS,
-					BlockHash:      blockHash,
-				}
-				blockHasEvents := false
-				var blockEvents []parser.DecodedEvent
-				var blockCustomLogs []CustomLog
-
-				for _, lg := range block.Logs {
-					if len(lg.Topics) == 0 {
-						continue
-					}
-					d0 := time.Now()
-					topic0 := common.HexToHash(lg.Topics[0])
-					def, ok := decoders[topic0]
-					if !ok {
-						decodeDur += time.Since(d0)
-						continue
-					}
-					if !def.MatchesAddress(lg.Address) {
-						decodeDur += time.Since(d0)
-						continue
-					}
-					ev, err := def.Decode(lg.Address, lg.Topics, common.FromHex(lg.Data))
-					decodeDur += time.Since(d0)
-					if err != nil {
-						log.Printf("decode %s log in block %d: %v", def.EventName(), block.Header.Number, err)
-						continue
-					}
-					ev.ChainID = chain.ID
-					ev.BlockNumber = block.Header.Number
-					ev.BlockTimestamp = blockTS
-					ev.BlockHash = blockHash
-					ev.TxHash = strings.Clone(lg.TransactionHash)
-					ev.TxIndex = lg.TransactionIndex
-					ev.LogIndex = lg.LogIndex
-					ev.Address = strings.Clone(lg.Address)
-					decodedEvents = append(decodedEvents, *ev)
-					blockEvents = append(blockEvents, *ev)
-					{
-						customLogs = append(customLogs, CustomLog{
-							ChainID:          chain.ID,
-							BlockNumber:      block.Header.Number,
-							BlockTimestamp:   blockTS,
-							BlockHash:        blockHash,
-							ContractAddress:  strings.Clone(lg.Address),
-							TransactionHash:  strings.Clone(lg.TransactionHash),
-							TransactionIndex: lg.TransactionIndex,
-							LogIndex:         lg.LogIndex,
-							Topics:           cloneStrings(lg.Topics),
-							Data:             strings.Clone(lg.Data),
-						})
-						blockCustomLogs = append(blockCustomLogs, CustomLog{
-							ChainID:          chain.ID,
-							BlockNumber:      block.Header.Number,
-							BlockTimestamp:   blockTS,
-							BlockHash:        blockHash,
-							ContractAddress:  strings.Clone(lg.Address),
-							TransactionHash:  strings.Clone(lg.TransactionHash),
-							TransactionIndex: lg.TransactionIndex,
-							LogIndex:         lg.LogIndex,
-							Topics:           cloneStrings(lg.Topics),
-							Data:             strings.Clone(lg.Data),
-						})
-					}
-					blockHasEvents = true
-					if table, ok := typedTables.lookup(ev.Address, ev.EventName); ok {
-						typedEvents[table.Name] = append(typedEvents[table.Name], *ev)
-						typedSpecs[table.Name] = table
-					}
-				}
-				if blockHasEvents {
-					blockRows = append(blockRows, blockRow)
-					eventBlockCount++
-				}
-				replayBuf.Write(chain.ID, block.Header.Number, blockHash, blockTS, blockEvents, blockCustomLogs)
-				return nil
-			})
-			profParse += time.Since(parseStart)
-			profDecode += decodeDur
-			profMarshal += marshalDur
-			profIters++
-
-			if err != nil {
-				log.Printf("Chain %d: parse %s error: %v", chain.ID, rangeLabel, err)
-				time.Sleep(5 * time.Second)
-				continue
+			if sig.err != nil {
+				return fmt.Errorf("producer error: %w", sig.err)
 			}
 
-			// Sequential ClickHouse insertion using pre-allocated inserter instances
-			insertStart := time.Now()
-			var firstErr error
+			// Clean exit of producer
+			producerDone = true
 
-			// 1. Logs insertion
-			if !cfg.ShouldOmitRawLogs() && len(decodedEvents) > 0 {
-				if err := baseInserter.InsertLogs(ctx, decodedEvents); err != nil {
-					firstErr = fmt.Errorf("InsertLogs: %w", err)
-				}
-			}
-
-			// 2. Typed logs insertions
-			if firstErr == nil {
-				for tableName, events := range typedEvents {
-					inserter := typedInserters[tableName]
-					if inserter == nil {
-						firstErr = fmt.Errorf("missing TypedInserter for %s", tableName)
-						break
-					}
-					if err := inserter.Insert(ctx, events); err != nil {
-						firstErr = fmt.Errorf("InsertTypedLogs(%s): %w", tableName, err)
-						break
-					}
-				}
-			}
-
-			// 3. Blocks insertion
-			if firstErr == nil && len(blockRows) > 0 {
-				if err := baseInserter.InsertBlocks(ctx, blockRows); err != nil {
-					firstErr = fmt.Errorf("InsertBlocks: %w", err)
-				}
-			}
-
-			if firstErr != nil {
-				log.Printf("Chain %d: sequential insert error: %v", chain.ID, firstErr)
-				if len(blockRefs) > 0 {
-					_ = rollbackAfterBlock(ctx, store, forkMode, chain.ID, blockRefs[0].Number-1)
-				}
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			profInsert += time.Since(insertStart)
-			if proc != nil && len(customLogs) > 0 {
-				insertStart := time.Now()
-				if err := proc.Process(ctx, store, customLogs); err != nil {
-					profInsert += time.Since(insertStart)
-					log.Printf("Chain %d: custom processor %s error: %v", chain.ID, rangeLabel, err)
-					if len(blockRefs) > 0 {
-						_ = rollbackAfterBlock(ctx, store, forkMode, chain.ID, blockRefs[0].Number-1)
-					}
-					time.Sleep(5 * time.Second)
-					continue
-				}
-				profInsert += time.Since(insertStart)
-			}
-
-			if cursorMode {
-				lastProcessed = maxSeenBlock
-				if effectiveEndBlock != nil && (seenBeyondEnd || lastProcessed > *effectiveEndBlock) {
-					lastProcessed = *effectiveEndBlock
-				}
-				state.ApplyBatch(response.Head.Finalized, blockRefs)
+		case finalized := <-finalizedChan:
+			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
+			state.ApplyBatch(finalized, nil)
+			if pendingBatchBlocks == 0 {
 				current := state.Current()
-				if current == nil && len(blockRefs) > 0 {
-					current = &blockRefs[len(blockRefs)-1]
-				}
 				if current != nil {
 					if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
-						return fmt.Errorf("update sync state %d: %w", lastProcessed, err)
+						return fmt.Errorf("update sync state: %w", err)
 					}
 				}
-			} else if err := store.UpdateSyncState(ctx, chain.ID, lastProcessed); err != nil {
-				return fmt.Errorf("update sync state %d: %w", lastProcessed, err)
+			} else {
+				log.Printf("Chain %d: finalized head advanced with %d uncommitted batch block(s); checkpoint delayed until batch commit", chain.ID, pendingBatchBlocks)
 			}
-			if profIters%10 == 0 {
-				if err := store.TruncateSyncState(ctx, chain.ID, lastProcessed); err != nil {
-					log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
-				}
-			}
+			log.Printf("Chain %d: empty response, waiting for new blocks...", chain.ID)
 
-			totalEvents += uint64(len(decodedEvents))
-		}
+		case <-replayBuf.notifyCh:
+			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
+			// A block was written, loop back to GetBlock check
 
-		scanned := uint64(0)
-		if lastProcessed >= requestStartBlock {
-			scanned = lastProcessed - requestStartBlock + 1
-		}
-		totalBlocks += scanned
-		elapsed := time.Since(startTime)
-		rate := float64(totalBlocks) / elapsed.Seconds()
-		if len(raw) > 0 {
-			log.Printf("Chain %d: %s scanned %d blocks, event blocks: %d, events: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
-				chain.ID, rangeLabel, scanned, eventBlockCount, len(decodedEvents), lastProcessed, totalBlocks, totalEvents, rate)
-		} else {
-			log.Printf("Chain %d: %s scanned %d blocks, empty response | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
-				chain.ID, rangeLabel, scanned, lastProcessed, totalBlocks, totalEvents, rate)
-		}
-
-		currentBlock = lastProcessed + 1
-
-		if effectiveEndBlock != nil && currentBlock > *effectiveEndBlock {
-			break
+		case <-statsTicker.C:
+			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
+			logStats("periodic")
 		}
 	}
 
-	runtime.ReadMemStats(&memAfter)
-	printProfile(profFetch, profParse, profDecode, profMarshal, profInsert, profIters, totalBlocks, totalEvents, startTime, memBefore, memAfter)
+	// Clean completion (backfill): force a durable commit of the tail (the blocks
+	// processed since the last periodic commit) and advance the checkpoint to it,
+	// so nothing processed is lost on a clean exit. Crash/cancel paths intentionally
+	// skip this — they resume from the last durable checkpoint and re-fetch the gap.
+	if !cursorMode && flusher != nil && lastCheckpoint > 0 {
+		committed, err := flusher.Flush(ctx, store, lastCheckpoint)
+		if err != nil {
+			return fmt.Errorf("final flush at %d: %w", lastCheckpoint, err)
+		}
+		if committed > durableCheckpoint {
+			if err := store.FlushAsyncInserts(ctx); err != nil {
+				return fmt.Errorf("final flush async inserts at %d: %w", committed, err)
+			}
+			if err := store.UpdateSyncState(ctx, chain.ID, committed); err != nil {
+				return fmt.Errorf("final checkpoint %d: %w", committed, err)
+			}
+			durableCheckpoint = committed
+		}
+	}
+
 	return nil
 }
 
-func printProfile(fetch, parse, decode, marshal, insert time.Duration, iters int, totalBlocks, totalEvents uint64, startTime time.Time, memBefore, memAfter runtime.MemStats) {
-	if iters == 0 {
-		return
-	}
-	total := fetch + parse + decode + marshal + insert
+func printProfile(fetch, parse, decode, marshal, insert, custom, consumerWait, producerBackpressure time.Duration, iters int, totalBlocks, totalEvents uint64, startTime time.Time, memBefore, memAfter runtime.MemStats) {
+	total := fetch + parse + decode + marshal + insert + custom
+	waitTotal := consumerWait + producerBackpressure
 	elapsed := time.Since(startTime)
 	log.Println("")
 	log.Println("═══ PROFILE ═══")
 	log.Printf("  FETCH:  %v (%.0f%%)", fetch, pct(fetch, total))
-	log.Printf("  PARSE:  %v (%.0f%%), %d iterations, avg %v/iter", parse, pct(parse, total), iters, parse/time.Duration(iters))
+	if iters > 0 {
+		log.Printf("  PARSE:  %v (%.0f%%), %d iterations, avg %v/iter", parse, pct(parse, total), iters, parse/time.Duration(iters))
+	} else {
+		log.Printf("  PARSE:  %v (%.0f%%), 0 iterations", parse, pct(parse, total))
+	}
 	log.Printf("  DECODE: %v (%.0f%%)", decode, pct(decode, total))
 	log.Printf("  MARSHAL:%v (%.0f%%)", marshal, pct(marshal, total))
 	log.Printf("  INSERT: %v (%.0f%%)", insert, pct(insert, total))
+	log.Printf("  CUSTOM: %v (%.0f%%)", custom, pct(custom, total))
+	log.Printf("  WAIT:   consumer=%v producer_backpressure=%v observed=%v", consumerWait, producerBackpressure, waitTotal)
 	log.Printf("  ─────────────────")
-	log.Printf("  TOTAL:  %v (wall %v, %.0f%% accounted)", total, elapsed, pct(total, elapsed))
+	log.Printf("  TOTAL:  %v work (wall %v, %.0f%% observed work)", total, elapsed, pct(total, elapsed))
 	log.Printf("  Throughput: %d blocks, %d events, avg %.0f µs/event", totalBlocks, totalEvents, float64(total.Microseconds())/float64(max(totalEvents, 1)))
 
 	allocMegabytes := float64(memAfter.TotalAlloc-memBefore.TotalAlloc) / 1024 / 1024
@@ -603,7 +1034,20 @@ func max(a, b uint64) uint64 {
 }
 
 func nextRequestRange(currentBlock, pageSize uint64, effectiveEndBlock *uint64, cursorMode bool) (*uint64, string, bool) {
+	if effectiveEndBlock != nil && currentBlock > *effectiveEndBlock {
+		return nil, "", false
+	}
 	if cursorMode {
+		if effectiveEndBlock != nil {
+			toBlock := *effectiveEndBlock
+			return &toBlock, fmt.Sprintf("[%d-%d]", currentBlock, toBlock), true
+		}
+		return nil, fmt.Sprintf("[%d-tail]", currentBlock), true
+	}
+	if pageSize == 0 {
+		if effectiveEndBlock != nil {
+			return nil, fmt.Sprintf("[%d-%d]", currentBlock, *effectiveEndBlock), true
+		}
 		return nil, fmt.Sprintf("[%d-tail]", currentBlock), true
 	}
 	toBlock := currentBlock + pageSize - 1
@@ -616,6 +1060,27 @@ func nextRequestRange(currentBlock, pageSize uint64, effectiveEndBlock *uint64, 
 	return &toBlock, fmt.Sprintf("[%d-%d]", currentBlock, toBlock), true
 }
 
+func nextProducerRequestRange(currentBlock, pageSize, adaptivePageSize, lastFinalized uint64, effectiveEndBlock *uint64, cursorMode bool) (*uint64, string, bool) {
+	if effectiveEndBlock != nil && currentBlock > *effectiveEndBlock {
+		return nil, "", false
+	}
+	effectivePageSize := pageSize
+	if effectivePageSize == 0 && cursorMode {
+		effectivePageSize = adaptivePageSize
+	}
+	if effectivePageSize > 0 && cursorMode && (lastFinalized == 0 || currentBlock+effectivePageSize < lastFinalized) {
+		toBlock := currentBlock + effectivePageSize - 1
+		if effectiveEndBlock != nil && toBlock > *effectiveEndBlock {
+			toBlock = *effectiveEndBlock
+		}
+		if toBlock < currentBlock {
+			return nil, "", false
+		}
+		return &toBlock, fmt.Sprintf("[%d-%d]", currentBlock, toBlock), true
+	}
+	return nextRequestRange(currentBlock, pageSize, effectiveEndBlock, cursorMode)
+}
+
 func minEndBlock(current *uint64, candidate uint64) *uint64 {
 	if current != nil && *current < candidate {
 		return current
@@ -624,6 +1089,11 @@ func minEndBlock(current *uint64, candidate uint64) *uint64 {
 }
 
 func chainEndpoint(chainID uint64, hot bool) string {
+	// Allow overriding the portal endpoint (e.g. a local mock or mirror) for
+	// integration testing the full ingestion pipeline against fixture data.
+	if v := os.Getenv("SQD_PORTAL_ENDPOINT"); v != "" {
+		return v
+	}
 	suffix := "/finalized-stream"
 	if hot {
 		suffix = "/stream"

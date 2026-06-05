@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/format"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -103,6 +104,7 @@ func GenerateProject(project *config.Project) (string, error) {
 	if err := os.WriteFile(filepath.Join(goOutDir, "events.go"), goCode, 0o644); err != nil {
 		return "", err
 	}
+
 	schemaGoCode, err := generateSchemaGo(events)
 	if err != nil {
 		return "", err
@@ -118,14 +120,24 @@ func GenerateProject(project *config.Project) (string, error) {
 		return "", err
 	}
 
-	// Determine if we should generate/update custom_processor.go
-	customProcessorPath := filepath.Join(goOutDir, "custom_processor.go")
-	customProcessorRootPath := filepath.Join(project.Root, "custom_processor.go")
-	configDir := filepath.Dir(project.ConfigPath)
-	customProcessorConfigPath := filepath.Join(configDir, "custom_processor.go")
+	viewsCode, err := generateProtoViewGo(events)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(goOutDir, "views.go"), viewsCode, 0o644); err != nil {
+		return "", err
+	}
 
-	hasCustomProcessor := false
-	isCodegenOwned := false
+	allCustomTables := append([]customTableSpec{}, customTables...)
+	allCustomTables = append(allCustomTables, customSchemaTables...)
+
+	hotStateTables := buildHotStateTables(allCustomTables, project.Config, events)
+
+	// Determine if we should generate/update generated/custom_processor.go.
+	// A user custom_processor.go next to config.yaml belongs to the project
+	// package and registers CustomProcessFn; it must not suppress framework
+	// generation in the generated package.
+	customProcessorPath := filepath.Join(goOutDir, "custom_processor.go")
 
 	// Helper to check if file has user code or is codegen-owned
 	checkFile := func(path string) (exists bool, codegenOwned bool) {
@@ -139,28 +151,17 @@ func GenerateProject(project *config.Project) (string, error) {
 		return true, false
 	}
 
-	if exists, codegenOwned := checkFile(customProcessorPath); exists {
-		hasCustomProcessor = true
-		isCodegenOwned = codegenOwned
-	} else if exists, codegenOwned := checkFile(customProcessorConfigPath); exists {
-		hasCustomProcessor = true
-		isCodegenOwned = codegenOwned
-	} else if exists, codegenOwned := checkFile(customProcessorRootPath); exists {
-		hasCustomProcessor = true
-		isCodegenOwned = codegenOwned
-	}
-
-	if !hasCustomProcessor || isCodegenOwned {
+	customProcessorExists, customProcessorCodegenOwned := checkFile(customProcessorPath)
+	if !customProcessorExists || customProcessorCodegenOwned {
 		// Generate the custom processor
 		var customProcessorCode []byte
 		var err error
 		// For backward compatibility, if the project is Uniswap/ERC20, we use ERC20 generator.
 		// Otherwise we can generate the empty/generic skeleton.
-		if project.Config.Name == "case_1_lbtc_event_only" {
+		if project.Config.Name == "case_1_lbtc_event_only" && len(hotStateTables) == 0 {
 			customProcessorCode, err = generateCustomProcessorGo(events)
 		} else {
-			hasHotState := (len(customTables) > 0 || len(customSchemaTables) > 0)
-			customProcessorCode, err = generateEmptyCustomProcessorGo(events, hasHotState)
+			customProcessorCode, err = generateEmptyCustomProcessorGo(project.Config, events, hotStateTables)
 		}
 		if err != nil {
 			return "", err
@@ -170,20 +171,43 @@ func GenerateProject(project *config.Project) (string, error) {
 		}
 	}
 
-	allCustomTables := append([]customTableSpec{}, customTables...)
-	allCustomTables = append(allCustomTables, customSchemaTables...)
 	hotstatePath := filepath.Join(goOutDir, "hotstate.go")
-	if len(allCustomTables) > 0 {
-		hotStateCode, err := generateHotStateGo(allCustomTables)
+	statePath := filepath.Join(goOutDir, "state.go")
+	if len(hotStateTables) > 0 {
+		hotStateCode, err := generateHotStateGo(hotStateTables)
 		if err != nil {
 			return "", err
 		}
 		if err := os.WriteFile(hotstatePath, hotStateCode, 0o644); err != nil {
 			return "", err
 		}
+		stateExists, stateCodegenOwned := checkFile(statePath)
+		if !stateExists || stateCodegenOwned {
+			stateCode, err := generateStateGo(hotStateTables, project.Config, events)
+			if err != nil {
+				return "", err
+			}
+			if err := os.WriteFile(statePath, stateCode, 0o644); err != nil {
+				return "", err
+			}
+		}
 	} else {
 		_ = os.Remove(hotstatePath)
+		if stateExists, stateCodegenOwned := checkFile(statePath); stateExists && stateCodegenOwned {
+			_ = os.Remove(statePath)
+		}
 	}
+
+	_ = os.Remove(filepath.Join(goOutDir, "prefetch.go"))
+
+	compactionCode, err := generateCompactionGo(project.Config, allCustomTables)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(goOutDir, "compaction.go"), compactionCode, 0o644); err != nil {
+		return "", err
+	}
+
 	ringBufferCode, err := generateRingBufferGo(events)
 	if err != nil {
 		return "", err
@@ -191,7 +215,53 @@ func GenerateProject(project *config.Project) (string, error) {
 	if err := os.WriteFile(filepath.Join(goOutDir, "ringbuffer.go"), ringBufferCode, 0o644); err != nil {
 		return "", err
 	}
+
+	parserCode, err := generateParserGo(events)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(goOutDir, "parser.go"), parserCode, 0o644); err != nil {
+		return "", err
+	}
+
+	// Generate events_easyjson.go using easyjson CLI (runs after all other generated files are written so package compiles)
+	easyjsonCmd := exec.Command("easyjson", "-all", "events.go")
+	easyjsonCmd.Dir = goOutDir
+	var easyjsonStderr bytes.Buffer
+	easyjsonCmd.Stderr = &easyjsonStderr
+	if err := easyjsonCmd.Run(); err != nil {
+		// Fallback to /home/dev/go/bin/easyjson
+		fallbackCmd := exec.Command("/home/dev/go/bin/easyjson", "-all", "events.go")
+		fallbackCmd.Dir = goOutDir
+		fallbackCmd.Stderr = &easyjsonStderr
+		if err2 := fallbackCmd.Run(); err2 != nil {
+			if _, statErr := os.Stat(filepath.Join(project.Root, "go.mod")); os.IsNotExist(statErr) {
+				// Log warning instead of returning error if go.mod is missing (e.g. in tests)
+				fmt.Printf("WARNING: easyjson failed in non-module directory: %v (stderr: %s)\n", err2, easyjsonStderr.String())
+			} else {
+				return "", fmt.Errorf("easyjson failed: %w (stderr: %s)", err2, easyjsonStderr.String())
+			}
+		}
+	}
+
 	return outPath, nil
+}
+
+func buildHotStateTables(customTables []customTableSpec, cfg *config.Config, events []eventSpec) []customTableSpec {
+	hotStateTables := append([]customTableSpec{}, customTables...)
+	if cfg == nil {
+		return hotStateTables
+	}
+	for _, state := range cfg.State {
+		if _, ok := findStateCustomTableSpec(customTables, state); ok {
+			continue
+		}
+		targetEv, err := findStateEventSpec(events, state)
+		if err == nil {
+			hotStateTables = append(hotStateTables, stateEventToCustomTableSpec(targetEv, state))
+		}
+	}
+	return hotStateTables
 }
 
 func buildManifest(project *config.Project) Manifest {
@@ -260,6 +330,7 @@ type eventSpec struct {
 	GoConstPrefix   string
 	ContractAddress []string
 	Args            []eventArg
+	DecodeArgs      []eventArg
 }
 
 type eventArg struct {
@@ -268,6 +339,7 @@ type eventArg struct {
 	SolidityType   string
 	ClickHouseType string
 	Indexed        bool
+	Omitted        bool
 	GoFieldName    string
 	GoType         string
 }
@@ -311,11 +383,15 @@ func buildEventSpecs(cfg *config.Config) ([]eventSpec, error) {
 				constPrefix := uniqueExported(usedConsts, contractIdent+eventIdent)
 
 				var filteredArgs []eventArg
+				var decodeArgs []eventArg
 				for _, arg := range parsed.Args {
 					if isArgOmitted(ev.Omit, arg.Name) {
+						arg.Omitted = true
+						decodeArgs = append(decodeArgs, arg)
 						continue
 					}
 					filteredArgs = append(filteredArgs, arg)
+					decodeArgs = append(decodeArgs, arg)
 				}
 
 				specs = append(specs, eventSpec{
@@ -333,6 +409,7 @@ func buildEventSpecs(cfg *config.Config) ([]eventSpec, error) {
 					GoConstPrefix:   constPrefix,
 					ContractAddress: addresses(contract.Address),
 					Args:            filteredArgs,
+					DecodeArgs:      decodeArgs,
 				})
 			}
 		}
@@ -457,7 +534,10 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 	b.WriteString(fmt.Sprintf(`-- Code generated by sqd-go codegen; DO NOT EDIT.
 
 CREATE DATABASE IF NOT EXISTS %[1]s;
+`, db))
 
+	if cfg.ShouldStoreBlocks() {
+		b.WriteString(fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %[1]s.blocks (
   chain_id UInt64,
   block_number UInt64,
@@ -467,8 +547,9 @@ CREATE TABLE IF NOT EXISTS %[1]s.blocks (
 ) ENGINE = %[2]s
 ORDER BY (chain_id, block_number);
 `, db, engine, signColumn))
+	}
 
-	if !cfg.ShouldOmitRawLogs() {
+	if cfg.ShouldStoreRawLogs() {
 		b.WriteString(fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %[1]s.logs (
   chain_id UInt64,
@@ -577,7 +658,7 @@ func eventPrimaryKey(ev eventSpec) string {
 }
 
 func generateViewsSQL(cfg *config.Config, events []eventSpec) string {
-	if cfg.ShouldOmitRawLogs() {
+	if !cfg.ShouldStoreRawLogs() {
 		return "-- Raw logs omitted by config\n"
 	}
 	var b strings.Builder
@@ -680,27 +761,25 @@ func generateGoCode(cfg *config.Config, events []eventSpec) ([]byte, error) {
 	b.WriteString("\n\n")
 
 	includeChainID := cfg.MetadataIncluded("chain_id")
-	includeBlockHash := cfg.MetadataIncluded("block_hash")
-	includeContractAddress := cfg.MetadataIncluded("contract_address")
-	includeTransactionHash := cfg.MetadataIncluded("transaction_hash")
 
 	b.WriteString("type EventMeta struct {\n")
 	if includeChainID {
-		b.WriteString("\tChainID         uint64 `json:\"chain_id\"`\n")
+		b.WriteString("\tChainID          uint64 `json:\"chain_id\"`\n")
 	}
-	b.WriteString("\tBlockNumber     uint64 `json:\"block_number\"`\n")
-	b.WriteString("\tBlockTimestamp  time.Time `json:\"block_timestamp\"`\n")
-	if includeBlockHash {
-		b.WriteString("\tBlockHash       string `json:\"block_hash\"`\n")
-	}
-	if includeContractAddress {
-		b.WriteString("\tContractAddress string `json:\"contract_address\"`\n")
-	}
-	if includeTransactionHash {
-		b.WriteString("\tTransactionHash string `json:\"transaction_hash\"`\n")
-	}
+	b.WriteString("\tBlockNumber      uint64 `json:\"block_number\"`\n")
+	b.WriteString("\tBlockTimestamp   time.Time `json:\"block_timestamp\"`\n")
+	b.WriteString("\tBlockHash        common.Hash `json:\"block_hash\"`\n")
+	b.WriteString("\tContractAddress  common.Address `json:\"contract_address\"`\n")
+	b.WriteString("\tTransactionHash  common.Hash `json:\"transaction_hash\"`\n")
 	b.WriteString("\tTransactionIndex uint64 `json:\"transaction_index\"`\n")
 	b.WriteString("\tLogIndex         uint64 `json:\"log_index\"`\n")
+	b.WriteString("}\n\n")
+
+	b.WriteString("type Event interface {\n")
+	b.WriteString("\tMeta() EventMeta\n")
+	b.WriteString("}\n\n")
+	b.WriteString("func (m EventMeta) Meta() EventMeta {\n")
+	b.WriteString("\treturn m\n")
 	b.WriteString("}\n\n")
 	for _, ev := range events {
 		b.WriteString("const ")
@@ -760,6 +839,7 @@ func generateGoCode(cfg *config.Config, events []eventSpec) ([]byte, error) {
 			}
 			b.WriteString("\n")
 		}
+		b.WriteString("\tTombstone bool `json:\"-\"`\n")
 		b.WriteString("}\n\n")
 	}
 	renderUnpackDispatcher(&b, events)
@@ -798,6 +878,10 @@ type DecodedLog struct {
 }
 
 func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error) {
+	return UnpackLogWithMeta(address, topics, data, EventMeta{})
+}
+
+func UnpackLogWithMeta(address string, topics []string, data []byte, meta EventMeta) (*DecodedLog, error) {
 	if len(topics) == 0 {
 		return nil, nil
 	}
@@ -818,7 +902,7 @@ func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error
 		b.WriteString(" {\n")
 		b.WriteString("\t\tev, err := Unpack")
 		b.WriteString(ev.GoTypeName)
-		b.WriteString("Log(topics, data)\n")
+		b.WriteString("LogWithMeta(topics, data, meta)\n")
 		b.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
 		b.WriteString("\t\tif ev == nil {\n\t\t\treturn nil, nil\n\t\t}\n")
 		b.WriteString("\t\treturn &DecodedLog{EventName: ")
@@ -855,8 +939,12 @@ func addressMatchExpr(eventIdx, addrCount int) string {
 }
 
 func renderEventUnpackFunction(b *bytes.Buffer, ev eventSpec) {
+	decodeArgs := ev.DecodeArgs
+	if len(decodeArgs) == 0 {
+		decodeArgs = ev.Args
+	}
 	requiredTopics := 1
-	for _, arg := range ev.Args {
+	for _, arg := range decodeArgs {
 		if arg.Indexed {
 			requiredTopics++
 		}
@@ -866,19 +954,33 @@ func renderEventUnpackFunction(b *bytes.Buffer, ev eventSpec) {
 	b.WriteString("Log(topics []string, data []byte) (*")
 	b.WriteString(ev.GoTypeName)
 	b.WriteString(", error) {\n")
+	b.WriteString("\treturn Unpack")
+	b.WriteString(ev.GoTypeName)
+	b.WriteString("LogWithMeta(topics, data, EventMeta{})\n")
+	b.WriteString("}\n\n")
+
+	b.WriteString("func Unpack")
+	b.WriteString(ev.GoTypeName)
+	b.WriteString("LogWithMeta(topics []string, data []byte, meta EventMeta) (*")
+	b.WriteString(ev.GoTypeName)
+	b.WriteString(", error) {\n")
 	b.WriteString(fmt.Sprintf("\tif len(topics) < %d {\n\t\treturn nil, nil\n\t}\n", requiredTopics))
 	b.WriteString("\tvar ev ")
 	b.WriteString(ev.GoTypeName)
-	b.WriteString("\n\tvar ok bool\n\tvar word []byte\n\t_ = ok\n\t_ = word\n")
+	b.WriteString("\n\tev.EventMeta = meta\n\tvar ok bool\n\tvar word []byte\n\t_ = ok\n\t_ = word\n")
 	topicIdx := 1
 	dataWord := 0
-	for _, arg := range ev.Args {
+	for _, arg := range decodeArgs {
 		if arg.Indexed {
-			renderIndexedDecode(b, arg, topicIdx)
+			if !arg.Omitted {
+				renderIndexedDecode(b, arg, topicIdx)
+			}
 			topicIdx++
 			continue
 		}
-		renderDataDecode(b, ev.GoTypeName, arg, dataWord)
+		if !arg.Omitted {
+			renderDataDecode(b, ev.GoTypeName, arg, dataWord)
+		}
 		dataWord += abiHeadWords(arg.SolidityType)
 	}
 	b.WriteString("\treturn &ev, nil\n}\n\n")
@@ -1384,4 +1486,66 @@ func generateSchemaGo(events []eventSpec) ([]byte, error) {
 	b.WriteString("}\n")
 
 	return format.Source(b.Bytes())
+}
+
+func stateEventToCustomTableSpec(ev *eventSpec, state config.StateConfig) customTableSpec {
+	spec := customTableSpec{
+		Name:       ev.TableName,
+		GoTypeName: ev.GoTypeName,
+		BaseName:   pluralizeGoName(exportIdent(state.Name)),
+		IsEvent:    true,
+	}
+
+	var pkeys []string
+	for _, k := range state.Key {
+		for _, arg := range ev.Args {
+			if strings.EqualFold(arg.ColumnName, k) || strings.EqualFold(arg.Name, k) || strings.EqualFold(arg.GoFieldName, k) {
+				pkeys = append(pkeys, arg.ColumnName)
+				break
+			}
+		}
+	}
+	spec.PrimaryKey = pkeys
+
+	spec.Fields = append(spec.Fields, customFieldSpec{
+		Name:       "BlockNumber",
+		ColumnName: "block_number",
+		Type:       "uint64",
+		ColumnType: "UInt64",
+	})
+	spec.Fields = append(spec.Fields, customFieldSpec{
+		Name:       "BlockTimestamp",
+		ColumnName: "block_timestamp",
+		Type:       "time.Time",
+		ColumnType: "DateTime64(3, 'UTC')",
+	})
+	spec.Fields = append(spec.Fields, customFieldSpec{
+		Name:       "TransactionIndex",
+		ColumnName: "transaction_index",
+		Type:       "uint64",
+		ColumnType: "UInt64",
+	})
+	spec.Fields = append(spec.Fields, customFieldSpec{
+		Name:       "LogIndex",
+		ColumnName: "log_index",
+		Type:       "uint64",
+		ColumnType: "UInt64",
+	})
+
+	for _, arg := range ev.Args {
+		spec.Fields = append(spec.Fields, customFieldSpec{
+			Name:       arg.GoFieldName,
+			ColumnName: arg.ColumnName,
+			Type:       arg.GoType,
+			ColumnType: arg.ClickHouseType,
+		})
+	}
+
+	for _, f := range spec.Fields {
+		spec.Columns = append(spec.Columns, customColumnSpec{
+			Name: f.ColumnName,
+			Type: f.ColumnType,
+		})
+	}
+	return spec
 }

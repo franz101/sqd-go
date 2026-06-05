@@ -19,9 +19,13 @@ type Config struct {
 	Chains          []Chain                `yaml:"chains" json:"chains"`
 	RollbackOnReorg *bool                  `yaml:"rollback_on_reorg,omitempty" json:"rollback_on_reorg,omitempty"`
 	RawEvents       *bool                  `yaml:"raw_events,omitempty" json:"raw_events,omitempty"`
-	OmitRawLogs     *bool                  `yaml:"omit_raw_logs,omitempty" json:"omit_raw_logs,omitempty"`
+	StoreBlocks     *bool                  `yaml:"store_blocks,omitempty" json:"store_blocks,omitempty"`
+	StoreRawLogs    *bool                  `yaml:"store_raw_logs,omitempty" json:"store_raw_logs,omitempty"`
+	ProtoMode       *bool                  `yaml:"proto_mode,omitempty" json:"proto_mode,omitempty"`
+	ColdCache       *bool                  `yaml:"cold_cache,omitempty" json:"cold_cache,omitempty"`
 	IncludeMetadata []string               `yaml:"include_metadata,omitempty" json:"include_metadata,omitempty"`
 	ExcludeMetadata []map[string]string    `yaml:"exclude_metadata,omitempty" json:"exclude_metadata,omitempty"`
+	State           []StateConfig          `yaml:"state,omitempty" json:"state,omitempty"`
 }
 
 type ForkMode string
@@ -66,6 +70,13 @@ type EventConfig struct {
 	Event string   `yaml:"event" json:"event"`
 	Name  *string  `yaml:"name,omitempty" json:"name,omitempty"`
 	Omit  []string `yaml:"omit,omitempty" json:"omit,omitempty"`
+}
+
+type StateConfig struct {
+	Name        string   `yaml:"name" json:"name"`
+	SourceTable string   `yaml:"source_table" json:"source_table"`
+	Key         []string `yaml:"key,omitempty" json:"key,omitempty"`
+	Mode        string   `yaml:"mode,omitempty" json:"mode,omitempty"`
 }
 
 type Chain struct {
@@ -232,14 +243,32 @@ func Validate(cfg *Config) error {
 			}
 		}
 	}
+	for i, state := range cfg.State {
+		if strings.TrimSpace(state.Name) == "" {
+			return fmt.Errorf("state[%d].name is required", i)
+		}
+		mode := strings.TrimSpace(strings.ToLower(state.Mode))
+		switch mode {
+		case "", "db_prefetch", "hotstate":
+		default:
+			return fmt.Errorf("state[%d].mode must be db_prefetch or hotstate", i)
+		}
+	}
 	return nil
 }
 
-func (cfg *Config) ShouldOmitRawLogs() bool {
-	if cfg == nil || cfg.OmitRawLogs == nil {
+func (cfg *Config) ShouldStoreRawLogs() bool {
+	if cfg == nil || cfg.StoreRawLogs == nil {
 		return false
 	}
-	return *cfg.OmitRawLogs
+	return *cfg.StoreRawLogs
+}
+
+func (cfg *Config) ShouldStoreBlocks() bool {
+	if cfg == nil || cfg.StoreBlocks == nil {
+		return false
+	}
+	return *cfg.StoreBlocks
 }
 
 func (cfg *Config) MetadataIncluded(field string) bool {

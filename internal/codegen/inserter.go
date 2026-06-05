@@ -123,13 +123,13 @@ type ClickHouseEventBatch interface {
 	b.WriteString("\tc.colBlock.Append(meta.BlockNumber)\n")
 	b.WriteString("\tc.colTimestamp.Append(meta.BlockTimestamp)\n")
 	if includeBlockHash {
-		b.WriteString("\tc.colBlockHash.Append(common.HexToHash(meta.BlockHash).Bytes())\n")
+		b.WriteString("\tc.colBlockHash.Append(meta.BlockHash.Bytes())\n")
 	}
 	if includeContractAddress {
-		b.WriteString("\tc.colContractAddress.Append(common.HexToAddress(meta.ContractAddress).Bytes())\n")
+		b.WriteString("\tc.colContractAddress.Append(meta.ContractAddress.Bytes())\n")
 	}
 	if includeTransactionHash {
-		b.WriteString("\tc.colTxHash.Append(common.HexToHash(meta.TransactionHash).Bytes())\n")
+		b.WriteString("\tc.colTxHash.Append(meta.TransactionHash.Bytes())\n")
 	}
 	b.WriteString("\tc.colTxIndex.Append(meta.TransactionIndex)\n")
 	b.WriteString("\tc.colLogIndex.Append(meta.LogIndex)\n")

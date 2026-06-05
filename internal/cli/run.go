@@ -9,20 +9,22 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
+	"strconv"
+	"syscall"
 
 	"github.com/franz101/sqd-go/internal/codegen"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string) int {
+func runDev(path string, restart, noResume, protoMode, v3Mode, coldCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return 1
 	}
-	applyOverrides(project.Config, startBlockStr, endBlockStr, chainIDStr)
+	applyOverrides(project.Config, protoMode, startBlockStr, endBlockStr, chainIDStr)
 	loadEnv(filepath.Join(project.Root, ".env"))
 	outPath, err := codegen.GenerateProject(project)
 	if err != nil {
@@ -51,16 +53,16 @@ func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, c
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, outPath, cpuprofile)
+	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, coldCache, outPath, cpuprofile, pageSizeStr)
 }
 
-func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string) int {
+func runStartPipeline(path string, restart, noResume, protoMode, v3Mode, coldCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return 1
 	}
-	applyOverrides(project.Config, startBlockStr, endBlockStr, chainIDStr)
+	applyOverrides(project.Config, protoMode, startBlockStr, endBlockStr, chainIDStr)
 	loadEnv(filepath.Join(project.Root, ".env"))
 	outPath, err := codegen.GenerateProject(project)
 	if err != nil {
@@ -69,10 +71,14 @@ func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, cha
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, outPath, cpuprofile)
+	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, coldCache, outPath, cpuprofile, pageSizeStr)
 }
 
-func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr string) {
+func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
+	if protoMode {
+		cfg.ProtoMode = &protoMode
+	}
+
 	if chainIDStr != "" {
 		id, err := chainIDFromName(chainIDStr)
 		if err == nil {
@@ -82,7 +88,7 @@ func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr s
 		}
 	}
 	if startBlockStr != "" {
-		start, err := parseUintFlag("--start-block", startBlockStr, 0)
+		start, err := strconv.ParseUint(startBlockStr, 10, 64)
 		if err == nil {
 			for i := range cfg.Chains {
 				cfg.Chains[i].StartBlock = start
@@ -90,23 +96,25 @@ func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr s
 		}
 	}
 	if endBlockStr != "" {
-		end, err := parseUintFlag("--end-block", endBlockStr, 0)
+		end, err := strconv.ParseUint(endBlockStr, 10, 64)
 		if err == nil {
-			if end == 0 {
-				for i := range cfg.Chains {
-					cfg.Chains[i].EndBlock = nil
-				}
-			} else {
-				for i := range cfg.Chains {
-					cfg.Chains[i].EndBlock = &end
-				}
+			for i := range cfg.Chains {
+				cfg.Chains[i].EndBlock = &end
 			}
 		}
 	}
 }
 
-func runStartPipelineInternal(project *config.Project, path string, restart bool, outPath, cpuprofile string) int {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+func runStartPipelineInternal(project *config.Project, path string, restart, noResume, protoMode, v3Mode, coldCache bool, outPath, cpuprofile string, pageSizeStr string) int {
+	if protoMode {
+		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
+	}
+	if v3Mode {
+		log.Printf("V3 DISCOVERY MODE ENABLED: auto-prefetch key discovery")
+	}
+	SetProtoMode(protoMode)
+	SetV3Mode(v3Mode)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if cpuprofile != "" {
@@ -115,8 +123,26 @@ func runStartPipelineInternal(project *config.Project, path string, restart bool
 			fmt.Fprintf(os.Stderr, "create cpu profile: %v\n", err)
 			return 1
 		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "start cpu profile: %v\n", err)
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			if err := f.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "close cpu profile: %v\n", err)
+				return
+			}
+			log.Printf("cpu profile written: %s", cpuprofile)
+		}()
+	}
+
+	var pageSize uint64 = 0
+	if pageSizeStr != "" {
+		if val, err := parseUintFlag("--pagesize", pageSizeStr, 0); err == nil {
+			pageSize = val
+		}
 	}
 
 	opts := ingestion.Options{
@@ -124,13 +150,24 @@ func runStartPipelineInternal(project *config.Project, path string, restart bool
 		ClickHousePort:     envOrDefaultInt("CLICKHOUSE_NATIVE_PORT", 9000),
 		ClickHouseUser:     envOrDefault("CLICKHOUSE_USER", "default"),
 		ClickHousePassword: envOrDefault("CLICKHOUSE_PASSWORD", "sqd-clickhouse"),
-		ClickHouseDatabase: project.Config.Name,
+		ClickHouseDatabase: envOrDefault("CLICKHOUSE_DATABASE", project.Config.Name),
 		Restart:            restart,
+		NoResume:           noResume,
 		GeneratedSQLDir:    filepath.Dir(outPath),
 		CursorMode:         true,
+		PageSize:           pageSize,
+		ColdCache:          coldCache || (project.Config.ColdCache != nil && *project.Config.ColdCache),
 	}
-
-	log.Printf("starting ingestion for %s", project.Config.Name)
+	if opts.ColdCache {
+		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")
+	}
+	processor, err := processorForProject(project.Config.Name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "custom processor: %v\n", err)
+		return 1
+	}
+	opts.Processor = processor
+	log.Printf("starting ingestion for %s (pageSize=%d)", project.Config.Name, pageSize)
 	if err := ingestion.Run(ctx, project.Config, opts); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "ingestion error: %v\n", err)
 		return 1

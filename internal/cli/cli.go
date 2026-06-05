@@ -16,6 +16,10 @@ type parsedArgs struct {
 	command      string
 	project      string
 	restart      bool
+	noResume     bool
+	protoMode    bool
+	v3Mode       bool
+	coldCache    bool
 	initSource   string
 	initABI      string
 	initName     string
@@ -24,10 +28,13 @@ type parsedArgs struct {
 	initStartBlk string
 	initEndBlk   string
 	cpuprofile   string
+	pageSize     string
 }
 
 func parseArgs(args []string) (*parsedArgs, error) {
-	p := &parsedArgs{}
+	p := &parsedArgs{
+		protoMode: true,
+	}
 	positional := make([]string, 0, len(args))
 
 	for i := 0; i < len(args); i++ {
@@ -35,6 +42,8 @@ func parseArgs(args []string) (*parsedArgs, error) {
 		switch a {
 		case "-r", "--restart":
 			p.restart = true
+		case "--no-resume":
+			p.noResume = true
 		case "-a", "--abi":
 			i++
 			if i >= len(args) {
@@ -77,6 +86,36 @@ func parseArgs(args []string) (*parsedArgs, error) {
 				return nil, fmt.Errorf("--cpuprofile requires a value")
 			}
 			p.cpuprofile = args[i]
+		case "--version":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--version requires a value (1, 2, or 3)")
+			}
+			switch args[i] {
+			case "1":
+				p.protoMode = false
+				p.v3Mode = false
+			case "2":
+				p.protoMode = true
+				p.v3Mode = false
+			case "3":
+				p.protoMode = true
+				p.v3Mode = true
+			default:
+				return nil, fmt.Errorf("--version must be 1, 2, or 3 (got %q)", args[i])
+			}
+		case "--v1":
+			p.protoMode = false
+		case "--v3":
+			p.v3Mode = true
+		case "--cold-cache":
+			p.coldCache = true
+		case "-p", "--pagesize":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--pagesize requires a value")
+			}
+			p.pageSize = args[i]
 		default:
 			if !strings.HasPrefix(a, "-") {
 				positional = append(positional, a)
@@ -143,17 +182,17 @@ func Run(args []string) int {
 
 	case "start":
 		if p.project == "" {
-			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
+			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart|--no-resume] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
 		}
-		return runStartPipeline(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
+		return runStartPipeline(p.project, p.restart, p.noResume, p.protoMode, p.v3Mode, p.coldCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "dev":
 		if p.project == "" {
-			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
+			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart|--no-resume]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
+		return runDev(p.project, p.restart, p.noResume, p.protoMode, p.v3Mode, p.coldCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "stop":
 		return runStop()
@@ -172,7 +211,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, false, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
+		return runStartPipeline(p.command, false, p.noResume, p.protoMode, p.v3Mode, p.coldCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 	}
 }
 
@@ -283,12 +322,18 @@ Commands:
 
 Flags:
   --restart             (dev/start) Drop DB and re-index from scratch
+  --no-resume           (dev/start) Drop DB and start from configured block
   --abi, -a             (init) Path to ABI JSON file
   --name, -n            (init) Contract name
   --address, --addr     (init) Contract address (hex)
   --blockchain, -b      (init/start) Chain ID or name (default: 1)
   --start-block, -s     (init/start) Start block (default: 0)
   --end-block, -e       (start) End block (0 for infinite)
+  --pagesize, -p        (start/dev) Fixed page size range to fetch (default: 0 for dynamic)
+  --version             (start/dev) Pipeline version: 1 (legacy parsed), 2 (proto, default), 3 (discovery prefetch)
+  --v1                  (start/dev) Alias for --version 1
+  --v3                  (start/dev) Alias for --version 3
+  --cold-cache          (start/dev) Pebble cold tier under hot caches: serve evicted keys from local disk instead of per-miss ClickHouse SELECTs (also set via cold_cache in config)
 
 Examples:
   sqd-go
@@ -296,6 +341,7 @@ Examples:
   sqd-go codegen examples/uniswap
   sqd-go start examples/uniswap
   sqd-go start examples/uniswap --blockchain polygon --start-block 80000000 --restart
+  sqd-go start examples/uniswap --no-resume
   sqd-go dev examples/uniswap --restart
   sqd-go stop
   sqd-go init contract-import local --abi erc20.json --name USDC --address 0xA0...

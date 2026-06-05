@@ -55,6 +55,22 @@ func TestParseArgsInitContractImportLocalSource(t *testing.T) {
 	}
 }
 
+func TestParseArgsStartNoResume(t *testing.T) {
+	p, err := parseArgs([]string{"start", "examples/sample_project", "--no-resume", "--cpuprofile", "cpu.pprof"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.command != "start" || p.project != "examples/sample_project" {
+		t.Fatalf("command/project = %q/%q", p.command, p.project)
+	}
+	if !p.noResume {
+		t.Fatal("noResume = false, want true")
+	}
+	if p.cpuprofile != "cpu.pprof" {
+		t.Fatalf("cpuprofile = %q, want cpu.pprof", p.cpuprofile)
+	}
+}
+
 func TestExtractEventsFromABIFormattedJSON(t *testing.T) {
 	got, err := extractEventsFromABI([]byte(erc20ABI))
 	if err != nil {
@@ -200,3 +216,77 @@ func TestRunInitTemplateWritesProject(t *testing.T) {
 		t.Fatalf("compose.yml missing: %v", err)
 	}
 }
+
+func TestRunInitWithConfig(t *testing.T) {
+	dir := t.TempDir()
+	projectDir := filepath.Join(dir, "uniswap_pnl")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	configYAML := `
+name: case_1_lbtc_event_only
+chains:
+  - id: 1
+    start_block: 0
+    end_block: 22200000
+    contracts:
+      - name: LBTC
+        address: "0x8236a87084f8B84306f72007F36F2618A5634494"
+        events:
+          - event: Transfer(address indexed from, address indexed to, uint256 value)
+`
+	configPath := filepath.Join(projectDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(configYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create dummy go.mod in dir so findGoModule works
+	goModContent := "module github.com/franz101/sqd-go\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goModContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runInitWithConfig(configPath)
+	if code != 0 {
+		t.Fatalf("runInitWithConfig exit = %d", code)
+	}
+
+	// Check files
+	schemaPath := filepath.Join(projectDir, "custom_schema.go")
+	if _, err := os.Stat(schemaPath); err != nil {
+		t.Fatalf("custom_schema.go missing: %v", err)
+	}
+	schemaBytes, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(schemaBytes), "package uniswap_pnl") {
+		t.Errorf("custom_schema.go package mismatch: %s", string(schemaBytes))
+	}
+
+	processorPath := filepath.Join(projectDir, "custom_processor.go")
+	if _, err := os.Stat(processorPath); err != nil {
+		t.Fatalf("custom_processor.go missing: %v", err)
+	}
+	processorBytes, err := os.ReadFile(processorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(processorBytes), "package uniswap_pnl") {
+		t.Errorf("custom_processor.go package mismatch: %s", string(processorBytes))
+	}
+	expectedImport := `"github.com/franz101/sqd-go/uniswap_pnl/generated"`
+	if !strings.Contains(string(processorBytes), expectedImport) {
+		t.Errorf("custom_processor.go missing import %s: %s", expectedImport, string(processorBytes))
+	}
+
+	// Check generated files (events.go, schema.go, custom_processor.go)
+	for _, f := range []string{"events.go", "schema.go", "custom_processor.go"} {
+		path := filepath.Join(projectDir, "generated", f)
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("generated file missing: %s", path)
+		}
+	}
+}
+

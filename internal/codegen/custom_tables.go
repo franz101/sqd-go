@@ -18,6 +18,8 @@ type customTableSpec struct {
 	PrimaryKey    []string
 	OrderBy       []string
 	GoTypeName    string
+	BaseName      string
+	IsEvent       bool
 	Fields        []customFieldSpec
 	Columns       []customColumnSpec
 	PrimaryKeySet bool
@@ -139,12 +141,42 @@ func loadCustomTableSpecsFromFile(path string) ([]customTableSpec, error) {
 }
 
 func customTableFromType(gen *ast.GenDecl, typeSpec *ast.TypeSpec) (customTableSpec, error) {
-	return customTableSpec{
+	table := customTableSpec{
 		Name:          customTableName(typeSpec.Name.Name),
 		Engine:        "ReplacingMergeTree(block_number)",
 		GoTypeName:    customTableEntityName(typeSpec.Name.Name),
 		PrimaryKeySet: false,
-	}, nil
+	}
+	if pk := primaryKeyFromComments(typeSpec.Doc, gen.Doc); len(pk) > 0 {
+		table.PrimaryKey = pk
+		table.PrimaryKeySet = true
+	}
+	return table, nil
+}
+
+func primaryKeyFromComments(groups ...*ast.CommentGroup) []string {
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		for _, line := range strings.Split(group.Text(), "\n") {
+			line = strings.TrimSpace(line)
+			lower := strings.ToLower(line)
+			var raw string
+			switch {
+			case strings.HasPrefix(lower, "pk:"):
+				raw = line[len("pk:"):]
+			case strings.HasPrefix(lower, "primary_key:"):
+				raw = line[len("primary_key:"):]
+			case strings.HasPrefix(lower, "primary key:"):
+				raw = line[len("primary key:"):]
+			default:
+				continue
+			}
+			return splitCSV(raw)
+		}
+	}
+	return nil
 }
 
 func parseCustomFields(fileSet *token.FileSet, field *ast.Field) ([]customFieldSpec, error) {
@@ -184,7 +216,7 @@ func generateCustomSchemaSQL(cfg *config.Config, tables []customTableSpec) strin
 	var b strings.Builder
 	db := quoteSQLIdent(cfg.Name)
 	b.WriteString("\n")
-	b.WriteString("-- Custom tables generated from custom_types.go.\n")
+	b.WriteString("-- Custom tables generated from custom schema definitions.\n")
 	for _, table := range tables {
 		b.WriteString("\n")
 		b.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s (\n", db, quoteSQLIdent(table.Name)))
@@ -294,6 +326,23 @@ func (t customTableSpec) keyFields() []customFieldSpec {
 	return fields
 }
 
+func findStateCustomTableSpec(tables []customTableSpec, state config.StateConfig) (customTableSpec, bool) {
+	source := strings.TrimSpace(state.SourceTable)
+	name := strings.TrimSpace(state.Name)
+	for _, table := range tables {
+		if source != "" && (strings.EqualFold(source, table.Name) || strings.EqualFold(source, table.GoTypeName)) {
+			return table, true
+		}
+		if name != "" {
+			base := strings.TrimPrefix(table.GoTypeName, "Memory")
+			if strings.EqualFold(name, table.Name) || strings.EqualFold(name, table.GoTypeName) || strings.EqualFold(name, base) {
+				return table, true
+			}
+		}
+	}
+	return customTableSpec{}, false
+}
+
 func (t *customTableSpec) addRequiredBlockFields() {
 	for _, field := range []customFieldSpec{
 		{Name: "BlockNumber", Type: "uint64", ColumnName: "block_number", ColumnType: "UInt64"},
@@ -345,16 +394,8 @@ func finalCustomOrderBy(primaryKey []string) []string {
 }
 
 func inferCustomPrimaryKey(fields []customFieldSpec) []string {
-	if hasCustomField(fields, "User") && hasCustomField(fields, "TokenID") {
-		return []string{toSnake("User"), toSnake("TokenID")}
-	}
-	for _, name := range []string{"ID", "Address", "User", "MarketID", "ConditionID"} {
-		if field, ok := customFieldByName(fields, name); ok {
-			return []string{field.ColumnName}
-		}
-	}
 	for _, field := range fields {
-		if strings.HasSuffix(field.Name, "ID") && !isRequiredBlockColumn(field.ColumnName) {
+		if field.Name == "ID" && !isRequiredBlockColumn(field.ColumnName) {
 			return []string{field.ColumnName}
 		}
 	}
@@ -425,6 +466,8 @@ func clickHouseTypeFromGo(goType string) string {
 		return "UInt256"
 	case "decimal.Decimal":
 		return "Decimal(38, 18)"
+	case "protomath.Decimal256":
+		return "Decimal256(18)"
 	case "[]byte":
 		return "String"
 	}

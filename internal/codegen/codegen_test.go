@@ -11,6 +11,7 @@ import (
 func TestGenerateWritesSQLViewsAndGoCode(t *testing.T) {
 	root := t.TempDir()
 	configYAML := []byte(`name: case_1_lbtc_event_only
+store_raw_logs: true
 chains:
   - id: 1
     start_block: 0
@@ -39,7 +40,7 @@ chains:
 	}
 
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.blocks")
+	assertNotContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.blocks")
 	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.logs")
 	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.sync_state")
 	assertContains(t, schema, "last_hash String")
@@ -60,9 +61,12 @@ chains:
 	goCode := readText(t, filepath.Join(root, "generated", "events.go"))
 	assertContains(t, goCode, "package generated")
 	assertContains(t, goCode, "const LBTCTransferTopic0 = \"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"")
-	assertContains(t, goCode, "type LBTCTransfer struct")
-	assertContains(t, goCode, "From  common.Address `json:\"from\"`")
-	assertContains(t, goCode, "Value uint256.Int    `json:\"value\"`")
+	assertContains(t, goCode, "From")
+	assertContains(t, goCode, "common.Address")
+	assertContains(t, goCode, "`json:\"from\"`")
+	assertContains(t, goCode, "Value")
+	assertContains(t, goCode, "uint256.Int")
+	assertContains(t, goCode, "`json:\"value\"`")
 	assertContains(t, goCode, "func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error)")
 	assertContains(t, goCode, "var _addr0_0 = common.HexToAddress(\"0x8236a87084f8B84306f72007F36F2618A5634494\")")
 	assertContains(t, goCode, "logAddress := common.HexToAddress(address)")
@@ -86,6 +90,32 @@ chains:
 	assertContains(t, processor, "type AddressPosition struct")
 	assertContains(t, processor, "func CustomProcessing(ctx context.Context, store Store, entities *Entities) error")
 	assertContains(t, processor, "func (s *MemoryState) SyncToClickHouse")
+}
+
+func TestGenerateStoreBlocksOptionIncludesBlocksTable(t *testing.T) {
+	root := t.TempDir()
+	configYAML := []byte(`name: with_blocks
+store_blocks: true
+chains:
+  - id: 1
+    start_block: 0
+    contracts:
+      - name: LBTC
+        address: "0x8236a87084f8B84306f72007F36F2618A5634494"
+        events:
+          - event: Transfer(address indexed from, address indexed to, uint256 value)
+`)
+	if err := os.WriteFile(filepath.Join(root, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Generate(root); err != nil {
+		t.Fatal(err)
+	}
+
+	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `with_blocks`.blocks")
+	assertContains(t, schema, "ORDER BY (chain_id, block_number)")
 }
 
 func TestGenerateOmitsLogAddressWhenNoContractAddressFilter(t *testing.T) {
@@ -115,7 +145,7 @@ chains:
 
 func TestGenerateIncludesCustomTypesSQL(t *testing.T) {
 	root := t.TempDir()
-	configYAML := []byte(`name: polymarket
+	configYAML := []byte(`name: market_fixture
 chains:
   - id: 137
     start_block: 0
@@ -127,7 +157,7 @@ chains:
 	if err := os.WriteFile(filepath.Join(root, "config.yaml"), configYAML, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	customTypes := []byte(`package polymarket
+	customTypes := []byte(`package market_fixture
 
 import (
 	"time"
@@ -136,14 +166,16 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-type MemoryUserPositionSchema struct {
-	User           common.Address
-	TokenID        common.Hash
+// pk: Account, AssetID
+type MemoryHoldingSchema struct {
+	Account        common.Address
+	AssetID        common.Hash
 	Amount         decimal.Decimal
 	UpdatedAtBlock uint64
 	UpdatedAt      time.Time
 }
 
+// pk: ID
 type MemoryMarketSchema struct {
 	ID             common.Hash
 	QuestionCount  uint32
@@ -160,38 +192,39 @@ type MemoryMarketSchema struct {
 	}
 
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
-	assertContains(t, schema, "-- Custom tables generated from custom_types.go.")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `polymarket`.`memory_user_positions`")
+	assertContains(t, schema, "-- Custom tables generated from custom schema definitions.")
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `market_fixture`.`memory_holdings`")
 	assertContains(t, schema, "`amount` Decimal(38, 18)")
 	assertContains(t, schema, "`updated_at` DateTime64(3, 'UTC')")
 	assertContains(t, schema, "`block_number` UInt64")
 	assertContains(t, schema, "`transaction_index` UInt64")
 	assertContains(t, schema, "`log_index` UInt64")
-	assertContains(t, schema, "PRIMARY KEY (`user`, `token_id`)")
-	assertContains(t, schema, "ORDER BY (`user`, `token_id`, `block_number`, `transaction_index`, `log_index`);")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `polymarket`.`memory_markets`")
+	assertContains(t, schema, "PRIMARY KEY (`account`, `asset_id`)")
+	assertContains(t, schema, "ORDER BY (`account`, `asset_id`, `block_number`, `transaction_index`, `log_index`);")
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `market_fixture`.`memory_markets`")
 	assertContains(t, schema, "`question_ids` Array(FixedString(32))")
 	assertContains(t, schema, "PRIMARY KEY (`id`)")
 	assertContains(t, schema, "ORDER BY (`id`, `block_number`, `transaction_index`, `log_index`);")
 
 	hotState := readText(t, filepath.Join(root, "generated", "hotstate.go"))
-	assertContains(t, hotState, "type MemoryUserPosition struct")
+	assertContains(t, hotState, "type MemoryHolding struct")
 	assertContains(t, hotState, "TxIndex")
 	assertContains(t, hotState, "uint64")
-	assertContains(t, hotState, "type PositionsClockEntry struct")
-	assertContains(t, hotState, "type PositionsClockCache struct")
-	assertContains(t, hotState, "ring     []PositionsClockEntry")
+	assertContains(t, hotState, "type HoldingsClockEntry struct")
+	assertContains(t, hotState, "type HoldingsClockCache struct")
+	assertContains(t, hotState, "ring     []HoldingsClockEntry")
 	assertNotContains(t, hotState, "inner *clock.Cache")
-	assertContains(t, hotState, "func NewPositionsClockCache(capacity uint64) *PositionsClockCache")
+	assertContains(t, hotState, "func NewHoldingsClockCache(capacity uint64) *HoldingsClockCache")
 	assertContains(t, hotState, "type MarketsClockCache struct")
-	assertContains(t, hotState, "type MemoryUserPositionBatch struct")
-	assertContains(t, hotState, "func (b *MemoryUserPositionBatch) Insert(ctx context.Context, conn *ch.Client, db string) error")
+	assertContains(t, hotState, "type MemoryHoldingBatch struct")
+	assertContains(t, hotState, "func (b *MemoryHoldingBatch) Insert(ctx context.Context, conn *ch.Client, db string) error")
 	assertContains(t, hotState, "func NewHotState(capacity uint64) *HotState")
 }
 
 func TestGenerateDefaultForkUsesCollapsingMergeTreeAndManifest(t *testing.T) {
 	root := t.TempDir()
 	configYAML := []byte(`name: hot_lbtc
+store_raw_logs: true
 fork: default
 chains:
   - id: 1
@@ -246,6 +279,67 @@ chains:
 
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
 	assertContains(t, schema, ") ENGINE = CollapsingMergeTree(sign)")
+}
+
+func TestGenerateStateHandlesFromCustomSchemaAndConfig(t *testing.T) {
+	root := t.TempDir()
+	configYAML := []byte(`name: generic_state
+state:
+  - name: Position
+    source_table: memory_holdings
+    key:
+      - Account
+      - AssetID
+    mode: hotstate
+chains:
+  - id: 1
+    start_block: 0
+    contracts:
+      - name: Ledger
+        events:
+          - event: HoldingTouched(address indexed account, bytes32 indexed assetId, uint256 value)
+`)
+	if err := os.WriteFile(filepath.Join(root, "config.yaml"), configYAML, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	customSchema := []byte(`package generic_state
+
+import (
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/shopspring/decimal"
+)
+
+// pk: Account, AssetID
+type MemoryHoldingSchema struct {
+	Account        common.Address
+	AssetID        common.Hash
+	Amount         decimal.Decimal
+	UpdatedAtBlock uint64
+	UpdatedAt      time.Time
+}
+`)
+	if err := os.WriteFile(filepath.Join(root, "custom_schema.go"), customSchema, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Generate(root); err != nil {
+		t.Fatal(err)
+	}
+
+	stateGo := readText(t, filepath.Join(root, "generated", "state.go"))
+	assertContains(t, stateGo, "type Position = MemoryHolding")
+	assertContains(t, stateGo, "Position       PositionState")
+	assertContains(t, stateGo, "func (h PositionState) Get(account common.Address, assetID common.Hash) (*Position, bool)")
+	assertContains(t, stateGo, "func (h PositionState) Save(value *Position, meta EventMeta)")
+	assertContains(t, stateGo, "h.state.HotState.UpdateMemoryHolding(*value)")
+	assertNotContains(t, stateGo, "Internal"+"PositionState")
+	assertNotContains(t, stateGo, "User"+"PositionKey")
+
+	processorGo := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
+	assertContains(t, processorGo, "hot.HoldingsResolver.Queue(HoldingsClockKey{Account: ev.Account, AssetID: ev.AssetID})")
+	assertNotContains(t, processorGo, "set"+"EventMeta")
 }
 
 func readJSON(t *testing.T, path string, out any) {
@@ -392,15 +486,24 @@ type DummyStateSchema struct {
 
 	emptyProc := readText(t, filepath.Join(configDir, "generated", "custom_processor.go"))
 	assertContains(t, emptyProc, "Code generated by sqd-go codegen; DO NOT EDIT.")
-	assertContains(t, emptyProc, "You have access to the database store.")
-	assertContains(t, emptyProc, "You have access to the incoming event logs via entities.")
-	assertContains(t, emptyProc, "You can also use HotState to maintain an in-memory/in-database state:")
+	assertContains(t, emptyProc, "var CustomProcessFn func(state *State, block *ParsedBlock) error")
+	assertContains(t, emptyProc, "func CustomProcessing(ctx context.Context, store Store, state *State, block *ParsedBlock) error")
+	assertContains(t, emptyProc, "func NewProcessor(protoMode bool) (*Processor, error)")
+	assertContains(t, emptyProc, "const defaultRingBufferSize uint32 = 8192")
+	assertContains(t, emptyProc, "var stateStore Store")
+	assertContains(t, emptyProc, "p.State.Store = stateStore")
+	assertContains(t, emptyProc, "processGroup := func(group blockGroup) error")
+	assertNotContains(t, emptyProc, "prefetchBlockBatchSize")
+	assertNotContains(t, emptyProc, "blocks := make([]*ParsedBlock")
+	assertNotContains(t, emptyProc, "var protoBlocks []*ProtoEventBlock")
+	assertNotContains(t, emptyProc, "protoBlocks := make([]*ProtoEventBlock")
+	assertNotContains(t, emptyProc, "set"+"EventMeta")
 }
 
 func TestGenerateOmitAndMetadataOptions(t *testing.T) {
 	root := t.TempDir()
 	configYAML := []byte(`name: test_omit_meta
-omit_raw_logs: true
+store_raw_logs: false
 include_metadata:
   - chain_id
   - block_hash
@@ -446,11 +549,15 @@ chains:
 	eventsGo := readText(t, filepath.Join(root, "generated", "events.go"))
 	assertContains(t, eventsGo, "ChainID")
 	assertContains(t, eventsGo, "BlockHash")
-	assertNotContains(t, eventsGo, "ContractAddress")
-	assertNotContains(t, eventsGo, "TransactionHash")
 	assertNotContains(t, eventsGo, "OrderHash")
+	assertContains(t, eventsGo, "ContractAddress")
+	assertContains(t, eventsGo, "TransactionHash")
 	assertContains(t, eventsGo, "Maker")
 	assertContains(t, eventsGo, "Taker")
+	assertContains(t, eventsGo, "if len(topics) < 4")
+	assertContains(t, eventsGo, "ev.Maker = common.HexToAddress(topics[2])")
+	assertContains(t, eventsGo, "ev.Taker = common.HexToAddress(topics[3])")
+	assertContains(t, eventsGo, "ev.MakerAssetID.SetBytes32(word)")
 
 	// 4. Verify inserter.go has the correct ClickHouseCommonColumnNames
 	inserterGo := readText(t, filepath.Join(root, "generated", "inserter.go"))

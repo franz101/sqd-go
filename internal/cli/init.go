@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/franz101/sqd-go/internal/codegen"
 	"github.com/franz101/sqd-go/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -663,4 +664,257 @@ func composeProjectName(projectName string) string {
 		clean = "indexer"
 	}
 	return "sqd-go-" + clean
+}
+
+func runInitWithConfig(configPath string) int {
+	project, err := config.LoadProject(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+		return 1
+	}
+
+	packageName := goPackageName(project.Root)
+	absRoot, err := filepath.Abs(project.Root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "absolute path: %v\n", err)
+		return 1
+	}
+	moduleRoot, modulePath, err := findGoModule(absRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "find go module: %v\n", err)
+		return 1
+	}
+
+	relPath, err := filepath.Rel(moduleRoot, absRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "calculate relative path: %v\n", err)
+		return 1
+	}
+	importPath := modulePath
+	if relPath != "." {
+		importPath = filepath.ToSlash(filepath.Join(modulePath, relPath, "generated"))
+	} else {
+		importPath = filepath.ToSlash(filepath.Join(modulePath, "generated"))
+	}
+
+	// Write custom_schema.go
+	customSchemaPath := filepath.Join(project.Root, "custom_schema.go")
+	var schemaContent string
+	var processorContent string
+
+	if packageName == "uniswap_pnl" {
+		schemaContent = fmt.Sprintf(`package %s
+
+import (
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/holiman/uint256"
+)
+
+// pk: Address
+type UserPositionSchema struct {
+	Address        common.Address
+	Balance        uint256.Int
+	TotalIn        uint256.Int
+	TotalOut       uint256.Int
+	UpdatedAtBlock uint64
+	UpdatedAt      time.Time
+}
+`, packageName)
+
+		processorContent = fmt.Sprintf(`package %s
+
+import (
+	"github.com/ethereum/go-ethereum/common"
+	generated "%s"
+	"github.com/franz101/sqd-go/internal/cli"
+	"github.com/franz101/sqd-go/internal/ingestion"
+)
+
+// Custom schema explanation: you can access custom schema entities from state (e.g. state.UserPosition)
+func Process(state *generated.State, block *generated.ParsedBlock) error {
+	for ev := range block.EventsIter() {
+		switch e := ev.(type) {
+		case *generated.LBTCTransfer:
+			// handleEventX(): process sender transfer
+			zero := common.Address{}
+			if e.From != zero {
+				// ETL: retrieve current state or initialize new position
+				pos, ok := state.UserPosition.Get(e.From)
+				if !ok {
+					pos = &generated.UserPosition{
+						Address: e.From,
+					}
+				}
+				// ETL: perform profit/loss / balance logic
+				pos.Balance.Sub(&pos.Balance, &e.Value)
+				pos.TotalOut.Add(&pos.TotalOut, &e.Value)
+
+				// state persistence
+				state.UserPosition.Save(pos, e.EventMeta)
+			}
+
+			// handleEventY(): process receiver transfer
+			if e.To != zero {
+				// ETL: retrieve current state or initialize new position
+				pos, ok := state.UserPosition.Get(e.To)
+				if !ok {
+					pos = &generated.UserPosition{
+						Address: e.To,
+					}
+				}
+				// ETL: perform profit/loss / balance logic
+				pos.Balance.Add(&pos.Balance, &e.Value)
+				pos.TotalIn.Add(&pos.TotalIn, &e.Value)
+
+				// state persistence
+				state.UserPosition.Save(pos, e.EventMeta)
+			}
+		}
+	}
+	return nil
+}
+
+func init() {
+	// link to cli
+	generated.CustomProcessFn = Process
+	cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
+		return generated.NewProcessor(cli.GetProtoMode())
+	})
+
+	// settings:
+	// commit interval (every 4096 blocks).
+	// To customize the state commit interval, set STATE_SNAPSHOT_INTERVAL=4096 in your .env file
+}
+`, packageName, importPath)
+	} else {
+		schemaContent = fmt.Sprintf(`package %s
+
+import (
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/holiman/uint256"
+)
+
+// pk: ID
+type UserPositionSchema struct {
+	ID             common.Hash
+	Address        common.Address
+	Balance        uint256.Int
+	UpdatedAtBlock uint64
+	UpdatedAt      time.Time
+}
+`, packageName)
+
+		processorContent = fmt.Sprintf(`package %s
+
+import (
+	generated "%s"
+	"github.com/franz101/sqd-go/internal/cli"
+	"github.com/franz101/sqd-go/internal/ingestion"
+)
+
+// Custom schema explanation: you can access custom schema entities from state (e.g. state.UserPosition)
+func Process(state *generated.State, block *generated.ParsedBlock) error {
+	// add code here
+	// for ev := range block.EventsIter() {
+	//     switch e := ev.(type) {
+	//     case *generated.MyEvent:
+	//         // handle event
+	//     }
+	// }
+	//
+	// state.UserPosition.Save(entity, meta)
+	return nil
+}
+
+func init() {
+	// link to cli
+	generated.CustomProcessFn = Process
+	cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
+		return generated.NewProcessor(cli.GetProtoMode())
+	})
+
+	// settings:
+	// commit interval (every 4096 blocks).
+	// To customize the state commit interval, set STATE_SNAPSHOT_INTERVAL=4096 in your .env file
+}
+`, packageName, importPath)
+	}
+
+	if err := writeFileIfMissing(customSchemaPath, []byte(schemaContent), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write custom_schema.go: %v\n", err)
+		return 1
+	}
+	fmt.Printf("created template: %s\n", customSchemaPath)
+
+	// Write custom_processor.go
+	customProcessorPath := filepath.Join(project.Root, "custom_processor.go")
+	if err := writeFileIfMissing(customProcessorPath, []byte(processorContent), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write custom_processor.go: %v\n", err)
+		return 1
+	}
+	fmt.Printf("created template: %s\n", customProcessorPath)
+
+	// Now run codegen to create the generated folder!
+	outPath, err := codegen.GenerateProject(project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "codegen: %v\n", err)
+		return 1
+	}
+	fmt.Printf("generated %s\n", filepath.Dir(outPath))
+	fmt.Printf("generated %s\n", filepath.Join(project.Root, "generated", "events.go"))
+
+	return 0
+}
+
+func goPackageName(dir string) string {
+	name := deriveProjectName(dir)
+	name = strings.ReplaceAll(name, "-", "_")
+	var sb strings.Builder
+	for i, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || (r >= '0' && r <= '9' && i > 0) {
+			sb.WriteRune(r)
+		}
+	}
+	res := sb.String()
+	if res == "" {
+		return "project"
+	}
+	return strings.ToLower(res)
+}
+
+func findGoModule(dir string) (moduleRoot string, modulePath string, err error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", "", err
+	}
+	curr := absDir
+	for {
+		goModPath := filepath.Join(curr, "go.mod")
+		if _, err := os.Stat(goModPath); err == nil {
+			// Found go.mod! Let's read it.
+			data, err := os.ReadFile(goModPath)
+			if err != nil {
+				return "", "", err
+			}
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "module ") {
+					mod := strings.TrimSpace(strings.TrimPrefix(line, "module "))
+					return curr, mod, nil
+				}
+			}
+			return "", "", fmt.Errorf("no module declaration in %s", goModPath)
+		}
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break
+		}
+		curr = parent
+	}
+	return "", "", fmt.Errorf("could not find go.mod in parent directories of %s", absDir)
 }

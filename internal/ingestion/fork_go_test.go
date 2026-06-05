@@ -198,9 +198,9 @@ func TestReplayPreservesForkCursorState(t *testing.T) {
 	rb := NewReplayBuffer(10)
 
 	// Write some blocks to it
-	rb.Write(1, 10, "0x10", time.Now(), nil, nil)
-	rb.Write(1, 11, "0x11", time.Now(), nil, nil)
-	rb.Write(1, 12, "0x12", time.Now(), nil, nil)
+	rb.Write(1, 10, "0x10", time.Now(), nil, nil, nil, nil, false, "", 0, nil)
+	rb.Write(1, 11, "0x11", time.Now(), nil, nil, nil, nil, false, "", 0, nil)
+	rb.Write(1, 12, "0x12", time.Now(), nil, nil, nil, nil, false, "", 0, nil)
 
 	// Verify seeking and replaying
 	rb.Seek(9)

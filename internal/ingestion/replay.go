@@ -3,6 +3,7 @@ package ingestion
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/franz101/sqd-go/internal/client"
@@ -13,12 +14,18 @@ import (
 // blockEntry stores all data needed to replay a single block through the full pipeline.
 // Events and logs are cloned on write so the ring buffer owns its data.
 type blockEntry struct {
-	number    uint64
-	hash      string
-	timestamp time.Time
-	events    []parser.DecodedEvent
-	logs      []CustomLog
-	blockRow  database.BlockRow
+	number            uint64
+	hash              string
+	timestamp         time.Time
+	events            []parser.DecodedEvent
+	logs              []CustomLog
+	blockRow          database.BlockRow
+	typedEvents       map[string][]parser.DecodedEvent
+	finalized         *client.BlockRef
+	isLastInBatch     bool
+	rangeLabel        string
+	requestStartBlock uint64
+	raw               []byte
 }
 
 // ReplayBuffer is a circular buffer of recent blocks that enables fork recovery
@@ -30,10 +37,14 @@ type blockEntry struct {
 type ReplayBuffer struct {
 	slots    []blockEntry
 	capacity int
+	index    map[uint64]int
 	// writePos is the next slot to write into (monotonically increasing modulo capacity).
 	writePos int
 	// count is the number of valid entries currently in the buffer.
 	count int
+
+	mu       sync.Mutex
+	notifyCh chan struct{}
 
 	// Seek point for replay — when set, ReadFrom returns the first block > seekBlock.
 	seekBlock uint64
@@ -52,13 +63,21 @@ func NewReplayBuffer(capacity int) *ReplayBuffer {
 	return &ReplayBuffer{
 		slots:    make([]blockEntry, capacity),
 		capacity: capacity,
+		index:    make(map[uint64]int, capacity),
+		notifyCh: make(chan struct{}, 1),
 	}
 }
 
 // Write stores a block and its events in the ring buffer.
 // Events and logs are cloned so the caller retains ownership of the originals.
-func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash string, blockTimestamp time.Time, events []parser.DecodedEvent, logs []CustomLog) {
+func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash string, blockTimestamp time.Time, events []parser.DecodedEvent, logs []CustomLog, typedEvents map[string][]parser.DecodedEvent, finalized *client.BlockRef, isLastInBatch bool, rangeLabel string, requestStartBlock uint64, raw []byte) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
 	idx := rb.writePos % rb.capacity
+	if rb.count == rb.capacity {
+		delete(rb.index, rb.slots[idx].number)
+	}
 
 	// Clone events
 	clonedEvents := make([]parser.DecodedEvent, len(events))
@@ -72,28 +91,61 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 		clonedLogs[i] = cloneCustomLog(lg)
 	}
 
+	// Clone typed events
+	var clonedTyped map[string][]parser.DecodedEvent
+	if typedEvents != nil {
+		clonedTyped = make(map[string][]parser.DecodedEvent, len(typedEvents))
+		for k, v := range typedEvents {
+			evs := make([]parser.DecodedEvent, len(v))
+			for i, ev := range v {
+				evs[i] = cloneDecodedEvent(ev)
+			}
+			clonedTyped[k] = evs
+		}
+	}
+
+	var clonedRaw []byte
+	if len(raw) > 0 {
+		clonedRaw = make([]byte, len(raw))
+		copy(clonedRaw, raw)
+	}
+
 	rb.slots[idx] = blockEntry{
-		number:    blockNumber,
-		hash:      blockHash,
-		timestamp: blockTimestamp,
-		events:    clonedEvents,
-		logs:      clonedLogs,
+		number:            blockNumber,
+		hash:              blockHash,
+		timestamp:         blockTimestamp,
+		events:            clonedEvents,
+		logs:              clonedLogs,
+		typedEvents:       clonedTyped,
+		finalized:         finalized,
+		isLastInBatch:     isLastInBatch,
+		rangeLabel:        rangeLabel,
+		requestStartBlock: requestStartBlock,
 		blockRow: database.BlockRow{
 			ChainID:        chainID,
 			BlockNumber:    blockNumber,
 			BlockTimestamp: blockTimestamp,
 			BlockHash:      blockHash,
 		},
+		raw: clonedRaw,
 	}
+	rb.index[blockNumber] = idx
 
 	rb.writePos++
 	if rb.count < rb.capacity {
 		rb.count++
 	}
+
+	select {
+	case rb.notifyCh <- struct{}{}:
+	default:
+	}
 }
 
 // Seek sets the replay start point. ReadFrom will return blocks > blockNumber.
 func (rb *ReplayBuffer) Seek(blockNumber uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	rb.seekBlock = blockNumber
 	rb.seekSet = true
 	rb.readDone = false
@@ -106,10 +158,13 @@ func (rb *ReplayBuffer) Seek(blockNumber uint64) {
 // The inserter callback receives decoded events (for ClickHouse insertion).
 // The processor callback receives custom logs (for custom processor).
 func (rb *ReplayBuffer) ReadFrom(inserter func(events []parser.DecodedEvent, blockRow database.BlockRow) error, processor func(logs []CustomLog) error) (int, error) {
+	rb.mu.Lock()
 	if !rb.seekSet {
+		rb.mu.Unlock()
 		return 0, fmt.Errorf("replay buffer: seek not set")
 	}
 	if rb.readDone {
+		rb.mu.Unlock()
 		return 0, nil
 	}
 
@@ -137,14 +192,23 @@ func (rb *ReplayBuffer) ReadFrom(inserter func(events []parser.DecodedEvent, blo
 
 	if startSlot < 0 || scanned == 0 {
 		rb.readDone = true
+		rb.mu.Unlock()
 		return 0, nil
 	}
 
-	// Replay from startSlot, reading scanned entries
-	replayed := 0
+	// Copy the entries we need to replay so we can release the lock
+	// and run the callbacks concurrently/without blocking writes!
+	entries := make([]blockEntry, scanned)
 	for i := 0; i < scanned; i++ {
 		pos := (startSlot + i) % rb.capacity
-		entry := rb.slots[pos]
+		entries[i] = rb.slots[pos]
+	}
+	rb.readDone = true
+	rb.mu.Unlock()
+
+	// Replay from copied entries
+	replayed := 0
+	for _, entry := range entries {
 		if entry.number <= rb.seekBlock {
 			continue
 		}
@@ -158,22 +222,54 @@ func (rb *ReplayBuffer) ReadFrom(inserter func(events []parser.DecodedEvent, blo
 		}
 		replayed++
 	}
-	rb.readDone = true
 	return replayed, nil
+}
+
+// GetBlock returns a copy of the block entry for blockNumber if it exists in the buffer.
+// It returns ok=false if the block is not present.
+func (rb *ReplayBuffer) GetBlock(blockNumber uint64) (blockEntry, bool) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	if rb.count == 0 {
+		return blockEntry{}, false
+	}
+
+	if pos, ok := rb.index[blockNumber]; ok && pos >= 0 && pos < rb.capacity && rb.slots[pos].number == blockNumber {
+		return rb.slots[pos], true
+	}
+	return blockEntry{}, false
+}
+
+// WaitBlock blocks until the requested blockNumber is present in the buffer, or the context is cancelled.
+func (rb *ReplayBuffer) WaitBlock(ctx context.Context, blockNumber uint64) (blockEntry, error) {
+	for {
+		if entry, ok := rb.GetBlock(blockNumber); ok {
+			return entry, nil
+		}
+
+		rb.mu.Lock()
+		ch := rb.notifyCh
+		rb.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return blockEntry{}, ctx.Err()
+		case <-ch:
+			// A write occurred, retry GetBlock.
+		}
+	}
 }
 
 // HasBlocks returns true if the buffer contains blocks > the given number.
 func (rb *ReplayBuffer) HasBlocks(blockNumber uint64) bool {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
 	if rb.count == 0 {
 		return false
 	}
-	oldestPos := (rb.writePos - rb.count + rb.capacity) % rb.capacity
-	if rb.count == 1 {
-		oldestPos = (rb.writePos - 1 + rb.capacity) % rb.capacity
-	}
 	newestEntry := rb.slots[(rb.writePos-1+rb.capacity)%rb.capacity]
-	oldestEntry := rb.slots[oldestPos]
-	_ = oldestEntry
 	return newestEntry.number > blockNumber
 }
 
@@ -181,6 +277,9 @@ func (rb *ReplayBuffer) HasBlocks(blockNumber uint64) bool {
 // This keeps the buffer from growing unbounded and is safe because finalized
 // blocks will never need replay (forks cannot go beyond finalized blocks).
 func (rb *ReplayBuffer) PruneBefore(finalizedBlock uint64) int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
 	if rb.count == 0 {
 		return 0
 	}
@@ -192,6 +291,7 @@ func (rb *ReplayBuffer) PruneBefore(finalizedBlock uint64) int {
 			break
 		}
 		// Clear the slot to help GC
+		delete(rb.index, entry.number)
 		rb.slots[oldestPos] = blockEntry{}
 		oldestPos = (oldestPos + 1) % rb.capacity
 		rb.count--
@@ -200,9 +300,57 @@ func (rb *ReplayBuffer) PruneBefore(finalizedBlock uint64) int {
 	return pruned
 }
 
+// PruneAfter removes all entries with block numbers > blockNumber.
+// This is called during fork recovery to invalidate any optimistic/pre-fork blocks.
+func (rb *ReplayBuffer) PruneAfter(blockNumber uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	if rb.count == 0 {
+		return
+	}
+
+	newCount := 0
+	oldestPos := (rb.writePos - rb.count + rb.capacity) % rb.capacity
+	if rb.count == 1 {
+		oldestPos = (rb.writePos - 1 + rb.capacity) % rb.capacity
+	}
+
+	for i := 0; i < rb.count; i++ {
+		pos := (oldestPos + i) % rb.capacity
+		if rb.slots[pos].number <= blockNumber {
+			newCount++
+		} else {
+			// Clear slot to help GC
+			rb.slots[pos] = blockEntry{}
+		}
+	}
+	rb.count = newCount
+	rb.writePos = (oldestPos + newCount) % rb.capacity
+	rb.rebuildIndexLocked()
+}
+
 // Len returns the number of blocks currently in the buffer.
 func (rb *ReplayBuffer) Len() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	return rb.count
+}
+
+func (rb *ReplayBuffer) rebuildIndexLocked() {
+	clear(rb.index)
+	if rb.count == 0 {
+		return
+	}
+	oldestPos := (rb.writePos - rb.count + rb.capacity) % rb.capacity
+	if rb.count == 1 {
+		oldestPos = (rb.writePos - 1 + rb.capacity) % rb.capacity
+	}
+	for i := 0; i < rb.count; i++ {
+		pos := (oldestPos + i) % rb.capacity
+		entry := rb.slots[pos]
+		rb.index[entry.number] = pos
+	}
 }
 
 // cloneDecodedEvent deep-copies a DecodedEvent so the buffer owns the data.
