@@ -22,6 +22,7 @@ type Config struct {
 	StoreBlocks     *bool                  `yaml:"store_blocks,omitempty" json:"store_blocks,omitempty"`
 	StoreRawLogs    *bool                  `yaml:"store_raw_logs,omitempty" json:"store_raw_logs,omitempty"`
 	ProtoMode       *bool                  `yaml:"proto_mode,omitempty" json:"proto_mode,omitempty"`
+	ColdCache       *bool                  `yaml:"cold_cache,omitempty" json:"cold_cache,omitempty"`
 	IncludeMetadata []string               `yaml:"include_metadata,omitempty" json:"include_metadata,omitempty"`
 	ExcludeMetadata []map[string]string    `yaml:"exclude_metadata,omitempty" json:"exclude_metadata,omitempty"`
 	State           []StateConfig          `yaml:"state,omitempty" json:"state,omitempty"`

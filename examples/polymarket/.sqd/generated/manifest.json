@@ -6,7 +6,8 @@
   "chains": [
     {
       "id": 137,
-      "start_block": 33605403,
+      "start_block": 26000000,
+      "end_block": 40000000,
       "contracts": [
         {
           "name": "ConditionalTokens",

@@ -56,17 +56,24 @@ package generated
 
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec) {
 	imports := map[string]string{
-		`"context"`:                           "",
-		`"fmt"`:                               "",
-		`"strings"`:                           "",
-		`"sync"`:                              "",
-		`"sync/atomic"`:                       "",
-		`"github.com/ClickHouse/ch-go"`:       "",
-		`"github.com/ClickHouse/ch-go/proto"`: "",
+		`"context"`:                                            "",
+		`"fmt"`:                                                "",
+		`"strings"`:                                            "",
+		`"sync"`:                                               "",
+		`"sync/atomic"`:                                        "",
+		`"github.com/ClickHouse/ch-go"`:                        "",
+		`"github.com/ClickHouse/ch-go/proto"`:                  "",
+		`"github.com/franz101/sqd-go/internal/coldcache"`:      "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""
 		imports[`"math/big"`] = ""
+	}
+	if customTablesUseColdCache(tables) {
+		// Cold tier (Pebble) stores pointer-free hot values as raw bytes; the
+		// unsafe memcpy is zero-transformation and filepath builds the per-cache dir.
+		imports[`"path/filepath"`] = ""
+		imports[`"unsafe"`] = ""
 	}
 	for _, table := range tables {
 		for _, field := range table.Fields {
@@ -171,6 +178,9 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
 }
 
 func New%[1]s(capacity uint64) *%[1]s {
@@ -241,6 +251,16 @@ func (c *%[1]s) idxUnlink(key %[2]s) {
 
 `, spec.cacheType, spec.keyType)
 
+	coldOn := entityUsesCold(spec.table)
+	// spill: on CLOCK eviction, write the victim (value or tombstone) to the cold
+	// tier BEFORE overwriting it, so a later re-reference is served from disk and a
+	// dirty-but-evicted entry isn't lost before Commit reads it.
+	spill := ""
+	if coldOn {
+		spill = "\t\t\tif c.cold != nil {\n" +
+			"\t\t\t\tc.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))\n" +
+			"\t\t\t}\n"
+	}
 	fmt.Fprintf(b, `func (c *%[1]s) Set(value %[3]s) {
 	c.SetByKey(New%[2]s(value), value)
 }
@@ -264,7 +284,7 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.idxUnlink(e.key)
+%[4]s			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
@@ -286,7 +306,35 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 	}
 }
 
-func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
+`, spec.cacheType, spec.keyType, valueType, spill)
+
+	if coldOn {
+		// Cold-consult on hot miss: an evicted entry (spilled on eviction) is served
+		// from Pebble (~8µs) instead of a ClickHouse round-trip (~1.9ms), then
+		// promoted back into the hot ring. A cold tombstone round-trips as a value
+		// with Tombstone=true, which the state-level Get treats as "absent".
+		fmt.Fprintf(b, `func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
+	}
+	if c.cold != nil {
+		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			var v %[3]s
+			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+			c.SetByKey(key, v)
+			return v, true
+		}
+	}
+	return %[3]s{}, false
+}
+
+`, spec.cacheType, spec.keyType, valueType)
+	} else {
+		fmt.Fprintf(b, `func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
 	idx, ok := c.idxLookup(key)
 	if !ok {
 		return %[3]s{}, false
@@ -300,6 +348,7 @@ func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
 }
 
 `, spec.cacheType, spec.keyType, valueType)
+	}
 
 	if len(keyFields) > 0 {
 		b.WriteString("func (c *")
@@ -322,6 +371,14 @@ func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
 		b.WriteString("})\n}\n\n")
 	}
 
+	// coldDel mirrors a hard delete into the cold tier so a rolled-back key cannot
+	// resurrect from disk on a later miss.
+	coldDel := ""
+	if coldOn {
+		coldDel = "\t\t\tif c.cold != nil {\n" +
+			"\t\t\t\tc.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))\n" +
+			"\t\t\t}\n"
+	}
 	fmt.Fprintf(b, `func (c *%[1]s) Delete(key %[2]s) bool {
 	idx, ok := c.idxLookup(key)
 	if !ok {
@@ -331,7 +388,7 @@ func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
 			c.idxUnlink(key)
-			e.key = %[2]s{}
+%[4]s			e.key = %[2]s{}
 			e.value = %[3]s{}
 			atomic.StoreUint32(&e.referenced, 0)
 			atomic.AddUint64(&c.size, ^uint64(0))
@@ -384,7 +441,7 @@ func (c *%[1]s) Len() uint64 {
 	return atomic.LoadUint64(&c.size)
 }
 
-`, spec.cacheType, spec.keyType, valueType)
+`, spec.cacheType, spec.keyType, valueType, coldDel)
 }
 
 func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
@@ -545,6 +602,10 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		}
 	}
 	b.WriteString("\tmu sync.Mutex\n")
+	b.WriteString("\t// coldAuthoritative is set when the cold tier was opened against an empty\n")
+	b.WriteString("\t// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,\n")
+	b.WriteString("\t// so the lazy state Get skips the ClickHouse point-SELECT entirely.\n")
+	b.WriteString("\tcoldAuthoritative bool\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -575,6 +636,49 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(")\n")
 	}
 	b.WriteString("\treturn state\n}\n\n")
+
+	// EnableColdCache / CloseColdCache: attach the Pebble cold tier to every
+	// pointer-free entity. authoritative=true (from-genesis, empty ClickHouse) lets
+	// the lazy Get skip ClickHouse on a hot+cold miss. Default-off — callers that
+	// never enable it get byte-for-byte the prior behaviour.
+	var coldSpecs []hotStateSpec
+	for _, spec := range specs {
+		if entityUsesCold(spec.table) {
+			coldSpecs = append(coldSpecs, spec)
+		}
+	}
+	if len(coldSpecs) == 0 {
+		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n\treturn nil\n}\n\n")
+		b.WriteString("func (s *HotState) CloseColdCache() error {\n\treturn nil\n}\n\n")
+	} else {
+		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n")
+		b.WriteString("\tif s == nil {\n\t\treturn nil\n\t}\n")
+		b.WriteString("\tvar err error\n")
+		for _, spec := range coldSpecs {
+			b.WriteString("\tif s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold, err = coldcache.Open(filepath.Join(dir, ")
+			b.WriteString(strconv.Quote(spec.baseName))
+			b.WriteString("), cacheBytes, memTableBytes); err != nil {\n\t\treturn err\n\t}\n")
+		}
+		b.WriteString("\ts.coldAuthoritative = authoritative\n")
+		b.WriteString("\treturn nil\n}\n\n")
+
+		b.WriteString("func (s *HotState) CloseColdCache() error {\n")
+		b.WriteString("\tif s == nil {\n\t\treturn nil\n\t}\n")
+		b.WriteString("\tvar firstErr error\n")
+		for _, spec := range coldSpecs {
+			b.WriteString("\tif s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold != nil {\n\t\tif e := s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold.Close(); e != nil && firstErr == nil {\n\t\t\tfirstErr = e\n\t\t}\n\t\ts.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold = nil\n\t}\n")
+		}
+		b.WriteString("\ts.coldAuthoritative = false\n")
+		b.WriteString("\treturn firstErr\n}\n\n")
+	}
 
 	b.WriteString("func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {\n")
 	for _, spec := range specs {
@@ -1127,6 +1231,49 @@ func customTablesUseType(tables []customTableSpec, typ string) bool {
 			if field.Type == typ {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// isPointerFreeEntity reports whether the entity's in-memory value AND key are
+// free of pointers/slices/strings, so they can be stored in the Pebble cold tier
+// as raw bytes via unsafe memcpy (zero-transformation). Slice-bearing entities
+// (e.g. Array(UInt256) payouts, Array(FixedString(32)) question_ids) are excluded
+// and keep the ClickHouse-fallback lazy-load path. Note: memoryGoType maps
+// time.Time -> int64 for non-event entities, so timestamps don't disqualify them.
+func isPointerFreeEntity(table customTableSpec) bool {
+	notFlat := func(t string) bool {
+		return strings.HasPrefix(t, "[]") || strings.HasPrefix(t, "*") ||
+			strings.HasPrefix(t, "map[") || strings.Contains(t, "string") ||
+			t == "time.Time"
+	}
+	for _, field := range table.Fields {
+		if notFlat(memoryGoType(field, table.IsEvent)) {
+			return false
+		}
+	}
+	for _, field := range table.keyFields() {
+		if notFlat(field.Type) {
+			return false
+		}
+	}
+	return true
+}
+
+// entityUsesCold reports whether a (non-event, pointer-free) entity participates
+// in the Pebble cold tier. Events are append-only (no lazy Get-by-key), so they
+// never need it.
+func entityUsesCold(table customTableSpec) bool {
+	return !table.IsEvent && isPointerFreeEntity(table)
+}
+
+// customTablesUseColdCache reports whether any entity can use the cold tier;
+// drives the "unsafe" + "path/filepath" imports in the generated hot state.
+func customTablesUseColdCache(tables []customTableSpec) bool {
+	for _, table := range tables {
+		if entityUsesCold(table) {
+			return true
 		}
 	}
 	return false

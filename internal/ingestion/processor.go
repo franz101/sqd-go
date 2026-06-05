@@ -58,6 +58,18 @@ type SnapshotController interface {
 	SetSnapshotsEnabled(enabled bool)
 }
 
+// ColdCacheProcessor is optionally implemented by processors that keep a
+// Pebble-backed cold tier under their hot caches. On a hot miss an evicted entry
+// is served from local disk (~8µs) instead of a ClickHouse point-SELECT (~1.9ms);
+// when authoritative (the cold tier was opened against an empty ClickHouse, i.e.
+// a from-genesis backfill), a hot+cold miss is provably new and the ClickHouse
+// lookup is skipped entirely. The ingestion layer only enables it in finalized
+// backfill (not cursor mode, for reorg safety) and closes it on exit.
+type ColdCacheProcessor interface {
+	EnableColdCache(dir string, authoritative bool) error
+	CloseColdCache() error
+}
+
 // ProcessorFunc adapts individual callback functions to the Processor interface.
 // Any nil callbacks are treated as no-ops.
 type ProcessorFunc struct {

@@ -143,6 +143,11 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	}
 	defer conn.Close()
 
+	// A reorg-time reload rebuilds hot state from rolled-back ClickHouse. Any cold
+	// tier attached now holds entries for blocks > the rollback point, which would
+	// be stale; detach it so post-reload misses fall back to ClickHouse (correct).
+	// At startup this is a no-op (cold is enabled after this call).
+	_ = s.HotState.CloseColdCache()
 	if err := s.HotState.Recover(ctx, conn, db); err != nil {
 		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
 	}
@@ -222,6 +227,10 @@ func (s *State) RestoreToBlock(blockNumber uint64) (uint64, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Detach the cold tier before discarding the hot state: its entries reflect
+	// blocks > the restore point and must not survive a reorg. Post-restore reads
+	// fall back to ClickHouse (rolled back to the safe block) — correct.
+	_ = s.HotState.CloseColdCache()
 	s.HotState = NewHotState(DefaultClockCacheCapacity)
 `)
 	for _, spec := range specs {
@@ -400,6 +409,14 @@ func renderStateHandleGet(b *bytes.Buffer, handle stateHandleSpec) {
 		b.WriteString(lowerFirst(field.Name))
 	}
 	b.WriteString(")\n\tif !ok {\n")
+	if entityUsesCold(handle.spec.table) {
+		// Cold tier already consulted inside GetByFields. A hot+cold miss under an
+		// authoritative (from-genesis) cold tier means the key provably does not
+		// exist in ClickHouse, so skip the point-SELECT entirely — this is what
+		// removes the per-miss SELECT storm. Non-authoritative (resume / cursor) or
+		// cold-disabled keeps the ClickHouse fallback below.
+		b.WriteString("\t\tif h.state.HotState != nil && h.state.HotState.coldAuthoritative {\n\t\t\treturn nil, false\n\t\t}\n")
+	}
 	b.WriteString("\t\tif h.state.Store != nil && h.state.Store.Conn() != nil {\n")
 	b.WriteString("\t\t\tkey := ")
 	b.WriteString(handle.spec.keyType)

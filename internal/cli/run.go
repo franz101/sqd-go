@@ -17,7 +17,7 @@ import (
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-func runDev(path string, restart, noResume, protoMode, v3Mode bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
+func runDev(path string, restart, noResume, protoMode, v3Mode, coldCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
@@ -53,10 +53,10 @@ func runDev(path string, restart, noResume, protoMode, v3Mode bool, startBlockSt
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, outPath, cpuprofile, pageSizeStr)
+	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, coldCache, outPath, cpuprofile, pageSizeStr)
 }
 
-func runStartPipeline(path string, restart, noResume, protoMode, v3Mode bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
+func runStartPipeline(path string, restart, noResume, protoMode, v3Mode, coldCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -71,7 +71,7 @@ func runStartPipeline(path string, restart, noResume, protoMode, v3Mode bool, st
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, outPath, cpuprofile, pageSizeStr)
+	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, coldCache, outPath, cpuprofile, pageSizeStr)
 }
 
 func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
@@ -105,7 +105,7 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 	}
 }
 
-func runStartPipelineInternal(project *config.Project, path string, restart, noResume, protoMode, v3Mode bool, outPath, cpuprofile string, pageSizeStr string) int {
+func runStartPipelineInternal(project *config.Project, path string, restart, noResume, protoMode, v3Mode, coldCache bool, outPath, cpuprofile string, pageSizeStr string) int {
 	if protoMode {
 		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
 	}
@@ -156,6 +156,10 @@ func runStartPipelineInternal(project *config.Project, path string, restart, noR
 		GeneratedSQLDir:    filepath.Dir(outPath),
 		CursorMode:         true,
 		PageSize:           pageSize,
+		ColdCache:          coldCache || (project.Config.ColdCache != nil && *project.Config.ColdCache),
+	}
+	if opts.ColdCache {
+		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")
 	}
 	processor, err := processorForProject(project.Config.Name)
 	if err != nil {

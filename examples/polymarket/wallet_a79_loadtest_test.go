@@ -69,6 +69,7 @@ func cloneOrderFilledForWallet(tmpl ingestion.CustomLog, wallet, block uint64) i
 // loadStats captures the throughput, GC, and CPU-profile outcome of one workload run.
 type loadStats struct {
 	version     int
+	cold        bool
 	blocks      uint64
 	bytes       int64
 	elapsed     time.Duration
@@ -187,7 +188,7 @@ func (s *syntheticStream) next() ([]ingestion.CustomLog, bool) {
 // LOAD_TEST_SNAPSHOTS=1. The store is used for periodic hot-state commits and the
 // final flush; per-position lazy loads don't fire because every synthetic wallet
 // is new.
-func runProcessorWorkload(t *testing.T, ctx context.Context, store *database.Store, protoMode bool, targetBytes int64, cpuProfPath string) loadStats {
+func runProcessorWorkload(t *testing.T, ctx context.Context, store *database.Store, protoMode, coldCache bool, targetBytes int64, cpuProfPath string) loadStats {
 	t.Helper()
 	proc, err := generated.NewProcessor(protoMode)
 	if err != nil {
@@ -195,6 +196,17 @@ func runProcessorWorkload(t *testing.T, ctx context.Context, store *database.Sto
 	}
 	if os.Getenv("LOAD_TEST_SNAPSHOTS") != "1" {
 		proc.SetSnapshotsEnabled(false)
+	}
+	// Cold tier: the store is a fresh (empty) ClickHouse, so the cold cache is
+	// authoritative — a hot+cold miss is provably new and the per-position lazy
+	// SELECT is skipped entirely (the V1≈V2 bottleneck). Pebble buffers are
+	// off-heap and hard-capped, so the Go heap stays tiny.
+	if coldCache {
+		coldDir := filepath.Join(t.TempDir(), "coldcache")
+		if err := proc.State.HotState.EnableColdCache(coldDir, true, 0, 0); err != nil {
+			t.Fatalf("enable cold cache: %v", err)
+		}
+		defer func() { _ = proc.State.HotState.CloseColdCache() }()
 	}
 
 	stream := newSyntheticStream(t, targetBytes)
@@ -250,6 +262,7 @@ func runProcessorWorkload(t *testing.T, ctx context.Context, store *database.Sto
 	}
 	return loadStats{
 		version:     version,
+		cold:        coldCache,
 		blocks:      blocks,
 		bytes:       stream.emitted,
 		elapsed:     elapsed,
@@ -265,8 +278,8 @@ func runProcessorWorkload(t *testing.T, ctx context.Context, store *database.Sto
 func logLoadStats(t *testing.T, s loadStats) {
 	t.Helper()
 	mib := func(b uint64) float64 { return float64(b) / (1 << 20) }
-	t.Logf("[LOAD][V%d] processed=%d blocks (%.1f MiB) in %s => %.0f blk/s",
-		s.version, s.blocks, float64(s.bytes)/(1<<20), s.elapsed.Round(time.Millisecond), s.blkPerSec())
+	t.Logf("[LOAD][V%d] cold=%v processed=%d blocks (%.1f MiB) in %s => %.0f blk/s",
+		s.version, s.cold, s.blocks, float64(s.bytes)/(1<<20), s.elapsed.Round(time.Millisecond), s.blkPerSec())
 	t.Logf("[LOAD][V%d][GC] TotalAlloc=%.0f MiB Mallocs=%d NumGC=%d PauseTotal=%s HeapInuse=%.0f MiB",
 		s.version, mib(s.totalAlloc), s.mallocs, s.numGC, s.pauseTotal.Round(time.Microsecond), mib(s.heapInuse))
 	if s.cpuProfPath != "" {
@@ -339,7 +352,7 @@ func TestLoadProcessorThroughput(t *testing.T) {
 	if os.Getenv("LOAD_TEST_CPUPROFILE") == "1" {
 		prof = filepath.Join(t.TempDir(), "cpu_v2.prof")
 	}
-	stats := runProcessorWorkload(t, ctx, store, true, loadTargetBytes(), prof)
+	stats := runProcessorWorkload(t, ctx, store, true, true, loadTargetBytes(), prof)
 	logLoadStats(t, stats)
 	assertA79UnderLoad(t, ctx, store, "V2")
 }
@@ -365,13 +378,16 @@ func TestLoadV1VsV2(t *testing.T) {
 
 	// V1 (parsed) and V2 (proto) each get a fresh DB so their recovered A79 state
 	// is independent; the synthetic stream is regenerated identically for each.
+	// V1 is the legacy baseline (no cold tier). V2 enables the cold tier — it is
+	// part of the V2 opt-in bundle — so the comparison shows V2 beating V1 by
+	// removing the per-miss ClickHouse SELECT storm.
 	storeV1 := newPolymarketIntegrationStore(t, ctx)
-	v1 := runProcessorWorkload(t, ctx, storeV1, false, target, filepath.Join(profDir, "cpu_v1.prof"))
+	v1 := runProcessorWorkload(t, ctx, storeV1, false, false, target, filepath.Join(profDir, "cpu_v1.prof"))
 	logLoadStats(t, v1)
 	assertA79UnderLoad(t, ctx, storeV1, "V1")
 
 	storeV2 := newPolymarketIntegrationStore(t, ctx)
-	v2 := runProcessorWorkload(t, ctx, storeV2, true, target, filepath.Join(profDir, "cpu_v2.prof"))
+	v2 := runProcessorWorkload(t, ctx, storeV2, true, true, target, filepath.Join(profDir, "cpu_v2.prof"))
 	logLoadStats(t, v2)
 	assertA79UnderLoad(t, ctx, storeV2, "V2")
 

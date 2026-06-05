@@ -398,6 +398,25 @@ func (p *Processor) SetSnapshotsEnabled(enabled bool) {
 	p.State.SetSnapshotsEnabled(enabled)
 }
 
+// EnableColdCache attaches the Pebble cold tier to the hot caches (pointer-free
+// entities). authoritative=true (from-genesis, empty ClickHouse) lets a hot+cold
+// miss skip the ClickHouse point-SELECT. No-op if state is nil.
+func (p *Processor) EnableColdCache(dir string, authoritative bool) error {
+	if p == nil || p.State == nil || p.State.HotState == nil {
+		return nil
+	}
+	return p.State.HotState.EnableColdCache(dir, authoritative, 0, 0)
+}
+
+// CloseColdCache releases the cold tier (and its off-heap Pebble buffers). Called
+// by the ingestion layer on exit.
+func (p *Processor) CloseColdCache() error {
+	if p == nil || p.State == nil || p.State.HotState == nil {
+		return nil
+	}
+	return p.State.HotState.CloseColdCache()
+}
+
 func prefetchBlockState(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
 	return prefetchBlocksState(ctx, store, state, []*ParsedBlock{block})
 }

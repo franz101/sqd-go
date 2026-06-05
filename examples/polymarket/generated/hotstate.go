@@ -9,11 +9,14 @@ import (
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/drafts/protomath"
+	"github.com/franz101/sqd-go/internal/coldcache"
 	"github.com/holiman/uint256"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 const DefaultClockCacheCapacity uint64 = 100000
@@ -56,6 +59,9 @@ type ConditionsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
 }
 
 func NewConditionsClockCache(capacity uint64) *ConditionsClockCache {
@@ -524,6 +530,9 @@ type UserPositionsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
 }
 
 func NewUserPositionsClockCache(capacity uint64) *UserPositionsClockCache {
@@ -612,6 +621,9 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value Memo
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			if c.cold != nil {
+				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))
+			}
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -635,14 +647,20 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value Memo
 }
 
 func (c *UserPositionsClockCache) Get(key UserPositionsClockKey) (MemoryUserPosition, bool) {
-	idx, ok := c.idxLookup(key)
-	if !ok {
-		return MemoryUserPosition{}, false
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
 	}
-	e := &c.ring[idx]
-	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-		atomic.StoreUint32(&e.referenced, 1)
-		return e.value, true
+	if c.cold != nil {
+		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			var v MemoryUserPosition
+			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+			c.SetByKey(key, v)
+			return v, true
+		}
 	}
 	return MemoryUserPosition{}, false
 }
@@ -660,6 +678,9 @@ func (c *UserPositionsClockCache) Delete(key UserPositionsClockKey) bool {
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
 			c.idxUnlink(key)
+			if c.cold != nil {
+				c.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))
+			}
 			e.key = UserPositionsClockKey{}
 			e.value = MemoryUserPosition{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -983,6 +1004,9 @@ type MarketsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
 }
 
 func NewMarketsClockCache(capacity uint64) *MarketsClockCache {
@@ -1414,6 +1438,9 @@ type NegRiskEventsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
 }
 
 func NewNegRiskEventsClockCache(capacity uint64) *NegRiskEventsClockCache {
@@ -1845,6 +1872,9 @@ type FixedProductMarketMakersClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
 }
 
 func NewFixedProductMarketMakersClockCache(capacity uint64) *FixedProductMarketMakersClockCache {
@@ -1932,6 +1962,9 @@ func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMake
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			if c.cold != nil {
+				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))
+			}
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -1955,14 +1988,20 @@ func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMake
 }
 
 func (c *FixedProductMarketMakersClockCache) Get(key FixedProductMarketMakersClockKey) (MemoryFixedProductMarketMaker, bool) {
-	idx, ok := c.idxLookup(key)
-	if !ok {
-		return MemoryFixedProductMarketMaker{}, false
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
 	}
-	e := &c.ring[idx]
-	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-		atomic.StoreUint32(&e.referenced, 1)
-		return e.value, true
+	if c.cold != nil {
+		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			var v MemoryFixedProductMarketMaker
+			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+			c.SetByKey(key, v)
+			return v, true
+		}
 	}
 	return MemoryFixedProductMarketMaker{}, false
 }
@@ -1980,6 +2019,9 @@ func (c *FixedProductMarketMakersClockCache) Delete(key FixedProductMarketMakers
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
 			c.idxUnlink(key)
+			if c.cold != nil {
+				c.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))
+			}
 			e.key = FixedProductMarketMakersClockKey{}
 			e.value = MemoryFixedProductMarketMaker{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -2268,6 +2310,9 @@ type ConditionPreparationsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
 }
 
 func NewConditionPreparationsClockCache(capacity uint64) *ConditionPreparationsClockCache {
@@ -2585,6 +2630,10 @@ type HotState struct {
 	ConditionPreparations            *ConditionPreparationsClockCache
 	ConditionPreparationsResolver    *ConditionalTokensConditionPreparationBatchResolver
 	mu                               sync.Mutex
+	// coldAuthoritative is set when the cold tier was opened against an empty
+	// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,
+	// so the lazy state Get skips the ClickHouse point-SELECT entirely.
+	coldAuthoritative bool
 }
 
 func NewHotState(capacity uint64) *HotState {
@@ -2611,6 +2660,42 @@ func NewHotState(capacity uint64) *HotState {
 	state.FixedProductMarketMakersResolver = NewMemoryFixedProductMarketMakerBatchResolver(state.FixedProductMarketMakers)
 	state.ConditionPreparationsResolver = NewConditionalTokensConditionPreparationBatchResolver(state.ConditionPreparations)
 	return state
+}
+
+func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	if s.UserPositions.cold, err = coldcache.Open(filepath.Join(dir, "UserPositions"), cacheBytes, memTableBytes); err != nil {
+		return err
+	}
+	if s.FixedProductMarketMakers.cold, err = coldcache.Open(filepath.Join(dir, "FixedProductMarketMakers"), cacheBytes, memTableBytes); err != nil {
+		return err
+	}
+	s.coldAuthoritative = authoritative
+	return nil
+}
+
+func (s *HotState) CloseColdCache() error {
+	if s == nil {
+		return nil
+	}
+	var firstErr error
+	if s.UserPositions.cold != nil {
+		if e := s.UserPositions.cold.Close(); e != nil && firstErr == nil {
+			firstErr = e
+		}
+		s.UserPositions.cold = nil
+	}
+	if s.FixedProductMarketMakers.cold != nil {
+		if e := s.FixedProductMarketMakers.cold.Close(); e != nil && firstErr == nil {
+			firstErr = e
+		}
+		s.FixedProductMarketMakers.cold = nil
+	}
+	s.coldAuthoritative = false
+	return firstErr
 }
 
 func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {

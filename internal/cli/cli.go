@@ -19,6 +19,7 @@ type parsedArgs struct {
 	noResume     bool
 	protoMode    bool
 	v3Mode       bool
+	coldCache    bool
 	initSource   string
 	initABI      string
 	initName     string
@@ -107,6 +108,8 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.protoMode = false
 		case "--v3":
 			p.v3Mode = true
+		case "--cold-cache":
+			p.coldCache = true
 		case "-p", "--pagesize":
 			i++
 			if i >= len(args) {
@@ -182,14 +185,14 @@ func Run(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart|--no-resume] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
 		}
-		return runStartPipeline(p.project, p.restart, p.noResume, p.protoMode, p.v3Mode, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runStartPipeline(p.project, p.restart, p.noResume, p.protoMode, p.v3Mode, p.coldCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart|--no-resume]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.noResume, p.protoMode, p.v3Mode, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runDev(p.project, p.restart, p.noResume, p.protoMode, p.v3Mode, p.coldCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "stop":
 		return runStop()
@@ -208,7 +211,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, false, p.noResume, p.protoMode, p.v3Mode, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runStartPipeline(p.command, false, p.noResume, p.protoMode, p.v3Mode, p.coldCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 	}
 }
 
@@ -330,6 +333,7 @@ Flags:
   --version             (start/dev) Pipeline version: 1 (legacy parsed), 2 (proto, default), 3 (discovery prefetch)
   --v1                  (start/dev) Alias for --version 1
   --v3                  (start/dev) Alias for --version 3
+  --cold-cache          (start/dev) Pebble cold tier under hot caches: serve evicted keys from local disk instead of per-miss ClickHouse SELECTs (also set via cold_cache in config)
 
 Examples:
   sqd-go

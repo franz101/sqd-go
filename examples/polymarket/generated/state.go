@@ -64,6 +64,9 @@ func (h UserPositionState) Get(user common.Address, tokenID common.Hash) (*UserP
 	}
 	val, ok := h.state.HotState.UserPositions.GetByFields(user, tokenID)
 	if !ok {
+		if h.state.HotState != nil && h.state.HotState.coldAuthoritative {
+			return nil, false
+		}
 		if h.state.Store != nil && h.state.Store.Conn() != nil {
 			key := UserPositionsClockKey{User: user, TokenID: tokenID}
 			h.state.HotState.UserPositionsResolver.Queue(key)
@@ -190,6 +193,9 @@ func (h FixedProductMarketMakerState) Get(id common.Address) (*FixedProductMarke
 	}
 	val, ok := h.state.HotState.FixedProductMarketMakers.GetByFields(id)
 	if !ok {
+		if h.state.HotState != nil && h.state.HotState.coldAuthoritative {
+			return nil, false
+		}
 		if h.state.Store != nil && h.state.Store.Conn() != nil {
 			key := FixedProductMarketMakersClockKey{ID: id}
 			h.state.HotState.FixedProductMarketMakersResolver.Queue(key)
@@ -232,6 +238,9 @@ func (h PositionState) Get(user common.Address, tokenID common.Hash) (*Position,
 	}
 	val, ok := h.state.HotState.UserPositions.GetByFields(user, tokenID)
 	if !ok {
+		if h.state.HotState != nil && h.state.HotState.coldAuthoritative {
+			return nil, false
+		}
 		if h.state.Store != nil && h.state.Store.Conn() != nil {
 			key := UserPositionsClockKey{User: user, TokenID: tokenID}
 			h.state.HotState.UserPositionsResolver.Queue(key)
@@ -405,6 +414,11 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	}
 	defer conn.Close()
 
+	// A reorg-time reload rebuilds hot state from rolled-back ClickHouse. Any cold
+	// tier attached now holds entries for blocks > the rollback point, which would
+	// be stale; detach it so post-reload misses fall back to ClickHouse (correct).
+	// At startup this is a no-op (cold is enabled after this call).
+	_ = s.HotState.CloseColdCache()
 	if err := s.HotState.Recover(ctx, conn, db); err != nil {
 		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
 	}
@@ -485,6 +499,10 @@ func (s *State) RestoreToBlock(blockNumber uint64) (uint64, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Detach the cold tier before discarding the hot state: its entries reflect
+	// blocks > the restore point and must not survive a reorg. Post-restore reads
+	// fall back to ClickHouse (rolled back to the safe block) — correct.
+	_ = s.HotState.CloseColdCache()
 	s.HotState = NewHotState(DefaultClockCacheCapacity)
 	for _, val := range best.conditions {
 		s.HotState.Conditions.Set(val)

@@ -75,9 +75,11 @@ E2E_END_BLOCK ?= 40000000
 dev-e2e: codegen-polymarket build
 	$(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block $(E2E_START_BLOCK) --end-block $(E2E_END_BLOCK) --version 1 --restart $(POLYMARKET_ARGS)
 
-# Same range as dev-e2e but the V2 (proto) pipeline. Sanity: -$13.93 / ~$3.00.
+# Same range as dev-e2e but the V2 (proto) pipeline + Pebble cold tier (removes the
+# per-miss ClickHouse SELECT storm; finalized backfill from --restart is authoritative).
+# Sanity: -$13.93 / ~$3.00.
 dev-e2e-v2: codegen-polymarket build
-	$(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block $(E2E_START_BLOCK) --end-block $(E2E_END_BLOCK) --version 2 --restart $(POLYMARKET_ARGS)
+	$(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block $(E2E_START_BLOCK) --end-block $(E2E_END_BLOCK) --version 2 --cold-cache --restart $(POLYMARKET_ARGS)
 
 dev-v3: codegen-polymarket build
 	$(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 3664531 --v3 $(POLYMARKET_ARGS)

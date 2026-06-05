@@ -39,6 +39,12 @@ type Options struct {
 	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
 	StateLoader        func(blockNumber uint64) error // called on startup to load processor state from database
 	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
+	// ColdCache enables a Pebble-backed cold tier under the hot caches (finalized
+	// backfill only). It removes the per-miss ClickHouse point-SELECT: an evicted
+	// entry is served from local disk, and on a from-genesis run a hot+cold miss is
+	// provably new so ClickHouse is skipped entirely. Default off.
+	ColdCache    bool
+	ColdCacheDir string // base directory for cold-tier files (default os.TempDir()/sqd-coldcache)
 }
 
 const (
@@ -130,8 +136,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	}
 	log.Printf("ClickHouse connected: %s:%d/%s (fork=%s)", opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseDatabase, forkMode)
 
+	coldDir := opts.ColdCacheDir
+	if opts.ColdCache && coldDir == "" {
+		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
+	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.NoResume || opts.Restart, proc); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.NoResume || opts.Restart, proc, opts.ColdCache, coldDir); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -139,7 +149,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, noResume bool, proc Processor) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, noResume bool, proc Processor, coldCache bool, coldDir string) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -251,6 +261,31 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// disable them — the single biggest in-memory cost in backfill.
 	if sc, ok := proc.(SnapshotController); ok {
 		sc.SetSnapshotsEnabled(cursorMode)
+	}
+	// Cold tier (Pebble): an evicted hot entry is served from local disk instead of
+	// a ClickHouse point-SELECT. Authoritative iff ClickHouse holds no rows for this
+	// chain at start (fresh / --restart): a hot+cold miss is then provably new and
+	// the per-miss SELECT is skipped entirely. On resume-with-data it stays
+	// non-authoritative — still serving re-referenced evictions from disk, but never
+	// skipping a needed lookup. Reorg-safe: any state recovery (RestoreToBlock /
+	// LoadFromDatabase) detaches the cold tier, so post-reorg reads fall back to the
+	// rolled-back ClickHouse.
+	if coldCache {
+		if cc, ok := proc.(ColdCacheProcessor); ok {
+			_, hasAny, err := store.LastBlock(ctx, chain.ID)
+			if err != nil {
+				return fmt.Errorf("cold cache: probe last block: %w", err)
+			}
+			authoritative := !hasAny
+			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
+			if err := cc.EnableColdCache(dir, authoritative); err != nil {
+				return fmt.Errorf("enable cold cache: %w", err)
+			}
+			defer func() { _ = cc.CloseColdCache() }()
+			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
+		} else {
+			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
+		}
 	}
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
 	useParseDecodeV2 := os.Getenv("SQD_PARSE_DECODE_V2") != "" && fastJSONLOK
