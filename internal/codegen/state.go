@@ -398,7 +398,13 @@ func renderStateHandleSave(b *bytes.Buffer, handle stateHandleSpec) {
 		case "BlockTimestamp", "UpdatedAt":
 			b.WriteString("\tvalue.")
 			b.WriteString(field.Name)
-			b.WriteString(" = meta.BlockTimestamp\n")
+			if field.Type == "time.Time" {
+				// A2: in-memory timestamp is int64 unix-millis to keep the ring
+				// pointer-free; the DateTime64 column is restored at Append time.
+				b.WriteString(" = meta.BlockTimestamp.UnixMilli()\n")
+			} else {
+				b.WriteString(" = meta.BlockTimestamp\n")
+			}
 		case "TxIndex", "TransactionIndex":
 			b.WriteString("\tvalue.")
 			b.WriteString(field.Name)

@@ -752,6 +752,15 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 							checkpointBlock = c
 						}
 					}
+					// No-data-loss invariant (backfill): the durable checkpoint must never
+					// lead the finalized head, so a crash always resumes from a finalized
+					// block and the re-fetched gap can't be re-orged out from under us. The
+					// producer already caps backfill requests at the finalized head; this
+					// clamp makes the guarantee local and independent of that logic. The
+					// gap (even ~10k blocks) is a cheap HTTP re-fetch on resume.
+					if entry.finalized != nil && entry.finalized.Number < checkpointBlock {
+						checkpointBlock = entry.finalized.Number
+					}
 					if checkpointBlock > durableCheckpoint {
 						// Make event-table rows for blocks <= checkpointBlock durable before
 						// the checkpoint advances past them, so a crash can't drop them.

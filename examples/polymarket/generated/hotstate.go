@@ -26,7 +26,7 @@ type MemoryCondition struct {
 	Resolved         bool           `ch:"name=resolved;type=UInt8"`
 	Payouts          []uint256.Int  `ch:"name=payouts;type=Array(UInt256)"`
 	UpdatedAtBlock   uint64         `ch:"name=updated_at_block;type=UInt64"`
-	UpdatedAt        time.Time      `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
+	UpdatedAt        int64          `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
 	BlockNumber      uint64         `ch:"name=block_number;type=UInt64"`
 	TxIndex          uint64         `ch:"name=transaction_index;type=UInt64"`
 	LogIndex         uint64         `ch:"name=log_index;type=UInt64"`
@@ -49,8 +49,10 @@ type ConditionsClockEntry struct {
 }
 
 type ConditionsClockCache struct {
-	items    sync.Map
+	buckets  []int32
+	next     []int32
 	ring     []ConditionsClockEntry
+	mask     uint32
 	capacity uint64
 	hand     uint64
 	size     uint64
@@ -60,7 +62,62 @@ func NewConditionsClockCache(capacity uint64) *ConditionsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
 	}
-	return &ConditionsClockCache{ring: make([]ConditionsClockEntry, capacity), capacity: capacity}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &ConditionsClockCache{
+		ring:     make([]ConditionsClockEntry, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
+
+func (c *ConditionsClockCache) keyHash(key ConditionsClockKey) uint32 {
+	h := uint64(1469598103934665603)
+	h = clockHash64(h, key.ID[:])
+	return uint32(h^(h>>32)) & c.mask
+}
+
+func (c *ConditionsClockCache) idxLookup(key ConditionsClockKey) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *ConditionsClockCache) idxInsert(key ConditionsClockKey, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *ConditionsClockCache) idxUnlink(key ConditionsClockKey) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
 }
 
 func (c *ConditionsClockCache) Set(value MemoryCondition) {
@@ -68,8 +125,7 @@ func (c *ConditionsClockCache) Set(value MemoryCondition) {
 }
 
 func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCondition) {
-	if idxVal, ok := c.items.Load(key); ok {
-		idx := idxVal.(uint64)
+	if idx, ok := c.idxLookup(key); ok {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			e.value = value
@@ -87,11 +143,11 @@ func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCond
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.items.Delete(e.key)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
-			c.items.Store(key, idx)
+			c.idxInsert(key, uint32(idx))
 			atomic.StoreUint32(&e.inUse, 1)
 			return
 		}
@@ -100,7 +156,7 @@ func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCond
 				e.key = key
 				e.value = value
 				atomic.StoreUint32(&e.referenced, 0)
-				c.items.Store(key, idx)
+				c.idxInsert(key, uint32(idx))
 				atomic.AddUint64(&c.size, 1)
 				atomic.StoreUint32(&e.inUse, 1)
 				return
@@ -110,11 +166,10 @@ func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCond
 }
 
 func (c *ConditionsClockCache) Get(key ConditionsClockKey) (MemoryCondition, bool) {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return MemoryCondition{}, false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
@@ -128,15 +183,14 @@ func (c *ConditionsClockCache) GetByFields(id common.Hash) (MemoryCondition, boo
 }
 
 func (c *ConditionsClockCache) Delete(key ConditionsClockKey) bool {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
-			c.items.Delete(key)
+			c.idxUnlink(key)
 			e.key = ConditionsClockKey{}
 			e.value = MemoryCondition{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -152,21 +206,18 @@ func (c *ConditionsClockCache) Range(fn func(ConditionsClockKey, MemoryCondition
 	if fn == nil {
 		return
 	}
-	c.items.Range(func(keyAny, idxAny any) bool {
-		key, ok := keyAny.(ConditionsClockKey)
-		if !ok {
-			return true
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
 		}
-		idx, ok := idxAny.(uint64)
-		if !ok || idx >= c.capacity {
-			return true
-		}
-		e := &c.ring[idx]
-		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-			return fn(key, e.value)
-		}
-		return true
-	})
+	}
 }
 
 func (c *ConditionsClockCache) AppendValues(dst []MemoryCondition) []MemoryCondition {
@@ -247,7 +298,7 @@ func (b *MemoryConditionBatch) Append(item MemoryCondition) {
 	b.colResolved.Append(hotStateBool(item.Resolved))
 	b.colPayouts.Append(hotStateUInt256Slice(item.Payouts, b.scratchPayouts))
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
-	b.colUpdatedAt.Append(item.UpdatedAt)
+	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
 	b.colTxIndex.Append(item.TxIndex)
 	b.colLogIndex.Append(item.LogIndex)
@@ -305,7 +356,7 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 				Resolved:         colResolved.Row(i) != 0,
 				Payouts:          hotStateUint256Slice(colPayouts.Row(i)),
 				UpdatedAtBlock:   colUpdatedAtBlock.Row(i),
-				UpdatedAt:        colUpdatedAt.Row(i),
+				UpdatedAt:        colUpdatedAt.Row(i).UnixMilli(),
 				BlockNumber:      colBlockNumber.Row(i),
 				TxIndex:          colTxIndex.Row(i),
 				LogIndex:         colLogIndex.Row(i),
@@ -410,7 +461,7 @@ func (r *MemoryConditionBatchResolver) Resolve(ctx context.Context, conn *ch.Cli
 					Resolved:         colResolved.Row(i) != 0,
 					Payouts:          hotStateUint256Slice(colPayouts.Row(i)),
 					UpdatedAtBlock:   colUpdatedAtBlock.Row(i),
-					UpdatedAt:        colUpdatedAt.Row(i),
+					UpdatedAt:        colUpdatedAt.Row(i).UnixMilli(),
 					BlockNumber:      colBlockNumber.Row(i),
 					TxIndex:          colTxIndex.Row(i),
 					LogIndex:         colLogIndex.Row(i),
@@ -442,7 +493,7 @@ type MemoryUserPosition struct {
 	RealizedPnL    protomath.Decimal256 `ch:"name=realized_pn_l;type=Decimal256(18)"`
 	TotalBought    protomath.Decimal256 `ch:"name=total_bought;type=Decimal256(18)"`
 	UpdatedAtBlock uint64               `ch:"name=updated_at_block;type=UInt64"`
-	UpdatedAt      time.Time            `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
+	UpdatedAt      int64                `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
 	BlockNumber    uint64               `ch:"name=block_number;type=UInt64"`
 	TxIndex        uint64               `ch:"name=transaction_index;type=UInt64"`
 	LogIndex       uint64               `ch:"name=log_index;type=UInt64"`
@@ -466,8 +517,10 @@ type UserPositionsClockEntry struct {
 }
 
 type UserPositionsClockCache struct {
-	items    sync.Map
+	buckets  []int32
+	next     []int32
 	ring     []UserPositionsClockEntry
+	mask     uint32
 	capacity uint64
 	hand     uint64
 	size     uint64
@@ -477,7 +530,63 @@ func NewUserPositionsClockCache(capacity uint64) *UserPositionsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
 	}
-	return &UserPositionsClockCache{ring: make([]UserPositionsClockEntry, capacity), capacity: capacity}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &UserPositionsClockCache{
+		ring:     make([]UserPositionsClockEntry, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
+
+func (c *UserPositionsClockCache) keyHash(key UserPositionsClockKey) uint32 {
+	h := uint64(1469598103934665603)
+	h = clockHash64(h, key.User[:])
+	h = clockHash64(h, key.TokenID[:])
+	return uint32(h^(h>>32)) & c.mask
+}
+
+func (c *UserPositionsClockCache) idxLookup(key UserPositionsClockKey) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *UserPositionsClockCache) idxInsert(key UserPositionsClockKey, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *UserPositionsClockCache) idxUnlink(key UserPositionsClockKey) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
 }
 
 func (c *UserPositionsClockCache) Set(value MemoryUserPosition) {
@@ -485,8 +594,7 @@ func (c *UserPositionsClockCache) Set(value MemoryUserPosition) {
 }
 
 func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value MemoryUserPosition) {
-	if idxVal, ok := c.items.Load(key); ok {
-		idx := idxVal.(uint64)
+	if idx, ok := c.idxLookup(key); ok {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			e.value = value
@@ -504,11 +612,11 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value Memo
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.items.Delete(e.key)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
-			c.items.Store(key, idx)
+			c.idxInsert(key, uint32(idx))
 			atomic.StoreUint32(&e.inUse, 1)
 			return
 		}
@@ -517,7 +625,7 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value Memo
 				e.key = key
 				e.value = value
 				atomic.StoreUint32(&e.referenced, 0)
-				c.items.Store(key, idx)
+				c.idxInsert(key, uint32(idx))
 				atomic.AddUint64(&c.size, 1)
 				atomic.StoreUint32(&e.inUse, 1)
 				return
@@ -527,11 +635,10 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value Memo
 }
 
 func (c *UserPositionsClockCache) Get(key UserPositionsClockKey) (MemoryUserPosition, bool) {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return MemoryUserPosition{}, false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
@@ -545,15 +652,14 @@ func (c *UserPositionsClockCache) GetByFields(user common.Address, tokenID commo
 }
 
 func (c *UserPositionsClockCache) Delete(key UserPositionsClockKey) bool {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
-			c.items.Delete(key)
+			c.idxUnlink(key)
 			e.key = UserPositionsClockKey{}
 			e.value = MemoryUserPosition{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -569,21 +675,18 @@ func (c *UserPositionsClockCache) Range(fn func(UserPositionsClockKey, MemoryUse
 	if fn == nil {
 		return
 	}
-	c.items.Range(func(keyAny, idxAny any) bool {
-		key, ok := keyAny.(UserPositionsClockKey)
-		if !ok {
-			return true
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
 		}
-		idx, ok := idxAny.(uint64)
-		if !ok || idx >= c.capacity {
-			return true
-		}
-		e := &c.ring[idx]
-		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-			return fn(key, e.value)
-		}
-		return true
-	})
+	}
 }
 
 func (c *UserPositionsClockCache) AppendValues(dst []MemoryUserPosition) []MemoryUserPosition {
@@ -661,7 +764,7 @@ func (b *MemoryUserPositionBatch) Append(item MemoryUserPosition) {
 	b.colRealizedPnL.Append(item.RealizedPnL.Proto())
 	b.colTotalBought.Append(item.TotalBought.Proto())
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
-	b.colUpdatedAt.Append(item.UpdatedAt)
+	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
 	b.colTxIndex.Append(item.TxIndex)
 	b.colLogIndex.Append(item.LogIndex)
@@ -717,7 +820,7 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 				RealizedPnL:    protomath.Decimal256(colRealizedPnL.Row(i)),
 				TotalBought:    protomath.Decimal256(colTotalBought.Row(i)),
 				UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-				UpdatedAt:      colUpdatedAt.Row(i),
+				UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 				BlockNumber:    colBlockNumber.Row(i),
 				TxIndex:        colTxIndex.Row(i),
 				LogIndex:       colLogIndex.Row(i),
@@ -820,7 +923,7 @@ func (r *MemoryUserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.
 					RealizedPnL:    protomath.Decimal256(colRealizedPnL.Row(i)),
 					TotalBought:    protomath.Decimal256(colTotalBought.Row(i)),
 					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-					UpdatedAt:      colUpdatedAt.Row(i),
+					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 					BlockNumber:    colBlockNumber.Row(i),
 					TxIndex:        colTxIndex.Row(i),
 					LogIndex:       colLogIndex.Row(i),
@@ -850,7 +953,7 @@ type MemoryMarket struct {
 	QuestionCount  uint32        `ch:"name=question_count;type=UInt32"`
 	QuestionIDs    []common.Hash `ch:"name=question_ids;type=Array(FixedString(32))"`
 	UpdatedAtBlock uint64        `ch:"name=updated_at_block;type=UInt64"`
-	UpdatedAt      time.Time     `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
+	UpdatedAt      int64         `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
 	BlockNumber    uint64        `ch:"name=block_number;type=UInt64"`
 	TxIndex        uint64        `ch:"name=transaction_index;type=UInt64"`
 	LogIndex       uint64        `ch:"name=log_index;type=UInt64"`
@@ -873,8 +976,10 @@ type MarketsClockEntry struct {
 }
 
 type MarketsClockCache struct {
-	items    sync.Map
+	buckets  []int32
+	next     []int32
 	ring     []MarketsClockEntry
+	mask     uint32
 	capacity uint64
 	hand     uint64
 	size     uint64
@@ -884,7 +989,62 @@ func NewMarketsClockCache(capacity uint64) *MarketsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
 	}
-	return &MarketsClockCache{ring: make([]MarketsClockEntry, capacity), capacity: capacity}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &MarketsClockCache{
+		ring:     make([]MarketsClockEntry, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
+
+func (c *MarketsClockCache) keyHash(key MarketsClockKey) uint32 {
+	h := uint64(1469598103934665603)
+	h = clockHash64(h, key.ID[:])
+	return uint32(h^(h>>32)) & c.mask
+}
+
+func (c *MarketsClockCache) idxLookup(key MarketsClockKey) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *MarketsClockCache) idxInsert(key MarketsClockKey, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *MarketsClockCache) idxUnlink(key MarketsClockKey) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
 }
 
 func (c *MarketsClockCache) Set(value MemoryMarket) {
@@ -892,8 +1052,7 @@ func (c *MarketsClockCache) Set(value MemoryMarket) {
 }
 
 func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
-	if idxVal, ok := c.items.Load(key); ok {
-		idx := idxVal.(uint64)
+	if idx, ok := c.idxLookup(key); ok {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			e.value = value
@@ -911,11 +1070,11 @@ func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.items.Delete(e.key)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
-			c.items.Store(key, idx)
+			c.idxInsert(key, uint32(idx))
 			atomic.StoreUint32(&e.inUse, 1)
 			return
 		}
@@ -924,7 +1083,7 @@ func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
 				e.key = key
 				e.value = value
 				atomic.StoreUint32(&e.referenced, 0)
-				c.items.Store(key, idx)
+				c.idxInsert(key, uint32(idx))
 				atomic.AddUint64(&c.size, 1)
 				atomic.StoreUint32(&e.inUse, 1)
 				return
@@ -934,11 +1093,10 @@ func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
 }
 
 func (c *MarketsClockCache) Get(key MarketsClockKey) (MemoryMarket, bool) {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return MemoryMarket{}, false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
@@ -952,15 +1110,14 @@ func (c *MarketsClockCache) GetByFields(id common.Hash) (MemoryMarket, bool) {
 }
 
 func (c *MarketsClockCache) Delete(key MarketsClockKey) bool {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
-			c.items.Delete(key)
+			c.idxUnlink(key)
 			e.key = MarketsClockKey{}
 			e.value = MemoryMarket{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -976,21 +1133,18 @@ func (c *MarketsClockCache) Range(fn func(MarketsClockKey, MemoryMarket) bool) {
 	if fn == nil {
 		return
 	}
-	c.items.Range(func(keyAny, idxAny any) bool {
-		key, ok := keyAny.(MarketsClockKey)
-		if !ok {
-			return true
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
 		}
-		idx, ok := idxAny.(uint64)
-		if !ok || idx >= c.capacity {
-			return true
-		}
-		e := &c.ring[idx]
-		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-			return fn(key, e.value)
-		}
-		return true
-	})
+	}
 }
 
 func (c *MarketsClockCache) AppendValues(dst []MemoryMarket) []MemoryMarket {
@@ -1060,7 +1214,7 @@ func (b *MemoryMarketBatch) Append(item MemoryMarket) {
 	b.colQuestionCount.Append(item.QuestionCount)
 	b.colQuestionIDs.Append(hotStateHashSliceBytes(item.QuestionIDs, b.scratchQuestionIDs))
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
-	b.colUpdatedAt.Append(item.UpdatedAt)
+	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
 	b.colTxIndex.Append(item.TxIndex)
 	b.colLogIndex.Append(item.LogIndex)
@@ -1107,7 +1261,7 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 				QuestionCount:  colQuestionCount.Row(i),
 				QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
 				UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-				UpdatedAt:      colUpdatedAt.Row(i),
+				UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 				BlockNumber:    colBlockNumber.Row(i),
 				TxIndex:        colTxIndex.Row(i),
 				LogIndex:       colLogIndex.Row(i),
@@ -1201,7 +1355,7 @@ func (r *MemoryMarketBatchResolver) Resolve(ctx context.Context, conn *ch.Client
 					QuestionCount:  colQuestionCount.Row(i),
 					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
 					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-					UpdatedAt:      colUpdatedAt.Row(i),
+					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 					BlockNumber:    colBlockNumber.Row(i),
 					TxIndex:        colTxIndex.Row(i),
 					LogIndex:       colLogIndex.Row(i),
@@ -1230,7 +1384,7 @@ type MemoryNegRiskEvent struct {
 	QuestionCount  uint32        `ch:"name=question_count;type=UInt32"`
 	QuestionIDs    []common.Hash `ch:"name=question_ids;type=Array(FixedString(32))"`
 	UpdatedAtBlock uint64        `ch:"name=updated_at_block;type=UInt64"`
-	UpdatedAt      time.Time     `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
+	UpdatedAt      int64         `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
 	BlockNumber    uint64        `ch:"name=block_number;type=UInt64"`
 	TxIndex        uint64        `ch:"name=transaction_index;type=UInt64"`
 	LogIndex       uint64        `ch:"name=log_index;type=UInt64"`
@@ -1253,8 +1407,10 @@ type NegRiskEventsClockEntry struct {
 }
 
 type NegRiskEventsClockCache struct {
-	items    sync.Map
+	buckets  []int32
+	next     []int32
 	ring     []NegRiskEventsClockEntry
+	mask     uint32
 	capacity uint64
 	hand     uint64
 	size     uint64
@@ -1264,7 +1420,62 @@ func NewNegRiskEventsClockCache(capacity uint64) *NegRiskEventsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
 	}
-	return &NegRiskEventsClockCache{ring: make([]NegRiskEventsClockEntry, capacity), capacity: capacity}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &NegRiskEventsClockCache{
+		ring:     make([]NegRiskEventsClockEntry, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
+
+func (c *NegRiskEventsClockCache) keyHash(key NegRiskEventsClockKey) uint32 {
+	h := uint64(1469598103934665603)
+	h = clockHash64(h, key.ID[:])
+	return uint32(h^(h>>32)) & c.mask
+}
+
+func (c *NegRiskEventsClockCache) idxLookup(key NegRiskEventsClockKey) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *NegRiskEventsClockCache) idxInsert(key NegRiskEventsClockKey, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *NegRiskEventsClockCache) idxUnlink(key NegRiskEventsClockKey) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
 }
 
 func (c *NegRiskEventsClockCache) Set(value MemoryNegRiskEvent) {
@@ -1272,8 +1483,7 @@ func (c *NegRiskEventsClockCache) Set(value MemoryNegRiskEvent) {
 }
 
 func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value MemoryNegRiskEvent) {
-	if idxVal, ok := c.items.Load(key); ok {
-		idx := idxVal.(uint64)
+	if idx, ok := c.idxLookup(key); ok {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			e.value = value
@@ -1291,11 +1501,11 @@ func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value Memo
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.items.Delete(e.key)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
-			c.items.Store(key, idx)
+			c.idxInsert(key, uint32(idx))
 			atomic.StoreUint32(&e.inUse, 1)
 			return
 		}
@@ -1304,7 +1514,7 @@ func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value Memo
 				e.key = key
 				e.value = value
 				atomic.StoreUint32(&e.referenced, 0)
-				c.items.Store(key, idx)
+				c.idxInsert(key, uint32(idx))
 				atomic.AddUint64(&c.size, 1)
 				atomic.StoreUint32(&e.inUse, 1)
 				return
@@ -1314,11 +1524,10 @@ func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value Memo
 }
 
 func (c *NegRiskEventsClockCache) Get(key NegRiskEventsClockKey) (MemoryNegRiskEvent, bool) {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return MemoryNegRiskEvent{}, false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
@@ -1332,15 +1541,14 @@ func (c *NegRiskEventsClockCache) GetByFields(id common.Hash) (MemoryNegRiskEven
 }
 
 func (c *NegRiskEventsClockCache) Delete(key NegRiskEventsClockKey) bool {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
-			c.items.Delete(key)
+			c.idxUnlink(key)
 			e.key = NegRiskEventsClockKey{}
 			e.value = MemoryNegRiskEvent{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -1356,21 +1564,18 @@ func (c *NegRiskEventsClockCache) Range(fn func(NegRiskEventsClockKey, MemoryNeg
 	if fn == nil {
 		return
 	}
-	c.items.Range(func(keyAny, idxAny any) bool {
-		key, ok := keyAny.(NegRiskEventsClockKey)
-		if !ok {
-			return true
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
 		}
-		idx, ok := idxAny.(uint64)
-		if !ok || idx >= c.capacity {
-			return true
-		}
-		e := &c.ring[idx]
-		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-			return fn(key, e.value)
-		}
-		return true
-	})
+	}
 }
 
 func (c *NegRiskEventsClockCache) AppendValues(dst []MemoryNegRiskEvent) []MemoryNegRiskEvent {
@@ -1440,7 +1645,7 @@ func (b *MemoryNegRiskEventBatch) Append(item MemoryNegRiskEvent) {
 	b.colQuestionCount.Append(item.QuestionCount)
 	b.colQuestionIDs.Append(hotStateHashSliceBytes(item.QuestionIDs, b.scratchQuestionIDs))
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
-	b.colUpdatedAt.Append(item.UpdatedAt)
+	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
 	b.colTxIndex.Append(item.TxIndex)
 	b.colLogIndex.Append(item.LogIndex)
@@ -1487,7 +1692,7 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 				QuestionCount:  colQuestionCount.Row(i),
 				QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
 				UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-				UpdatedAt:      colUpdatedAt.Row(i),
+				UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 				BlockNumber:    colBlockNumber.Row(i),
 				TxIndex:        colTxIndex.Row(i),
 				LogIndex:       colLogIndex.Row(i),
@@ -1581,7 +1786,7 @@ func (r *MemoryNegRiskEventBatchResolver) Resolve(ctx context.Context, conn *ch.
 					QuestionCount:  colQuestionCount.Row(i),
 					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
 					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-					UpdatedAt:      colUpdatedAt.Row(i),
+					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 					BlockNumber:    colBlockNumber.Row(i),
 					TxIndex:        colTxIndex.Row(i),
 					LogIndex:       colLogIndex.Row(i),
@@ -1610,7 +1815,7 @@ type MemoryFixedProductMarketMaker struct {
 	ConditionID     common.Hash    `ch:"name=condition_id;type=FixedString(32)"`
 	CollateralToken common.Address `ch:"name=collateral_token;type=FixedString(20)"`
 	UpdatedAtBlock  uint64         `ch:"name=updated_at_block;type=UInt64"`
-	UpdatedAt       time.Time      `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
+	UpdatedAt       int64          `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
 	BlockNumber     uint64         `ch:"name=block_number;type=UInt64"`
 	TxIndex         uint64         `ch:"name=transaction_index;type=UInt64"`
 	LogIndex        uint64         `ch:"name=log_index;type=UInt64"`
@@ -1633,8 +1838,10 @@ type FixedProductMarketMakersClockEntry struct {
 }
 
 type FixedProductMarketMakersClockCache struct {
-	items    sync.Map
+	buckets  []int32
+	next     []int32
 	ring     []FixedProductMarketMakersClockEntry
+	mask     uint32
 	capacity uint64
 	hand     uint64
 	size     uint64
@@ -1644,7 +1851,62 @@ func NewFixedProductMarketMakersClockCache(capacity uint64) *FixedProductMarketM
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
 	}
-	return &FixedProductMarketMakersClockCache{ring: make([]FixedProductMarketMakersClockEntry, capacity), capacity: capacity}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &FixedProductMarketMakersClockCache{
+		ring:     make([]FixedProductMarketMakersClockEntry, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
+
+func (c *FixedProductMarketMakersClockCache) keyHash(key FixedProductMarketMakersClockKey) uint32 {
+	h := uint64(1469598103934665603)
+	h = clockHash64(h, key.ID[:])
+	return uint32(h^(h>>32)) & c.mask
+}
+
+func (c *FixedProductMarketMakersClockCache) idxLookup(key FixedProductMarketMakersClockKey) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *FixedProductMarketMakersClockCache) idxInsert(key FixedProductMarketMakersClockKey, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *FixedProductMarketMakersClockCache) idxUnlink(key FixedProductMarketMakersClockKey) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
 }
 
 func (c *FixedProductMarketMakersClockCache) Set(value MemoryFixedProductMarketMaker) {
@@ -1652,8 +1914,7 @@ func (c *FixedProductMarketMakersClockCache) Set(value MemoryFixedProductMarketM
 }
 
 func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMakersClockKey, value MemoryFixedProductMarketMaker) {
-	if idxVal, ok := c.items.Load(key); ok {
-		idx := idxVal.(uint64)
+	if idx, ok := c.idxLookup(key); ok {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			e.value = value
@@ -1671,11 +1932,11 @@ func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMake
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.items.Delete(e.key)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
-			c.items.Store(key, idx)
+			c.idxInsert(key, uint32(idx))
 			atomic.StoreUint32(&e.inUse, 1)
 			return
 		}
@@ -1684,7 +1945,7 @@ func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMake
 				e.key = key
 				e.value = value
 				atomic.StoreUint32(&e.referenced, 0)
-				c.items.Store(key, idx)
+				c.idxInsert(key, uint32(idx))
 				atomic.AddUint64(&c.size, 1)
 				atomic.StoreUint32(&e.inUse, 1)
 				return
@@ -1694,11 +1955,10 @@ func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMake
 }
 
 func (c *FixedProductMarketMakersClockCache) Get(key FixedProductMarketMakersClockKey) (MemoryFixedProductMarketMaker, bool) {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return MemoryFixedProductMarketMaker{}, false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
@@ -1712,15 +1972,14 @@ func (c *FixedProductMarketMakersClockCache) GetByFields(id common.Address) (Mem
 }
 
 func (c *FixedProductMarketMakersClockCache) Delete(key FixedProductMarketMakersClockKey) bool {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
-			c.items.Delete(key)
+			c.idxUnlink(key)
 			e.key = FixedProductMarketMakersClockKey{}
 			e.value = MemoryFixedProductMarketMaker{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -1736,21 +1995,18 @@ func (c *FixedProductMarketMakersClockCache) Range(fn func(FixedProductMarketMak
 	if fn == nil {
 		return
 	}
-	c.items.Range(func(keyAny, idxAny any) bool {
-		key, ok := keyAny.(FixedProductMarketMakersClockKey)
-		if !ok {
-			return true
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
 		}
-		idx, ok := idxAny.(uint64)
-		if !ok || idx >= c.capacity {
-			return true
-		}
-		e := &c.ring[idx]
-		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-			return fn(key, e.value)
-		}
-		return true
-	})
+	}
 }
 
 func (c *FixedProductMarketMakersClockCache) AppendValues(dst []MemoryFixedProductMarketMaker) []MemoryFixedProductMarketMaker {
@@ -1822,7 +2078,7 @@ func (b *MemoryFixedProductMarketMakerBatch) Append(item MemoryFixedProductMarke
 	b.colConditionID.Append(item.ConditionID.Bytes())
 	b.colCollateralToken.Append(item.CollateralToken.Bytes())
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
-	b.colUpdatedAt.Append(item.UpdatedAt)
+	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
 	b.colTxIndex.Append(item.TxIndex)
 	b.colLogIndex.Append(item.LogIndex)
@@ -1870,7 +2126,7 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 				ConditionID:     common.BytesToHash(colConditionID.Row(i)),
 				CollateralToken: common.BytesToAddress(colCollateralToken.Row(i)),
 				UpdatedAtBlock:  colUpdatedAtBlock.Row(i),
-				UpdatedAt:       colUpdatedAt.Row(i),
+				UpdatedAt:       colUpdatedAt.Row(i).UnixMilli(),
 				BlockNumber:     colBlockNumber.Row(i),
 				TxIndex:         colTxIndex.Row(i),
 				LogIndex:        colLogIndex.Row(i),
@@ -1965,7 +2221,7 @@ func (r *MemoryFixedProductMarketMakerBatchResolver) Resolve(ctx context.Context
 					ConditionID:     common.BytesToHash(colConditionID.Row(i)),
 					CollateralToken: common.BytesToAddress(colCollateralToken.Row(i)),
 					UpdatedAtBlock:  colUpdatedAtBlock.Row(i),
-					UpdatedAt:       colUpdatedAt.Row(i),
+					UpdatedAt:       colUpdatedAt.Row(i).UnixMilli(),
 					BlockNumber:     colBlockNumber.Row(i),
 					TxIndex:         colTxIndex.Row(i),
 					LogIndex:        colLogIndex.Row(i),
@@ -2005,8 +2261,10 @@ type ConditionPreparationsClockEntry struct {
 }
 
 type ConditionPreparationsClockCache struct {
-	items    sync.Map
+	buckets  []int32
+	next     []int32
 	ring     []ConditionPreparationsClockEntry
+	mask     uint32
 	capacity uint64
 	hand     uint64
 	size     uint64
@@ -2016,7 +2274,62 @@ func NewConditionPreparationsClockCache(capacity uint64) *ConditionPreparationsC
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
 	}
-	return &ConditionPreparationsClockCache{ring: make([]ConditionPreparationsClockEntry, capacity), capacity: capacity}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &ConditionPreparationsClockCache{
+		ring:     make([]ConditionPreparationsClockEntry, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
+
+func (c *ConditionPreparationsClockCache) keyHash(key ConditionPreparationsClockKey) uint32 {
+	h := uint64(1469598103934665603)
+	h = clockHash64(h, key.ConditionID[:])
+	return uint32(h^(h>>32)) & c.mask
+}
+
+func (c *ConditionPreparationsClockCache) idxLookup(key ConditionPreparationsClockKey) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *ConditionPreparationsClockCache) idxInsert(key ConditionPreparationsClockKey, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *ConditionPreparationsClockCache) idxUnlink(key ConditionPreparationsClockKey) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
 }
 
 func (c *ConditionPreparationsClockCache) Set(value ConditionalTokensConditionPreparation) {
@@ -2024,8 +2337,7 @@ func (c *ConditionPreparationsClockCache) Set(value ConditionalTokensConditionPr
 }
 
 func (c *ConditionPreparationsClockCache) SetByKey(key ConditionPreparationsClockKey, value ConditionalTokensConditionPreparation) {
-	if idxVal, ok := c.items.Load(key); ok {
-		idx := idxVal.(uint64)
+	if idx, ok := c.idxLookup(key); ok {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			e.value = value
@@ -2043,11 +2355,11 @@ func (c *ConditionPreparationsClockCache) SetByKey(key ConditionPreparationsCloc
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.items.Delete(e.key)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
-			c.items.Store(key, idx)
+			c.idxInsert(key, uint32(idx))
 			atomic.StoreUint32(&e.inUse, 1)
 			return
 		}
@@ -2056,7 +2368,7 @@ func (c *ConditionPreparationsClockCache) SetByKey(key ConditionPreparationsCloc
 				e.key = key
 				e.value = value
 				atomic.StoreUint32(&e.referenced, 0)
-				c.items.Store(key, idx)
+				c.idxInsert(key, uint32(idx))
 				atomic.AddUint64(&c.size, 1)
 				atomic.StoreUint32(&e.inUse, 1)
 				return
@@ -2066,11 +2378,10 @@ func (c *ConditionPreparationsClockCache) SetByKey(key ConditionPreparationsCloc
 }
 
 func (c *ConditionPreparationsClockCache) Get(key ConditionPreparationsClockKey) (ConditionalTokensConditionPreparation, bool) {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return ConditionalTokensConditionPreparation{}, false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
@@ -2084,15 +2395,14 @@ func (c *ConditionPreparationsClockCache) GetByFields(conditionID common.Hash) (
 }
 
 func (c *ConditionPreparationsClockCache) Delete(key ConditionPreparationsClockKey) bool {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
-			c.items.Delete(key)
+			c.idxUnlink(key)
 			e.key = ConditionPreparationsClockKey{}
 			e.value = ConditionalTokensConditionPreparation{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -2108,21 +2418,18 @@ func (c *ConditionPreparationsClockCache) Range(fn func(ConditionPreparationsClo
 	if fn == nil {
 		return
 	}
-	c.items.Range(func(keyAny, idxAny any) bool {
-		key, ok := keyAny.(ConditionPreparationsClockKey)
-		if !ok {
-			return true
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
 		}
-		idx, ok := idxAny.(uint64)
-		if !ok || idx >= c.capacity {
-			return true
-		}
-		e := &c.ring[idx]
-		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-			return fn(key, e.value)
-		}
-		return true
-	})
+	}
 }
 
 func (c *ConditionPreparationsClockCache) AppendValues(dst []ConditionalTokensConditionPreparation) []ConditionalTokensConditionPreparation {
@@ -2491,6 +2798,15 @@ func (s *HotState) RestoreMemoryFixedProductMarketMaker(key FixedProductMarketMa
 	}
 	s.FixedProductMarketMakers.Delete(key)
 	delete(s.dirtyFixedProductMarketMakers, key)
+}
+
+func clockHash64(seed uint64, b []byte) uint64 {
+	h := seed
+	for _, x := range b {
+		h ^= uint64(x)
+		h *= 1099511628211
+	}
+	return h
 }
 
 func hotStateBool(v bool) uint8 {

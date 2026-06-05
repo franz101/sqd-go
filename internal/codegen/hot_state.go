@@ -101,7 +101,7 @@ func renderHotStateEntity(b *bytes.Buffer, table customTableSpec) {
 		b.WriteString("\t")
 		b.WriteString(field.Name)
 		b.WriteString(" ")
-		b.WriteString(field.Type)
+		b.WriteString(memoryGoType(field, table.IsEvent))
 		b.WriteString(" `ch:")
 		b.WriteString(strconv.Quote("name=" + field.ColumnName + ";type=" + field.ColumnType))
 		b.WriteString("`\n")
@@ -156,49 +156,150 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(valueType)
 	b.WriteString("\n\treferenced uint32\n\tinUse uint32\n}\n\n")
 
-	b.WriteString("type ")
-	b.WriteString(spec.cacheType)
-	b.WriteString(" struct {\n\titems sync.Map\n\tring []")
-	b.WriteString(spec.entryType)
-	b.WriteString("\n\tcapacity uint64\n\thand uint64\n\tsize uint64\n}\n\n")
+	// Cache struct. The index is a pointer-free chained hash over an arena (A3):
+	// buckets[h] = ring index of a chain head (-1 = empty); next[ringIdx] = next
+	// ring index in the same bucket (-1 = end). Replaces a sync.Map[key]idx whose
+	// boxed key+idx interfaces were ~3 GC-scanned objects per live entry. Single
+	// writer (one processor goroutine) => the index needs no locking; the CLOCK
+	// entry flags stay atomic so concurrent readers (if ever reintroduced) still see
+	// torn-free flag transitions.
+	fmt.Fprintf(b, `type %[1]s struct {
+	buckets  []int32
+	next     []int32
+	ring     []%[2]s
+	mask     uint32
+	capacity uint64
+	hand     uint64
+	size     uint64
+}
 
-	b.WriteString("func New")
-	b.WriteString(spec.cacheType)
-	b.WriteString("(capacity uint64) *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(" {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n\treturn &")
-	b.WriteString(spec.cacheType)
-	b.WriteString("{ring: make([]")
-	b.WriteString(spec.entryType)
-	b.WriteString(", capacity), capacity: capacity}\n}\n\n")
+func New%[1]s(capacity uint64) *%[1]s {
+	if capacity == 0 {
+		capacity = DefaultClockCacheCapacity
+	}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &%[1]s{
+		ring:     make([]%[2]s, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Set(value ")
-	b.WriteString(valueType)
-	b.WriteString(") {\n\tc.SetByKey(New")
-	b.WriteString(spec.keyType)
-	b.WriteString("(value), value)\n}\n\n")
+`, spec.cacheType, spec.entryType)
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") SetByKey(key ")
-	b.WriteString(spec.keyType)
-	b.WriteString(", value ")
-	b.WriteString(valueType)
-	b.WriteString(") {\n\tif idxVal, ok := c.items.Load(key); ok {\n\t\tidx := idxVal.(uint64)\n\t\te := &c.ring[idx]\n\t\tif atomic.LoadUint32(&e.inUse) == 1 && e.key == key {\n\t\t\te.value = value\n\t\t\tatomic.StoreUint32(&e.referenced, 1)\n\t\t\treturn\n\t\t}\n\t}\n\tfor {\n\t\thand := atomic.AddUint64(&c.hand, 1)\n\t\tidx := (hand - 1) % c.capacity\n\t\te := &c.ring[idx]\n\t\tif atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {\n\t\t\tif atomic.LoadUint32(&e.referenced) == 1 {\n\t\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\t\tatomic.StoreUint32(&e.inUse, 1)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tc.items.Delete(e.key)\n\t\t\te.key = key\n\t\t\te.value = value\n\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\tc.items.Store(key, idx)\n\t\t\tatomic.StoreUint32(&e.inUse, 1)\n\t\t\treturn\n\t\t}\n\t\tif atomic.LoadUint32(&e.inUse) == 0 {\n\t\t\tif atomic.CompareAndSwapUint32(&e.inUse, 0, 2) {\n\t\t\t\te.key = key\n\t\t\t\te.value = value\n\t\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\t\tc.items.Store(key, idx)\n\t\t\t\tatomic.AddUint64(&c.size, 1)\n\t\t\t\tatomic.StoreUint32(&e.inUse, 1)\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n}\n\n")
+	// keyHash folds every key field's bytes (all keys are common.Hash/Address byte
+	// arrays) into a bucket index.
+	fmt.Fprintf(b, "func (c *%s) keyHash(key %s) uint32 {\n\th := uint64(1469598103934665603)\n", spec.cacheType, spec.keyType)
+	for _, field := range keyFields {
+		fmt.Fprintf(b, "\th = clockHash64(h, key.%s[:])\n", field.Name)
+	}
+	b.WriteString("\treturn uint32(h^(h>>32)) & c.mask\n}\n\n")
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Get(key ")
-	b.WriteString(spec.keyType)
-	b.WriteString(") (")
-	b.WriteString(valueType)
-	b.WriteString(", bool) {\n\tidxVal, ok := c.items.Load(key)\n\tif !ok {\n\t\treturn ")
-	b.WriteString(valueType)
-	b.WriteString("{}, false\n\t}\n\tidx := idxVal.(uint64)\n\te := &c.ring[idx]\n\tif atomic.LoadUint32(&e.inUse) == 1 && e.key == key {\n\t\tatomic.StoreUint32(&e.referenced, 1)\n\t\treturn e.value, true\n\t}\n\treturn ")
-	b.WriteString(valueType)
-	b.WriteString("{}, false\n}\n\n")
+	fmt.Fprintf(b, `func (c *%[1]s) idxLookup(key %[2]s) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *%[1]s) idxInsert(key %[2]s, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *%[1]s) idxUnlink(key %[2]s) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
+}
+
+`, spec.cacheType, spec.keyType)
+
+	fmt.Fprintf(b, `func (c *%[1]s) Set(value %[3]s) {
+	c.SetByKey(New%[2]s(value), value)
+}
+
+func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			e.value = value
+			atomic.StoreUint32(&e.referenced, 1)
+			return
+		}
+	}
+	for {
+		hand := atomic.AddUint64(&c.hand, 1)
+		idx := (hand - 1) %% c.capacity
+		e := &c.ring[idx]
+		if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
+			if atomic.LoadUint32(&e.referenced) == 1 {
+				atomic.StoreUint32(&e.referenced, 0)
+				atomic.StoreUint32(&e.inUse, 1)
+				continue
+			}
+			c.idxUnlink(e.key)
+			e.key = key
+			e.value = value
+			atomic.StoreUint32(&e.referenced, 0)
+			c.idxInsert(key, uint32(idx))
+			atomic.StoreUint32(&e.inUse, 1)
+			return
+		}
+		if atomic.LoadUint32(&e.inUse) == 0 {
+			if atomic.CompareAndSwapUint32(&e.inUse, 0, 2) {
+				e.key = key
+				e.value = value
+				atomic.StoreUint32(&e.referenced, 0)
+				c.idxInsert(key, uint32(idx))
+				atomic.AddUint64(&c.size, 1)
+				atomic.StoreUint32(&e.inUse, 1)
+				return
+			}
+		}
+	}
+}
+
+func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
+	idx, ok := c.idxLookup(key)
+	if !ok {
+		return %[3]s{}, false
+	}
+	e := &c.ring[idx]
+	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+		atomic.StoreUint32(&e.referenced, 1)
+		return e.value, true
+	}
+	return %[3]s{}, false
+}
+
+`, spec.cacheType, spec.keyType, valueType)
 
 	if len(keyFields) > 0 {
 		b.WriteString("func (c *")
@@ -221,37 +322,69 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString("})\n}\n\n")
 	}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Delete(key ")
-	b.WriteString(spec.keyType)
-	b.WriteString(") bool {\n\tidxVal, ok := c.items.Load(key)\n\tif !ok {\n\t\treturn false\n\t}\n\tidx := idxVal.(uint64)\n\te := &c.ring[idx]\n\tif atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {\n\t\tif e.key == key {\n\t\t\tc.items.Delete(key)\n\t\t\te.key = ")
-	b.WriteString(spec.keyType)
-	b.WriteString("{}\n\t\t\te.value = ")
-	b.WriteString(valueType)
-	b.WriteString("{}\n\t\t\tatomic.StoreUint32(&e.referenced, 0)\n\t\t\tatomic.AddUint64(&c.size, ^uint64(0))\n\t\t\treturn true\n\t\t}\n\t\tatomic.StoreUint32(&e.inUse, 1)\n\t}\n\treturn false\n}\n\n")
+	fmt.Fprintf(b, `func (c *%[1]s) Delete(key %[2]s) bool {
+	idx, ok := c.idxLookup(key)
+	if !ok {
+		return false
+	}
+	e := &c.ring[idx]
+	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
+		if e.key == key {
+			c.idxUnlink(key)
+			e.key = %[2]s{}
+			e.value = %[3]s{}
+			atomic.StoreUint32(&e.referenced, 0)
+			atomic.AddUint64(&c.size, ^uint64(0))
+			return true
+		}
+		atomic.StoreUint32(&e.inUse, 1)
+	}
+	return false
+}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Range(fn func(")
-	b.WriteString(spec.keyType)
-	b.WriteString(", ")
-	b.WriteString(valueType)
-	b.WriteString(") bool) {\n\tif fn == nil {\n\t\treturn\n\t}\n\tc.items.Range(func(keyAny, idxAny any) bool {\n\t\tkey, ok := keyAny.(")
-	b.WriteString(spec.keyType)
-	b.WriteString(")\n\t\tif !ok {\n\t\t\treturn true\n\t\t}\n\t\tidx, ok := idxAny.(uint64)\n\t\tif !ok || idx >= c.capacity {\n\t\t\treturn true\n\t\t}\n\t\te := &c.ring[idx]\n\t\tif atomic.LoadUint32(&e.inUse) == 1 && e.key == key {\n\t\t\treturn fn(key, e.value)\n\t\t}\n\t\treturn true\n\t})\n}\n\n")
+func (c *%[1]s) Range(fn func(%[2]s, %[3]s) bool) {
+	if fn == nil {
+		return
+	}
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
+		}
+	}
+}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") AppendValues(dst []")
-	b.WriteString(valueType)
-	b.WriteString(") []")
-	b.WriteString(valueType)
-	b.WriteString(" {\n\tif c == nil {\n\t\treturn dst\n\t}\n\tif atomic.LoadUint64(&c.size) == 0 {\n\t\treturn dst\n\t}\n\tlimit := atomic.LoadUint64(&c.hand)\n\tif limit > c.capacity {\n\t\tlimit = c.capacity\n\t}\n\tfor i := 0; i < int(limit); i++ {\n\t\te := &c.ring[i]\n\t\tif atomic.LoadUint32(&e.inUse) == 1 {\n\t\t\tdst = append(dst, e.value)\n\t\t}\n\t}\n\treturn dst\n}\n\n")
+func (c *%[1]s) AppendValues(dst []%[3]s) []%[3]s {
+	if c == nil {
+		return dst
+	}
+	if atomic.LoadUint64(&c.size) == 0 {
+		return dst
+	}
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := 0; i < int(limit); i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			dst = append(dst, e.value)
+		}
+	}
+	return dst
+}
 
-	b.WriteString("func (c *")
-	b.WriteString(spec.cacheType)
-	b.WriteString(") Len() uint64 {\n\treturn atomic.LoadUint64(&c.size)\n}\n\n")
+func (c *%[1]s) Len() uint64 {
+	return atomic.LoadUint64(&c.size)
+}
+
+`, spec.cacheType, spec.keyType, valueType)
 }
 
 func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
@@ -320,7 +453,7 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(spec.table.GoTypeName)
 	b.WriteString(") {\n")
 	for _, field := range spec.table.Fields {
-		for _, line := range batchAppendLines(field) {
+		for _, line := range batchAppendLines(field, spec.table.IsEvent) {
 			b.WriteString("\t")
 			b.WriteString(line)
 			b.WriteString("\n")
@@ -381,7 +514,7 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString("\t\t\t\t")
 		b.WriteString(field.Name)
 		b.WriteString(": ")
-		b.WriteString(resultValueExpr(field))
+		b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 		b.WriteString(",\n")
 	}
 	b.WriteString("\t\t\t}\n\t\t\tc.Set(item)\n\t\t}\n\t\treturn nil\n\t}})\n}\n\n")
@@ -555,6 +688,20 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 }
 
 func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec) {
+	// Shared FNV-1a byte fold used by every clock cache's flat index (A3). The
+	// index is a pointer-free open-chained hash over an arena (buckets []int32 head
+	// + next []int32 chain), so the GC scans two flat integer slices instead of the
+	// millions of boxed interface objects a sync.Map[key]idx allocated.
+	b.WriteString(`
+func clockHash64(seed uint64, b []byte) uint64 {
+	h := seed
+	for _, x := range b {
+		h ^= uint64(x)
+		h *= 1099511628211
+	}
+	return h
+}
+`)
 	if customTablesUseBool(tables) {
 		b.WriteString("\nfunc hotStateBool(v bool) uint8 {\n\tif v {\n\t\treturn 1\n\t}\n\treturn 0\n}\n")
 		b.WriteString("\nfunc hotStateBoolSQL(v bool) string {\n\tif v {\n\t\treturn \"1\"\n\t}\n\treturn \"0\"\n}\n")
@@ -732,6 +879,29 @@ func batchScratchType(field customFieldSpec) string {
 	}
 }
 
+// memoryGoType returns the in-memory Go type for a hot-state value-struct field,
+// which may differ from the schema/source type to keep the rings pointer-free
+// (A2). Timestamps are stored as int64 unix-millis in memory — the ClickHouse
+// column stays DateTime64(3, 'UTC') — so MemoryUserPosition et al. carry no
+// *time.Location pointer and the GC skips the whole ring backing array on every
+// mark, instead of scanning all N entries. Conversions happen at Append/Recover
+// (see batchAppendLines / resultValueExpr) and at assignment (state.go Save).
+func memoryGoType(field customFieldSpec, isEvent bool) string {
+	// Event value-structs embed EventMeta (shared with the ingestion/handler layer,
+	// where BlockTimestamp is a time.Time), so they keep time.Time. Only the derived
+	// entity rings (UserPositions et al.) — the ones that grow to capacity — are
+	// converted to int64 to make their backing arrays pointer-free.
+	if isEvent {
+		return field.Type
+	}
+	switch field.Type {
+	case "time.Time":
+		return "int64"
+	default:
+		return field.Type
+	}
+}
+
 func batchColumnType(field customFieldSpec) string {
 	switch field.Type {
 	case "bool", "uint8":
@@ -844,9 +1014,15 @@ func batchColumnRowsExpr(field customFieldSpec) string {
 	return col + ".Rows()"
 }
 
-func batchAppendLines(field customFieldSpec) []string {
+func batchAppendLines(field customFieldSpec, isEvent bool) []string {
 	col := "b." + batchColumnField(field)
 	value := "item." + field.Name
+	if !isEvent && field.Type == "time.Time" {
+		// In-memory value is int64 unix-millis (A2); the DateTime64(3) column's raw
+		// units are also milliseconds, so append the raw value directly — no
+		// time.Time is constructed on the hot insert path.
+		return []string{col + ".AppendRaw(proto.DateTime64(" + value + "))"}
+	}
 	switch field.Type {
 	case "common.Address", "common.Hash":
 		return []string{col + ".Append(" + value + ".Bytes())"}
@@ -869,8 +1045,14 @@ func batchAppendLines(field customFieldSpec) []string {
 	}
 }
 
-func resultValueExpr(field customFieldSpec) string {
+func resultValueExpr(field customFieldSpec, isEvent bool) string {
 	col := batchColumnField(field)
+	if !isEvent && field.Type == "time.Time" {
+		// Recover path (cold): read the DateTime64 instant back as int64 unix-millis
+		// to match the in-memory representation (A2). UnixMilli is timezone-
+		// independent, so it round-trips the millisecond raw value exactly.
+		return col + ".Row(i).UnixMilli()"
+	}
 	switch field.Type {
 	case "common.Address":
 		return "common.BytesToAddress(" + col + ".Row(i))"
@@ -1093,7 +1275,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 				b.WriteString("\t\t\t\t\t\t")
 				b.WriteString(field.Name)
 				b.WriteString(": ")
-				b.WriteString(resultValueExpr(field))
+				b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 				b.WriteString(",\n")
 			}
 		}
@@ -1103,7 +1285,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 				b.WriteString("\t\t\t\t\t")
 				b.WriteString(field.Name)
 				b.WriteString(": ")
-				b.WriteString(resultValueExpr(field))
+				b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 				b.WriteString(",\n")
 			}
 		}
@@ -1112,7 +1294,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 			b.WriteString("\t\t\t\t\t")
 			b.WriteString(field.Name)
 			b.WriteString(": ")
-			b.WriteString(resultValueExpr(field))
+			b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 			b.WriteString(",\n")
 		}
 	}

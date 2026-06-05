@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	generated "github.com/franz101/sqd-go/examples/polymarket/generated"
+	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/ingestion"
 	"github.com/shopspring/decimal"
 )
@@ -24,7 +27,6 @@ const exchangeOrderFilledTopic0 = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd
 // position — growing the UserPositions cache to stress GC / memory layout.
 func makerTopicForWallet(i uint64) string {
 	var addr [20]byte
-	// Deterministic, collision-free per i; offset away from the real wallet.
 	binPut := func(b []byte, v uint64) {
 		for k := 0; k < 8; k++ {
 			b[len(b)-1-k] = byte(v >> (8 * k))
@@ -64,73 +66,148 @@ func cloneOrderFilledForWallet(tmpl ingestion.CustomLog, wallet, block uint64) i
 	return c
 }
 
-// TestLoadProcessorThroughput drives the V2 proto processor through a large,
-// locally-generated workload (duplicated synthetic wallets + the real A79 events
-// sprinkled across blocks, in order) to measure throughput + GC under a ~2 GB
-// processed volume WITHOUT being bottlenecked by portal HTTP, and confirms no
-// data loss: the real wallet still computes realized -$13.93 / open $3.00.
-//
-// Gated behind LOAD_TEST=1 (heavy). Size via LOAD_TEST_BYTES (default 256 MiB;
-// set 2147483648 for ~2 GB). Duplicate wallets per A79 block via LOAD_TEST_FANOUT.
-func TestLoadProcessorThroughput(t *testing.T) {
-	if os.Getenv("LOAD_TEST") != "1" {
-		t.Skip("set LOAD_TEST=1 to run the load test")
-	}
-	ctx := context.Background()
-	store := newPolymarketIntegrationStore(t, ctx)
+// loadStats captures the throughput, GC, and CPU-profile outcome of one workload run.
+type loadStats struct {
+	version     int
+	blocks      uint64
+	bytes       int64
+	elapsed     time.Duration
+	totalAlloc  uint64
+	mallocs     uint64
+	numGC       uint32
+	pauseTotal  time.Duration
+	heapInuse   uint64
+	cpuProfPath string
+}
 
-	targetBytes := int64(256 << 20)
-	if v := os.Getenv("LOAD_TEST_BYTES"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			targetBytes = n
-		}
+func (s loadStats) blkPerSec() float64 {
+	if s.elapsed <= 0 {
+		return 0
 	}
-	fanout := uint64(2000)
-	if v := os.Getenv("LOAD_TEST_FANOUT"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n > 0 {
-			fanout = n
-		}
-	}
+	return float64(s.blocks) / s.elapsed.Seconds()
+}
 
+// syntheticStream is a deterministic, memory-bounded generator of CustomLog
+// batches: synthetic duplicate-wallet OrderFilled logs (each a distinct
+// (user, token_id) position to grow the UserPositions ring) with the real A79
+// wallet's events sprinkled through in their original order. It yields one batch
+// at a time so a 2 GB (or 20 GB) workload never has to be fully resident — both
+// V1 and V2 replay the *same* stream by re-seeding from the same A79 fixture.
+type syntheticStream struct {
+	tmpl       ingestion.CustomLog
+	a79Blocks  [][]ingestion.CustomLog
+	targetByte int64
+	batchSize  int // blocks per Process() call
+	sprinkle   int // emit one real A79 block every `sprinkle` synthetic blocks
+
+	block   uint64
+	wallet  uint64
+	emitted int64
+	a79Idx  int
+	done    bool
+}
+
+func approxLogBytes(lg ingestion.CustomLog) int64 {
+	n := len(lg.BlockHash) + len(lg.ContractAddress) + len(lg.TransactionHash) + len(lg.Data)
+	for _, tp := range lg.Topics {
+		n += len(tp)
+	}
+	return int64(n) + 64
+}
+
+func newSyntheticStream(t *testing.T, targetBytes int64) *syntheticStream {
+	t.Helper()
 	a79Logs := loadWalletCustomLogs(t, "../../tests/wallet_0xa79af3b_all.jsonl")
 	tmpl := findTemplateOrderFilled(t, a79Logs)
 
-	// Group the real A79 logs by their original block so we can replay them
-	// block-by-block, in order, sprinkled through the synthetic stream.
-	type a79Block struct {
-		logs []ingestion.CustomLog
-	}
-	var a79Blocks []a79Block
-	{
-		var cur *a79Block
-		var curNum uint64
-		for _, lg := range a79Logs {
-			if cur == nil || lg.BlockNumber != curNum {
-				a79Blocks = append(a79Blocks, a79Block{})
-				cur = &a79Blocks[len(a79Blocks)-1]
-				curNum = lg.BlockNumber
-			}
-			cur.logs = append(cur.logs, lg)
+	// Group the real A79 logs by their original block, preserving order.
+	var blocks [][]ingestion.CustomLog
+	var curNum uint64
+	for _, lg := range a79Logs {
+		if len(blocks) == 0 || lg.BlockNumber != curNum {
+			blocks = append(blocks, nil)
+			curNum = lg.BlockNumber
 		}
+		blocks[len(blocks)-1] = append(blocks[len(blocks)-1], lg)
 	}
 
-	proc, err := generated.NewProcessor(true) // V2 proto
+	return &syntheticStream{
+		tmpl:       tmpl,
+		a79Blocks:  blocks,
+		targetByte: targetBytes,
+		batchSize:  256,
+		sprinkle:   64,
+		block:      1,
+	}
+}
+
+// next returns the next batch of CustomLogs, or (nil, false) when the byte budget
+// is met AND every real A79 block has been drained (so no A79 history is lost).
+func (s *syntheticStream) next() ([]ingestion.CustomLog, bool) {
+	if s.done {
+		return nil, false
+	}
+	if s.emitted >= s.targetByte && s.a79Idx >= len(s.a79Blocks) {
+		s.done = true
+		return nil, false
+	}
+	var batch []ingestion.CustomLog
+	for bb := 0; bb < s.batchSize; bb++ {
+		if s.a79Idx < len(s.a79Blocks) && (s.emitted >= s.targetByte || int(s.block)%s.sprinkle == 0) {
+			for _, lg := range s.a79Blocks[s.a79Idx] {
+				nl := lg
+				nl.BlockNumber = s.block
+				nl.BlockHash = fmt.Sprintf("0x%064x", s.block)
+				batch = append(batch, nl)
+				s.emitted += approxLogBytes(nl)
+			}
+			s.a79Idx++
+		} else if s.emitted < s.targetByte {
+			dl := cloneOrderFilledForWallet(s.tmpl, s.wallet, s.block)
+			s.wallet++
+			batch = append(batch, dl)
+			s.emitted += approxLogBytes(dl)
+		}
+		s.block++
+		if s.emitted >= s.targetByte && s.a79Idx >= len(s.a79Blocks) {
+			break
+		}
+	}
+	if len(batch) == 0 {
+		s.done = true
+		return nil, false
+	}
+	return batch, true
+}
+
+// runProcessorWorkload drives the synthetic stream through one processor version
+// (protoMode=false => V1 parsed path, true => V2 proto path) and measures
+// throughput + GC. If cpuProfPath != "", a CPU profile of the whole run is written
+// there. Snapshots are disabled (finalized-backfill behaviour) unless
+// LOAD_TEST_SNAPSHOTS=1. The store is used for periodic hot-state commits and the
+// final flush; per-position lazy loads don't fire because every synthetic wallet
+// is new.
+func runProcessorWorkload(t *testing.T, ctx context.Context, store *database.Store, protoMode bool, targetBytes int64, cpuProfPath string) loadStats {
+	t.Helper()
+	proc, err := generated.NewProcessor(protoMode)
 	if err != nil {
 		t.Fatalf("new processor: %v", err)
 	}
-	// Backfill behaviour: disable fork-recovery snapshots (the ingestion layer does
-	// this in non-cursor mode). Set LOAD_TEST_SNAPSHOTS=1 to measure with them on.
 	if os.Getenv("LOAD_TEST_SNAPSHOTS") != "1" {
 		proc.SetSnapshotsEnabled(false)
 	}
 
-	// approxLogBytes: rough wire size per CustomLog for the byte budget.
-	approxLogBytes := func(lg ingestion.CustomLog) int64 {
-		n := len(lg.BlockHash) + len(lg.ContractAddress) + len(lg.TransactionHash) + len(lg.Data)
-		for _, tp := range lg.Topics {
-			n += len(tp)
+	stream := newSyntheticStream(t, targetBytes)
+
+	var cpuFile *os.File
+	if cpuProfPath != "" {
+		cpuFile, err = os.Create(cpuProfPath)
+		if err != nil {
+			t.Fatalf("create cpu profile: %v", err)
 		}
-		return int64(n) + 64
+		if err := pprof.StartCPUProfile(cpuFile); err != nil {
+			t.Fatalf("start cpu profile: %v", err)
+		}
 	}
 
 	var memBefore runtime.MemStats
@@ -138,84 +215,70 @@ func TestLoadProcessorThroughput(t *testing.T) {
 	runtime.ReadMemStats(&memBefore)
 	start := time.Now()
 
-	var (
-		block        uint64 = 1
-		wallet       uint64
-		bytesEmitted int64
-		blocksProc   uint64
-		a79Idx       int
-		// emit one real A79 block every `sprinkle` synthetic blocks, preserving order.
-		sprinkle = 64
-	)
-
-	// Process in contiguous block batches; each batch is one Process call.
-	const batchBlocks = 256
-	for bytesEmitted < targetBytes {
-		var batch []ingestion.CustomLog
-		for bb := 0; bb < batchBlocks; bb++ {
-			// Sprinkle the next real A79 block (in order) periodically.
-			if a79Idx < len(a79Blocks) && int(block)%sprinkle == 0 {
-				for _, lg := range a79Blocks[a79Idx].logs {
-					nl := lg
-					nl.BlockNumber = block
-					nl.BlockHash = fmt.Sprintf("0x%064x", block)
-					batch = append(batch, nl)
-					bytesEmitted += approxLogBytes(nl)
-				}
-				a79Idx++
-			} else {
-				// One synthetic duplicate-wallet OrderFilled.
-				dl := cloneOrderFilledForWallet(tmpl, wallet, block)
-				wallet++
-				batch = append(batch, dl)
-				bytesEmitted += approxLogBytes(dl)
+	var blocks uint64
+	for {
+		batch, ok := stream.next()
+		if !ok {
+			break
+		}
+		if err := proc.Process(ctx, store, batch); err != nil {
+			if cpuProfPath != "" {
+				pprof.StopCPUProfile()
+				cpuFile.Close()
 			}
-			block++
+			t.Fatalf("processor.Process (v=%v): %v", protoMode, err)
 		}
-		if err := proc.Process(ctx, store, batch); err != nil {
-			t.Fatalf("processor.Process at block %d: %v", block, err)
-		}
-		blocksProc += batchBlocks
-		_ = fanout
+		// batch spans <= batchSize block numbers; count distinct blocks processed.
+		blocks += uint64(stream.batchSize)
 	}
-
-	// Drain any remaining real A79 blocks so the wallet's full history is applied
-	// in order (no data loss even if the byte budget cut the stream short).
-	for ; a79Idx < len(a79Blocks); a79Idx++ {
-		var batch []ingestion.CustomLog
-		for _, lg := range a79Blocks[a79Idx].logs {
-			nl := lg
-			nl.BlockNumber = block
-			nl.BlockHash = fmt.Sprintf("0x%064x", block)
-			batch = append(batch, nl)
-		}
-		if err := proc.Process(ctx, store, batch); err != nil {
-			t.Fatalf("processor.Process (A79 drain) at block %d: %v", block, err)
-		}
-		block++
-		blocksProc++
-	}
-
 	if err := proc.State.Commit(ctx, store); err != nil {
 		t.Fatalf("final commit: %v", err)
 	}
 
 	elapsed := time.Since(start)
+	if cpuProfPath != "" {
+		pprof.StopCPUProfile()
+		cpuFile.Close()
+	}
+
 	var memAfter runtime.MemStats
 	runtime.ReadMemStats(&memAfter)
 
-	mib := func(b uint64) float64 { return float64(b) / (1 << 20) }
-	t.Logf("[LOAD] processed=%d blocks (%.1f MiB) in %s => %.0f blk/s",
-		blocksProc, float64(bytesEmitted)/(1<<20), elapsed.Round(time.Millisecond),
-		float64(blocksProc)/elapsed.Seconds())
-	t.Logf("[LOAD][GC] TotalAlloc=%.0f MiB Mallocs=%d NumGC=%d PauseTotal=%s HeapInuse=%.0f MiB",
-		mib(memAfter.TotalAlloc-memBefore.TotalAlloc),
-		memAfter.Mallocs-memBefore.Mallocs,
-		memAfter.NumGC-memBefore.NumGC,
-		time.Duration(memAfter.PauseTotalNs-memBefore.PauseTotalNs).Round(time.Microsecond),
-		mib(memAfter.HeapInuse))
+	version := 1
+	if protoMode {
+		version = 2
+	}
+	return loadStats{
+		version:     version,
+		blocks:      blocks,
+		bytes:       stream.emitted,
+		elapsed:     elapsed,
+		totalAlloc:  memAfter.TotalAlloc - memBefore.TotalAlloc,
+		mallocs:     memAfter.Mallocs - memBefore.Mallocs,
+		numGC:       memAfter.NumGC - memBefore.NumGC,
+		pauseTotal:  time.Duration(memAfter.PauseTotalNs - memBefore.PauseTotalNs),
+		heapInuse:   memAfter.HeapInuse,
+		cpuProfPath: cpuProfPath,
+	}
+}
 
-	// No-data-loss check: recover A79 positions from ClickHouse, assert PnL.
+func logLoadStats(t *testing.T, s loadStats) {
+	t.Helper()
+	mib := func(b uint64) float64 { return float64(b) / (1 << 20) }
+	t.Logf("[LOAD][V%d] processed=%d blocks (%.1f MiB) in %s => %.0f blk/s",
+		s.version, s.blocks, float64(s.bytes)/(1<<20), s.elapsed.Round(time.Millisecond), s.blkPerSec())
+	t.Logf("[LOAD][V%d][GC] TotalAlloc=%.0f MiB Mallocs=%d NumGC=%d PauseTotal=%s HeapInuse=%.0f MiB",
+		s.version, mib(s.totalAlloc), s.mallocs, s.numGC, s.pauseTotal.Round(time.Microsecond), mib(s.heapInuse))
+	if s.cpuProfPath != "" {
+		t.Logf("[LOAD][V%d][CPU] profile written to %s (analyze: go tool pprof -top %s)", s.version, s.cpuProfPath, s.cpuProfPath)
+	}
+}
+
+// assertA79UnderLoad recovers the real wallet's positions from ClickHouse and
+// asserts the known-answer PnL, proving the duplicated bulk didn't perturb or
+// drop A79's events (no data loss under load).
+func assertA79UnderLoad(t *testing.T, ctx context.Context, store *database.Store, tag string) {
+	t.Helper()
 	fresh := generated.NewState()
 	if err := fresh.HotState.UserPositions.Recover(ctx, store.Conn(), store.DB()); err != nil {
 		t.Fatalf("recover positions: %v", err)
@@ -238,14 +301,81 @@ func TestLoadProcessorThroughput(t *testing.T) {
 	})
 	pnl := realized.Div(million)
 	openVal := openValueHalf.Div(million)
-	t.Logf("[LOAD][A79] positions=%d realized=$%s open=$%s", n, pnl.StringFixed(4), openVal.StringFixed(4))
+	t.Logf("[LOAD][%s][A79] positions=%d realized=$%s open=$%s", tag, n, pnl.StringFixed(4), openVal.StringFixed(4))
 	if n == 0 {
-		t.Fatal("no A79 positions persisted under load")
+		t.Fatalf("[%s] no A79 positions persisted under load", tag)
 	}
 	if pnl.Sub(decimal.NewFromFloat(-13.93)).Abs().GreaterThan(decimal.NewFromFloat(0.01)) {
-		t.Errorf("under load realized PnL = %s, want -13.93 (data loss?)", pnl.StringFixed(4))
+		t.Errorf("[%s] under load realized PnL = %s, want -13.93 (data loss?)", tag, pnl.StringFixed(4))
 	}
 	if openVal.Sub(decimal.NewFromFloat(3.00)).Abs().GreaterThan(decimal.NewFromFloat(0.01)) {
-		t.Errorf("under load open value = %s, want 3.00 (data loss?)", openVal.StringFixed(4))
+		t.Errorf("[%s] under load open value = %s, want 3.00 (data loss?)", tag, openVal.StringFixed(4))
 	}
+}
+
+// loadTargetBytes resolves the byte budget (default 256 MiB; set 2147483648 for ~2 GB).
+func loadTargetBytes() int64 {
+	targetBytes := int64(256 << 20)
+	if v := os.Getenv("LOAD_TEST_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			targetBytes = n
+		}
+	}
+	return targetBytes
+}
+
+// TestLoadProcessorThroughput drives the V2 proto processor through the synthetic
+// workload (~256 MiB default, set LOAD_TEST_BYTES=2147483648 for ~2 GB) to measure
+// throughput + GC without portal HTTP, and confirms no data loss (A79 = -13.93/3.00).
+// Gated behind LOAD_TEST=1. Set LOAD_TEST_CPUPROFILE=1 to also write a CPU profile.
+func TestLoadProcessorThroughput(t *testing.T) {
+	if os.Getenv("LOAD_TEST") != "1" {
+		t.Skip("set LOAD_TEST=1 to run the load test")
+	}
+	ctx := context.Background()
+	store := newPolymarketIntegrationStore(t, ctx)
+
+	prof := ""
+	if os.Getenv("LOAD_TEST_CPUPROFILE") == "1" {
+		prof = filepath.Join(t.TempDir(), "cpu_v2.prof")
+	}
+	stats := runProcessorWorkload(t, ctx, store, true, loadTargetBytes(), prof)
+	logLoadStats(t, stats)
+	assertA79UnderLoad(t, ctx, store, "V2")
+}
+
+// TestLoadV1VsV2 runs the identical synthetic workload through both the V1 parsed
+// path and the V2 proto path, on separate ClickHouse databases, writing a CPU
+// profile for each so the per-version bottlenecks (string/hex conversion, hot-state
+// commit, GC) can be compared directly. Both must reproduce A79 = -13.93/3.00.
+//
+// Gated behind LOAD_TEST=1. Profiles land in LOAD_TEST_PROFDIR (default a temp dir
+// echoed in the log) as cpu_v1.prof / cpu_v2.prof.
+func TestLoadV1VsV2(t *testing.T) {
+	if os.Getenv("LOAD_TEST") != "1" {
+		t.Skip("set LOAD_TEST=1 to run the V1-vs-V2 load comparison")
+	}
+	ctx := context.Background()
+	target := loadTargetBytes()
+
+	profDir := os.Getenv("LOAD_TEST_PROFDIR")
+	if profDir == "" {
+		profDir = t.TempDir()
+	}
+
+	// V1 (parsed) and V2 (proto) each get a fresh DB so their recovered A79 state
+	// is independent; the synthetic stream is regenerated identically for each.
+	storeV1 := newPolymarketIntegrationStore(t, ctx)
+	v1 := runProcessorWorkload(t, ctx, storeV1, false, target, filepath.Join(profDir, "cpu_v1.prof"))
+	logLoadStats(t, v1)
+	assertA79UnderLoad(t, ctx, storeV1, "V1")
+
+	storeV2 := newPolymarketIntegrationStore(t, ctx)
+	v2 := runProcessorWorkload(t, ctx, storeV2, true, target, filepath.Join(profDir, "cpu_v2.prof"))
+	logLoadStats(t, v2)
+	assertA79UnderLoad(t, ctx, storeV2, "V2")
+
+	t.Logf("[LOAD][CMP] V1=%.0f blk/s  V2=%.0f blk/s  (V2/V1=%.2fx)  | V1 alloc=%.0fMiB V2 alloc=%.0fMiB | profiles in %s",
+		v1.blkPerSec(), v2.blkPerSec(), v2.blkPerSec()/v1.blkPerSec(),
+		float64(v1.totalAlloc)/(1<<20), float64(v2.totalAlloc)/(1<<20), profDir)
 }

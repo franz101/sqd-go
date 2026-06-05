@@ -44,7 +44,7 @@ func (h ConditionState) Save(value *Condition, meta EventMeta) {
 		return
 	}
 	value.UpdatedAtBlock = meta.BlockNumber
-	value.UpdatedAt = meta.BlockTimestamp
+	value.UpdatedAt = meta.BlockTimestamp.UnixMilli()
 	value.BlockNumber = meta.BlockNumber
 	value.TxIndex = meta.TransactionIndex
 	value.LogIndex = meta.LogIndex
@@ -86,7 +86,7 @@ func (h UserPositionState) Save(value *UserPosition, meta EventMeta) {
 		return
 	}
 	value.UpdatedAtBlock = meta.BlockNumber
-	value.UpdatedAt = meta.BlockTimestamp
+	value.UpdatedAt = meta.BlockTimestamp.UnixMilli()
 	value.BlockNumber = meta.BlockNumber
 	value.TxIndex = meta.TransactionIndex
 	value.LogIndex = meta.LogIndex
@@ -128,7 +128,7 @@ func (h MarketState) Save(value *Market, meta EventMeta) {
 		return
 	}
 	value.UpdatedAtBlock = meta.BlockNumber
-	value.UpdatedAt = meta.BlockTimestamp
+	value.UpdatedAt = meta.BlockTimestamp.UnixMilli()
 	value.BlockNumber = meta.BlockNumber
 	value.TxIndex = meta.TransactionIndex
 	value.LogIndex = meta.LogIndex
@@ -170,7 +170,7 @@ func (h NegRiskEventState) Save(value *NegRiskEvent, meta EventMeta) {
 		return
 	}
 	value.UpdatedAtBlock = meta.BlockNumber
-	value.UpdatedAt = meta.BlockTimestamp
+	value.UpdatedAt = meta.BlockTimestamp.UnixMilli()
 	value.BlockNumber = meta.BlockNumber
 	value.TxIndex = meta.TransactionIndex
 	value.LogIndex = meta.LogIndex
@@ -212,7 +212,7 @@ func (h FixedProductMarketMakerState) Save(value *FixedProductMarketMaker, meta 
 		return
 	}
 	value.UpdatedAtBlock = meta.BlockNumber
-	value.UpdatedAt = meta.BlockTimestamp
+	value.UpdatedAt = meta.BlockTimestamp.UnixMilli()
 	value.BlockNumber = meta.BlockNumber
 	value.TxIndex = meta.TransactionIndex
 	value.LogIndex = meta.LogIndex
@@ -254,7 +254,7 @@ func (h PositionState) Save(value *Position, meta EventMeta) {
 		return
 	}
 	value.UpdatedAtBlock = meta.BlockNumber
-	value.UpdatedAt = meta.BlockTimestamp
+	value.UpdatedAt = meta.BlockTimestamp.UnixMilli()
 	value.BlockNumber = meta.BlockNumber
 	value.TxIndex = meta.TransactionIndex
 	value.LogIndex = meta.LogIndex
