@@ -349,14 +349,7 @@ func (p *Processor) LoadFromDatabase(blockNumber uint64) error {
 		p.State = NewState()
 	}
 
-	httpPort := 8123
-	if portStr := os.Getenv("CLICKHOUSE_HTTP_PORT"); portStr != "" {
-		if pVal, err := strconv.Atoi(portStr); err == nil {
-			httpPort = pVal
-		}
-	}
-
-	if err := p.State.LoadFromClickHouse(context.Background(), httpPort, blockNumber); err != nil {
+	if err := p.State.LoadFromClickHouse(context.Background(), blockNumber); err != nil {
 		return fmt.Errorf("failed to load state from ClickHouse: %w", err)
 	}
 

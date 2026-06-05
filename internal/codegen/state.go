@@ -87,20 +87,71 @@ package generated
 	return s.HotState.Commit(ctx, store.Conn(), store.DB())
 }
 
-func (s *State) LoadFromClickHouse(ctx context.Context, httpPort int, blockNumber uint64) error {
-	if LoadStateFromClickHouseFn != nil {
-		return LoadStateFromClickHouseFn(s, ctx, httpPort, blockNumber)
-	}
+// LoadFromClickHouse rebuilds the in-memory hot state from the durable memory_*
+// tables at startup/recovery. It dials a native ClickHouse client from the
+// environment (the hot-state caches are not yet attached to a Store at this
+// point) and delegates the per-entity reload to the generated HotState.Recover,
+// which reads each entity's latest row back via the same columnar decoders the
+// commit path writes — guaranteeing a faithful round-trip.
+func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) error {
 	if s == nil {
 		return nil
 	}
+	// Test mode: don't touch a live database, just advance the cursor so a fresh
+	// process starts at the checkpoint.
+	if os.Getenv("TEST_MODE") == "1" || os.Getenv("CI") == "1" {
+		s.LastSyncBlock = blockNumber
+		s.LastPruneBlock = blockNumber
+		s.SaveSnapshot(blockNumber)
+		return nil
+	}
+	if s.HotState == nil {
+		s.LastSyncBlock = blockNumber
+		s.LastPruneBlock = blockNumber
+		s.SaveSnapshot(blockNumber)
+		return nil
+	}
+
+	host := os.Getenv("CLICKHOUSE_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := 9000
+	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			port = p
+		}
+	}
+	user := os.Getenv("CLICKHOUSE_USER")
+	if user == "" {
+		user = "default"
+	}
+	password := os.Getenv("CLICKHOUSE_PASSWORD")
+	db := os.Getenv("CLICKHOUSE_DATABASE")
+	if db == "" {
+		db = ProjectName
+	}
+
+	conn, err := ch.Dial(ctx, ch.Options{
+		Address:  fmt.Sprintf("%s:%d", host, port),
+		Database: "default",
+		User:     user,
+		Password: password,
+	})
+	if err != nil {
+		return fmt.Errorf("load state: dial clickhouse %s:%d: %w", host, port, err)
+	}
+	defer conn.Close()
+
+	if err := s.HotState.Recover(ctx, conn, db); err != nil {
+		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
+	}
+
 	s.LastSyncBlock = blockNumber
 	s.LastPruneBlock = blockNumber
 	s.SaveSnapshot(blockNumber)
 	return nil
 }
-
-var LoadStateFromClickHouseFn func(state *State, ctx context.Context, httpPort int, blockNumber uint64) error
 
 func (s *State) SaveSnapshot(blockNumber uint64) {
 	if s == nil || s.HotState == nil || len(s.snapshots) == 0 || !s.snapshotsEnabled {
@@ -271,9 +322,12 @@ func findHotStateSpec(specs []hotStateSpec, table customTableSpec) (hotStateSpec
 
 func renderStateImports(b *bytes.Buffer, handles []stateHandleSpec) {
 	imports := map[string]struct{}{
-		`"context"`: {},
-		`"fmt"`:     {},
-		`"sync"`:    {},
+		`"context"`:                     {},
+		`"fmt"`:                         {},
+		`"os"`:                          {},
+		`"strconv"`:                     {},
+		`"sync"`:                        {},
+		`"github.com/ClickHouse/ch-go"`: {},
 	}
 	for _, handle := range handles {
 		for _, field := range handle.spec.table.keyFields() {
