@@ -118,6 +118,11 @@ func TestLoadProcessorThroughput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new processor: %v", err)
 	}
+	// Backfill behaviour: disable fork-recovery snapshots (the ingestion layer does
+	// this in non-cursor mode). Set LOAD_TEST_SNAPSHOTS=1 to measure with them on.
+	if os.Getenv("LOAD_TEST_SNAPSHOTS") != "1" {
+		proc.SetSnapshotsEnabled(false)
+	}
 
 	// approxLogBytes: rough wire size per CustomLog for the byte budget.
 	approxLogBytes := func(lg ingestion.CustomLog) int64 {

@@ -1,0 +1,698 @@
+package tests
+
+import (
+	"encoding/hex"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	generated "github.com/franz101/sqd-go/examples/polymarket/generated"
+	"github.com/franz101/sqd-go/internal/parser/abiunpack"
+	"github.com/holiman/uint256"
+)
+
+// =============================================================================
+// Proto Parsing Edge Case Tests
+// Tests for data hex decoding, ABI word layout, topic handling, and
+// address-matching edge cases in the generated parser code.
+// =============================================================================
+
+// --- ABI Word Layout Tests ---
+
+func TestABIPositionSplitWordLayout(t *testing.T) {
+	// ConditionalTokensPositionSplit non-indexed:
+	//   address collateralToken (word 0), uint256[] partition (word 1 = offset), uint256 amount (word 2)
+	collateral := common.HexToAddress("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE")
+	partition := []uint256.Int{*uint256.NewInt(1), *uint256.NewInt(2)}
+	amount := uint256.NewInt(100)
+
+	data := buildABIData(t,
+		padAddress(collateral),               // word 0: address
+		uint256ToBytes32Word(uint256.NewInt(96)), // word 1: offset to dynamic array (3 words × 32)
+		uint256ToBytes32Word(amount),          // word 2: amount
+		uint256ToBytes32Word(uint256.NewInt(2)), // word 3 (at offset): array length
+		uint256ToBytes32Word(&partition[0]),    // word 4: element 0
+		uint256ToBytes32Word(&partition[1]),    // word 5: element 1
+	)
+
+	word, ok := abiunpack.Word(data, 0)
+	if !ok {
+		t.Fatal("Word(0) failed")
+	}
+	gotCollateral := common.BytesToAddress(word[12:32])
+	if gotCollateral != collateral {
+		t.Errorf("collateralToken: got %s, want %s", gotCollateral.Hex(), collateral.Hex())
+	}
+
+	word, ok = abiunpack.Word(data, 2)
+	if !ok {
+		t.Fatal("Word(2) failed")
+	}
+	var gotAmount uint256.Int
+	gotAmount.SetBytes32(word)
+	if !gotAmount.Eq(amount) {
+		t.Errorf("amount: got %s, want %s", gotAmount.String(), amount.String())
+	}
+
+	gotPartition, ok := abiunpack.Uint256Array(data, 1)
+	if !ok {
+		t.Fatal("Uint256Array(data, 1) failed")
+	}
+	if len(gotPartition) != 2 {
+		t.Fatalf("partition length: got %d, want 2", len(gotPartition))
+	}
+	if !gotPartition[0].Eq(&partition[0]) || !gotPartition[1].Eq(&partition[1]) {
+		t.Errorf("partition: got %v, want %v", gotPartition, partition)
+	}
+}
+
+func TestABIPayoutRedemptionCTFWordLayout(t *testing.T) {
+	// ConditionalTokensPayoutRedemption non-indexed:
+	//   bytes32 conditionId (word 0), uint256[] indexSets (word 1 = offset), uint256 payout (word 2)
+	conditionID := common.HexToHash("0xabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+	indexSets := []uint256.Int{*uint256.NewInt(0), *uint256.NewInt(1)}
+	payout := uint256.NewInt(5000000)
+
+	data := buildABIData(t,
+		conditionID.Bytes(),                 // word 0
+		uint256ToBytes32Word(uint256.NewInt(96)), // word 1: offset
+		uint256ToBytes32Word(payout),         // word 2
+		uint256ToBytes32Word(uint256.NewInt(2)), // word 3 (at offset): length
+		uint256ToBytes32Word(&indexSets[0]),   // word 4
+		uint256ToBytes32Word(&indexSets[1]),   // word 5
+	)
+
+	word, ok := abiunpack.Word(data, 0)
+	if !ok {
+		t.Fatal("Word(0) failed")
+	}
+	gotCondID := common.BytesToHash(word)
+	if gotCondID != conditionID {
+		t.Errorf("conditionId: got %s, want %s", gotCondID.Hex(), conditionID.Hex())
+	}
+
+	word, ok = abiunpack.Word(data, 2)
+	if !ok {
+		t.Fatal("Word(2) failed")
+	}
+	var gotPayout uint256.Int
+	gotPayout.SetBytes32(word)
+	if !gotPayout.Eq(payout) {
+		t.Errorf("payout: got %s, want %s", gotPayout.String(), payout.String())
+	}
+
+	gotIndexSets, ok := abiunpack.Uint256Array(data, 1)
+	if !ok {
+		t.Fatal("Uint256Array(data, 1) failed")
+	}
+	if len(gotIndexSets) != 2 {
+		t.Fatalf("indexSets length: got %d, want 2", len(gotIndexSets))
+	}
+}
+
+func TestABIConditionResolutionWordLayout(t *testing.T) {
+	denom := uint256.NewInt(1000000)
+	numers := []uint256.Int{*uint256.NewInt(750000), *uint256.NewInt(250000)}
+
+	data := buildABIData(t,
+		uint256ToBytes32Word(denom),          // word 0
+		uint256ToBytes32Word(uint256.NewInt(64)), // word 1: offset (skip len, elements at word 3)
+		uint256ToBytes32Word(uint256.NewInt(2)),  // word 2 (at offset): array length
+		uint256ToBytes32Word(&numers[0]),      // word 3
+		uint256ToBytes32Word(&numers[1]),      // word 4
+	)
+
+	word, ok := abiunpack.Word(data, 0)
+	if !ok {
+		t.Fatal("Word(0) failed")
+	}
+	var gotDenom uint256.Int
+	gotDenom.SetBytes32(word)
+	if !gotDenom.Eq(denom) {
+		t.Errorf("payoutDenominator: got %s, want %s", gotDenom.String(), denom.String())
+	}
+
+	gotNumers, ok := abiunpack.Uint256Array(data, 1)
+	if !ok {
+		t.Fatal("Uint256Array(data, 1) failed")
+	}
+	if len(gotNumers) != 2 {
+		t.Fatalf("payoutNumerators length: got %d, want 2", len(gotNumers))
+	}
+}
+
+func TestABINegRiskPayoutRedemptionWordLayout(t *testing.T) {
+	amounts := []uint256.Int{*uint256.NewInt(100), *uint256.NewInt(200)}
+	payout := uint256.NewInt(300)
+
+	data := buildABIData(t,
+		uint256ToBytes32Word(uint256.NewInt(64)), // word 0: offset to word 2
+		uint256ToBytes32Word(payout),             // word 1: payout
+		uint256ToBytes32Word(uint256.NewInt(2)),  // word 2 (at offset): array length
+		uint256ToBytes32Word(&amounts[0]),         // word 3
+		uint256ToBytes32Word(&amounts[1]),         // word 4
+	)
+
+	gotAmounts, ok := abiunpack.Uint256Array(data, 0)
+	if !ok {
+		t.Fatal("Uint256Array(data, 0) failed")
+	}
+	if len(gotAmounts) != 2 {
+		t.Fatalf("amounts length: got %d, want 2", len(gotAmounts))
+	}
+
+	word, ok := abiunpack.Word(data, 1)
+	if !ok {
+		t.Fatal("Word(1) failed")
+	}
+	var gotPayout uint256.Int
+	gotPayout.SetBytes32(word)
+	if !gotPayout.Eq(payout) {
+		t.Errorf("payout: got %s, want %s", gotPayout.String(), payout.String())
+	}
+}
+
+// --- Data Hex Edge Cases ---
+
+func TestAppendHexBytesEmpty(t *testing.T) {
+	result := abiunpack.AppendHexBytes(make([]byte, 0, 32), "")
+	if len(result) != 0 {
+		t.Errorf("empty hex: got %d bytes, want 0", len(result))
+	}
+
+	result = abiunpack.AppendHexBytes(make([]byte, 0, 32), "0x")
+	if len(result) != 0 {
+		t.Errorf("bare 0x: got %d bytes, want 0", len(result))
+	}
+}
+
+func TestAppendHexBytesOddLength(t *testing.T) {
+	result := abiunpack.AppendHexBytes(nil, "0xa")
+	if len(result) != 1 || result[0] != 0x0a {
+		t.Errorf("odd hex '0xa': got %x, want [0a]", result)
+	}
+
+	result = abiunpack.AppendHexBytes(nil, "abc")
+	expected, _ := hex.DecodeString("0abc")
+	if string(result) != string(expected) {
+		t.Errorf("odd hex 'abc': got %x, want %x", result, expected)
+	}
+}
+
+func TestAppendHexBytesReuseBuffer(t *testing.T) {
+	buf := make([]byte, 0, 100)
+	result := abiunpack.AppendHexBytes(buf, "0xdeadbeef")
+	if len(result) != 4 {
+		t.Fatalf("got %d bytes", len(result))
+	}
+	result2 := abiunpack.AppendHexBytes(result[:0], "0xcafebabe")
+	if &result2[0] != &result[0] {
+		t.Error("buffer was not reused — allocated new backing array")
+	}
+	if len(result2) != 4 || result2[0] != 0xca {
+		t.Errorf("buffer reuse corrupted: %x", result2)
+	}
+}
+
+func TestAppendHexBytesInvalidChars(t *testing.T) {
+	result := abiunpack.AppendHexBytes(nil, "0xGGGG")
+	if len(result) != 0 {
+		t.Errorf("invalid hex should return empty slice, got %x", result)
+	}
+}
+
+func TestWordOutOfBounds(t *testing.T) {
+	word, ok := abiunpack.Word([]byte{0x01, 0x02}, 0)
+	if ok || word != nil {
+		t.Errorf("expected failure for Word on 2-byte data")
+	}
+}
+
+func TestWordNegativeIndex(t *testing.T) {
+	word, ok := abiunpack.Word(make([]byte, 64), -1)
+	if ok {
+		t.Errorf("expected failure for negative word index, got %x", word)
+	}
+}
+
+func TestUint256ArrayEmptyData(t *testing.T) {
+	result, ok := abiunpack.Uint256Array([]byte{}, 0)
+	if ok {
+		t.Errorf("Uint256Array on empty data should fail, got %v", result)
+	}
+}
+
+func TestUint256ArrayTruncatedData(t *testing.T) {
+	data := buildABIData(t,
+		uint256ToBytes32Word(uint256.NewInt(32)), // word 0: offset 32
+		uint256ToBytes32Word(uint256.NewInt(5)),  // word 1 (at offset): length 5
+		uint256ToBytes32Word(uint256.NewInt(1)),  // word 2: only 1 element
+	)
+
+	result, ok := abiunpack.Uint256Array(data, 0)
+	if ok {
+		t.Errorf("Uint256Array with truncated data should fail, got %v", result)
+	}
+}
+
+// --- Topic Handling Edge Cases ---
+
+func TestUnpackLogNoTopics(t *testing.T) {
+	decoded, err := generated.UnpackLog("0x0000000000000000000000000000000000000000", nil, nil)
+	if err != nil {
+		t.Fatalf("UnpackLog with no topics: %v", err)
+	}
+	if decoded != nil {
+		t.Errorf("expected nil for no topics, got %v", decoded.EventName)
+	}
+}
+
+func TestUnpackLogEmptyTopics(t *testing.T) {
+	decoded, err := generated.UnpackLog("0x0000000000000000000000000000000000000000", []string{}, nil)
+	if err != nil {
+		t.Fatalf("UnpackLog with empty topics: %v", err)
+	}
+	if decoded != nil {
+		t.Errorf("expected nil for empty topics, got %v", decoded.EventName)
+	}
+}
+
+func TestUnpackLogUnknownTopic0(t *testing.T) {
+	decoded, err := generated.UnpackLog(
+		"0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+		[]string{"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("UnpackLog with unknown topic0: %v", err)
+	}
+	if decoded != nil {
+		t.Errorf("expected nil for unknown topic0, got %v", decoded.EventName)
+	}
+}
+
+func TestUnpackLogWrongAddress(t *testing.T) {
+	decoded, err := generated.UnpackLog(
+		"0x0000000000000000000000000000000000000000",
+		[]string{"0xab3760c3bd2bb38b5bcf54dc79802ed67338b4cf29f3054ded67ed24661e4177"},
+		make([]byte, 32),
+	)
+	if err != nil {
+		t.Fatalf("UnpackLog with wrong address: %v", err)
+	}
+	if decoded != nil {
+		t.Errorf("expected nil for wrong address, got %v", decoded.EventName)
+	}
+}
+
+func TestUnpackLogCaseInsensitiveAddress(t *testing.T) {
+	data := buildABIData(t, uint256ToBytes32Word(uint256.NewInt(2)))
+	dataHex := "0x" + hex.EncodeToString(data)
+
+	decoded, err := generated.UnpackLog(
+		"0x4d97dcd97ec945f40cf65f87097ace5ea0476045", // lowercase
+		[]string{
+			"0xab3760c3bd2bb38b5bcf54dc79802ed67338b4cf29f3054ded67ed24661e4177",
+			"0x0000000000000000000000000000000000000000000000000000000000000001",
+			"0x0000000000000000000000000000000000000000000000000000000000000002",
+			"0x0000000000000000000000000000000000000000000000000000000000000003",
+		},
+		common.FromHex(dataHex),
+	)
+	if err != nil {
+		t.Fatalf("UnpackLog case-insensitive: %v", err)
+	}
+	if decoded == nil {
+		t.Fatal("expected decode with lowercase address")
+	}
+	ev, ok := decoded.Value.(*generated.ConditionalTokensConditionPreparation)
+	if !ok {
+		t.Fatalf("expected ConditionPreparation, got %T", decoded.Value)
+	}
+	if ev.OutcomeSlotCount.Uint64() != 2 {
+		t.Errorf("outcomeSlotCount: got %d, want 2", ev.OutcomeSlotCount.Uint64())
+	}
+}
+
+// --- Exchange vs NegRiskExchange (shared topic0) ---
+
+func TestUnpackLogSharedTopic0ExchangeVsNegRisk(t *testing.T) {
+	orderFilledTopic0 := "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
+	topics := []string{
+		orderFilledTopic0,
+		"0x0000000000000000000000000000000000000000000000000000000000000001",
+		"0x0000000000000000000000000000000000000000000000000000000000000aaa",
+		"0x0000000000000000000000000000000000000000000000000000000000000bbb",
+	}
+	orderData := buildABIData(t,
+		uint256ToBytes32Word(uint256.NewInt(5)),
+		uint256ToBytes32Word(uint256.NewInt(3)),
+		uint256ToBytes32Word(uint256.NewInt(100)),
+		uint256ToBytes32Word(uint256.NewInt(200)),
+		uint256ToBytes32Word(uint256.NewInt(2)),
+	)
+
+	// Exchange address
+	decoded, err := generated.UnpackLog(
+		"0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+		topics, orderData,
+	)
+	if err != nil {
+		t.Fatalf("Exchange decode: %v", err)
+	}
+	if decoded == nil {
+		t.Fatal("expected ExchangeOrderFilled decode")
+	}
+	if _, ok := decoded.Value.(*generated.ExchangeOrderFilled); !ok {
+		t.Errorf("expected ExchangeOrderFilled, got %T", decoded.Value)
+	}
+
+	// NegRiskExchange address
+	decoded, err = generated.UnpackLog(
+		"0xC5d563A36AE78145C45a50134d48A1215220f80a",
+		topics, orderData,
+	)
+	if err != nil {
+		t.Fatalf("NegRiskExchange decode: %v", err)
+	}
+	if decoded == nil {
+		t.Fatal("expected NegRiskExchangeOrderFilled decode")
+	}
+	if _, ok := decoded.Value.(*generated.NegRiskExchangeOrderFilled); !ok {
+		t.Errorf("expected NegRiskExchangeOrderFilled, got %T", decoded.Value)
+	}
+}
+
+// --- FPMM Events (no fixed address, wildcard) ---
+
+func TestUnpackLogFPMMEventsAnyAddress(t *testing.T) {
+	randomAddr := "0x1111111111111111111111111111111111111111"
+	topics := []string{
+		"0x4f62630f51608fc8a7603a9391a5101e58bd7c276139366fc107dc3b67c3dcf8",
+		"0x0000000000000000000000000000000000000000000000000000000000000ccc",
+		"0x0000000000000000000000000000000000000000000000000000000000000000",
+	}
+	data := buildABIData(t,
+		uint256ToBytes32Word(uint256.NewInt(1000)),
+		uint256ToBytes32Word(uint256.NewInt(10)),
+		uint256ToBytes32Word(uint256.NewInt(500)),
+	)
+
+	decoded, err := generated.UnpackLog(randomAddr, topics, data)
+	if err != nil {
+		t.Fatalf("FPMMBuy decode: %v", err)
+	}
+	if decoded == nil {
+		t.Fatal("expected FPMMBuy decode for any address")
+	}
+	ev, ok := decoded.Value.(*generated.FixedProductMarketMakerFPMMBuy)
+	if !ok {
+		t.Fatalf("expected FPMMBuy, got %T", decoded.Value)
+	}
+	// Buyer is case-normalized from 0x0ccc to checksum
+	if ev.Buyer.Hex() != "0x0000000000000000000000000000000000000cCc" {
+		t.Errorf("buyer: got %s", ev.Buyer.Hex())
+	}
+}
+
+func TestUnpackLogFPMEventsTopicIndexSwap(t *testing.T) {
+	// FPMMBuy has buyer at topic[1], outcomeIndex at topic[2]
+	// Verify topic indexing when outcomeIndex is a large value
+	topics := []string{
+		"0x4f62630f51608fc8a7603a9391a5101e58bd7c276139366fc107dc3b67c3dcf8",
+		"0x0000000000000000000000000000000000000000000000000000000000000ccc",
+		"0x0000000000000000000000000000000000000000000000000000000000000001", // outcomeIndex=1
+	}
+	data := buildABIData(t,
+		uint256ToBytes32Word(uint256.NewInt(1000)),
+		uint256ToBytes32Word(uint256.NewInt(10)),
+		uint256ToBytes32Word(uint256.NewInt(500)),
+	)
+
+	decoded, err := generated.UnpackLog("0x1111111111111111111111111111111111111111", topics, data)
+	if err != nil {
+		t.Fatalf("FPMMBuy decode: %v", err)
+	}
+	ev := decoded.Value.(*generated.FixedProductMarketMakerFPMMBuy)
+	if ev.OutcomeIndex.Uint64() != 1 {
+		t.Errorf("outcomeIndex: got %d, want 1", ev.OutcomeIndex.Uint64())
+	}
+}
+
+// --- ProtoBlock Append + Readback Roundtrip ---
+
+func TestProtoEventBlockAppendReadbackRoundtrip(t *testing.T) {
+	block := generated.NewProtoEventBlock()
+	if block == nil {
+		t.Fatal("NewProtoEventBlock returned nil")
+	}
+
+	meta := generated.EventMeta{
+		BlockNumber:    42000000,
+		ContractAddress: common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+	}
+
+	ev := &generated.ConditionalTokensConditionPreparation{
+		EventMeta:        meta,
+		ConditionID:      common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		Oracle:           common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		QuestionID:       common.HexToHash("0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+		OutcomeSlotCount: *uint256.NewInt(3),
+	}
+
+	block.AppendConditionalTokensConditionPreparation(meta, &ev)
+
+	if len(block.Sequence) != 1 {
+		t.Fatalf("Sequence length: got %d, want 1", len(block.Sequence))
+	}
+
+	view := block.ConditionalTokensConditionPreparationProtoAt(0)
+	if view.ConditionID() != ev.ConditionID {
+		t.Errorf("ConditionID roundtrip: got %s, want %s", view.ConditionID().Hex(), ev.ConditionID().Hex())
+	}
+	if view.Oracle() != ev.Oracle {
+		t.Errorf("Oracle roundtrip: got %s, want %s", view.Oracle().Hex(), ev.Oracle().Hex())
+	}
+	if view.OutcomeSlotCount().Uint64() != 3 {
+		t.Errorf("OutcomeSlotCount: got %d, want 3", view.OutcomeSlotCount().Uint64())
+	}
+}
+
+func TestProtoEventBlockMultipleEventsSequentialAccess(t *testing.T) {
+	block := generated.NewProtoEventBlock()
+	meta1 := generated.EventMeta{BlockNumber: 1}
+	meta2 := generated.EventMeta{BlockNumber: 2}
+	meta3 := generated.EventMeta{BlockNumber: 3}
+
+	cond1 := &generated.ConditionalTokensConditionPreparation{
+		EventMeta: meta1, ConditionID: common.HexToHash("0x01"),
+	}
+	cond2 := &generated.ConditionalTokensConditionPreparation{
+		EventMeta: meta2, ConditionID: common.HexToHash("0x02"),
+	}
+	evSplit := &generated.ConditionalTokensPositionSplit{
+		EventMeta: meta3, ConditionID: common.HexToHash("0x03"),
+		Amount: *uint256.NewInt(999),
+	}
+
+	block.AppendConditionalTokensConditionPreparation(meta1, cond1)
+	block.AppendConditionalTokensPositionSplit(meta3, evSplit)
+	block.AppendConditionalTokensConditionPreparation(meta2, cond2)
+
+	if len(block.Sequence) != 3 {
+		t.Fatalf("Sequence length: got %d, want 3", len(block.Sequence))
+	}
+
+	v0 := block.ConditionalTokensConditionPreparationProtoAt(0)
+	v1 := block.ConditionalTokensConditionPreparationProtoAt(1)
+	v2 := block.ConditionalTokensPositionSplitProtoAt(0)
+
+	if v0.ConditionID().Hex() != "0x0100000000000000000000000000000000000000000000000000000000000000" {
+		t.Errorf("first cond: got %s", v0.ConditionID().Hex())
+	}
+	if v1.ConditionID().Hex() != "0x0200000000000000000000000000000000000000000000000000000000000000" {
+		t.Errorf("second cond: got %s", v1.ConditionID().Hex())
+	}
+	if v2.Amount().Uint64() != 999 {
+		t.Errorf("split amount: got %d, want 999", v2.Amount().Uint64())
+	}
+}
+
+func TestProtoEventBlockReset(t *testing.T) {
+	block := generated.NewProtoEventBlock()
+	ev := &generated.ConditionalTokensConditionPreparation{
+		ConditionID: common.HexToHash("0x01"),
+	}
+	block.AppendConditionalTokensConditionPreparation(generated.EventMeta{}, ev)
+
+	if len(block.Sequence) != 1 {
+		t.Fatal("expected 1 sequence entry after append")
+	}
+
+	block.Reset()
+
+	if len(block.Sequence) != 0 {
+		t.Errorf("Sequence not cleared: got %d entries", len(block.Sequence))
+	}
+	if block.HeaderBlockNumber != 0 {
+		t.Errorf("HeaderBlockNumber not cleared: %d", block.HeaderBlockNumber)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("ProtoAt(0) panicked after Reset: %v", r)
+		}
+	}()
+	_ = block.ConditionalTokensConditionPreparationProtoAt(0)
+}
+
+func TestProtoEventBlockAllEventTypesRoundtrip(t *testing.T) {
+	block := generated.NewProtoEventBlock()
+	meta := generated.EventMeta{
+		BlockNumber:      123456,
+		BlockTimestamp:   time.Unix(1700000000, 0).UTC(),
+		TransactionIndex: 42,
+		LogIndex:         7,
+		ContractAddress:  common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+		TransactionHash:  common.HexToHash("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+		BlockHash:        common.HexToHash("0xcafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"),
+	}
+
+	tests := []struct {
+		name string
+		ev   generated.Event
+	}{
+		{"ConditionPreparation", &generated.ConditionalTokensConditionPreparation{
+			EventMeta: meta, ConditionID: common.HexToHash("0x01"),
+			Oracle: common.HexToAddress("0x02"), QuestionID: common.HexToHash("0x03"),
+			OutcomeSlotCount: *uint256.NewInt(2),
+		}},
+		{"ConditionResolution", &generated.ConditionalTokensConditionResolution{
+			EventMeta: meta, ConditionID: common.HexToHash("0x01"),
+			PayoutDenominator: *uint256.NewInt(1000000),
+			PayoutNumerators:  []uint256.Int{*uint256.NewInt(750000), *uint256.NewInt(250000)},
+		}},
+		{"PositionSplit", &generated.ConditionalTokensPositionSplit{
+			EventMeta: meta, Stakeholder: common.HexToAddress("0xaa"),
+			CollateralToken: common.HexToAddress("0xbb"), ConditionID: common.HexToHash("0xcc"),
+			Partition: []uint256.Int{*uint256.NewInt(1), *uint256.NewInt(2)},
+			Amount:    *uint256.NewInt(1000),
+		}},
+		{"ExchangeOrderFilled", &generated.ExchangeOrderFilled{
+			EventMeta: meta, Maker: common.HexToAddress("0x11"), Taker: common.HexToAddress("0x22"),
+			MakerAssetID: *uint256.NewInt(5), TakerAssetID: *uint256.NewInt(3),
+			MakerAmountFilled: *uint256.NewInt(100), TakerAmountFilled: *uint256.NewInt(200),
+			Fee: *uint256.NewInt(2),
+		}},
+		{"FPMMBuy", &generated.FixedProductMarketMakerFPMMBuy{
+			EventMeta: meta, Buyer: common.HexToAddress("0x33"),
+			InvestmentAmount: *uint256.NewInt(1000), FeeAmount: *uint256.NewInt(10),
+			OutcomeIndex: *uint256.NewInt(0), OutcomeTokensBought: *uint256.NewInt(500),
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			block.Reset()
+			block.AppendDecodedLog(generated.DecodedLog{EventName: tt.name, Value: tt.ev})
+
+			if len(block.Sequence) != 1 {
+				t.Fatalf("expected 1 sequence entry, got %d", len(block.Sequence))
+			}
+
+			pb := block.ToParsedBlock()
+			if pb.BlockNumber != meta.BlockNumber {
+				t.Errorf("block number: got %d, want %d", pb.BlockNumber, meta.BlockNumber)
+			}
+		})
+	}
+}
+
+func TestProtoRingBufferWrapAround(t *testing.T) {
+	ring, err := generated.NewProtoRingBuffer(4)
+	if err != nil {
+		t.Fatalf("NewProtoRingBuffer: %v", err)
+	}
+
+	// Fill with 4 blocks
+	for i := uint64(100); i < 104; i++ {
+		slot := ring.NextProtoSlot(i, fmt.Sprintf("0x%x", i))
+		slot.AppendConditionalTokensConditionPreparation(
+			generated.EventMeta{BlockNumber: i},
+			&generated.ConditionalTokensConditionPreparation{
+				ConditionID:      common.BytesToHash(uint64ToBytes(i)),
+				OutcomeSlotCount: *uint256.NewInt(i),
+			},
+		)
+	}
+
+	if ring.Len() != 4 {
+		t.Fatalf("ring length after fill: got %d, want 4", ring.Len())
+	}
+
+	// Add one more — should wrap
+	slot := ring.NextProtoSlot(104, "0x68")
+	slot.AppendConditionalTokensConditionPreparation(
+		generated.EventMeta{BlockNumber: 104},
+		&generated.ConditionalTokensConditionPreparation{
+			ConditionID:      common.BytesToHash(uint64ToBytes(104)),
+			OutcomeSlotCount: *uint256.NewInt(104),
+		},
+	)
+
+	if ring.Len() != 4 {
+		t.Fatalf("ring length after wrap: got %d, want 4 (still max)", ring.Len())
+	}
+
+	// Block 100 should be evicted
+	_, ok := ring.GetProtoEventBlock(100)
+	if ok {
+		t.Error("block 100 should be evicted after wrap")
+	}
+
+	// Block 101 should still be present
+	block, ok := ring.GetProtoEventBlock(101)
+	if !ok {
+		t.Fatal("block 101 should still be in ring")
+	}
+	if block.HeaderBlockNumber != 101 {
+		t.Errorf("block 101 header: got %d", block.HeaderBlockNumber)
+	}
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+func buildABIData(t *testing.T, words ...[]byte) []byte {
+	t.Helper()
+	var total int
+	for _, w := range words {
+		total += len(w)
+	}
+	buf := make([]byte, 0, total)
+	for _, w := range words {
+		buf = append(buf, w...)
+	}
+	return buf
+}
+
+func uint256ToBytes32Word(n *uint256.Int) []byte {
+	b := n.Bytes32()
+	return b[:]
+}
+
+func padAddress(addr common.Address) []byte {
+	buf := make([]byte, 32)
+	copy(buf[12:], addr.Bytes())
+	return buf
+}
+
+func uint64ToBytes(n uint64) []byte {
+	b := make([]byte, 8)
+	for i := 0; i < 8; i++ {
+		b[7-i] = byte(n >> (i * 8))
+	}
+	return b
+}

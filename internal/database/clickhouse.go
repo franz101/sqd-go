@@ -792,6 +792,15 @@ func (s *Store) SaveSyncState(ctx context.Context, chainID uint64, state SyncSta
 	})
 }
 
+// FlushAsyncInserts forces all server-side async-insert buffers to flush to
+// storage, making prior async (wait_for_async_insert=0) inserts durable. Called
+// before advancing the durable checkpoint so event rows for blocks <= checkpoint
+// are guaranteed persisted (no gap on crash). Cheap because the checkpoint only
+// advances at the commit cadence.
+func (s *Store) FlushAsyncInserts(ctx context.Context) error {
+	return s.conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
+}
+
 func (s *Store) TruncateSyncState(ctx context.Context, chainID, lastBlock uint64) error {
 	db := quoteIdent(s.db)
 	q := fmt.Sprintf("DELETE FROM %s.sync_state WHERE chain_id = %d AND last_block < %d SETTINGS lightweight_deletes_sync = 1", db, chainID, lastBlock)

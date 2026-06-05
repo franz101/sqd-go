@@ -43,6 +43,14 @@ package generated
 	b.WriteString("\tmu sync.RWMutex\n")
 	b.WriteString("\tLastSyncBlock uint64\n")
 	b.WriteString("\tLastPruneBlock uint64\n")
+	b.WriteString("\t// lastCommitWallNanos is the unix-nanos of the last hot-state commit, used\n")
+	b.WriteString("\t// by the hybrid block/time commit cadence. 0 means \"not yet committed\".\n")
+	b.WriteString("\tlastCommitWallNanos int64\n")
+	b.WriteString("\t// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only\n")
+	b.WriteString("\t// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized\n")
+	b.WriteString("\t// head); during finalized backfill they are pure GC/memory churn, so the\n")
+	b.WriteString("\t// ingestion layer disables them there. Default true (safe).\n")
+	b.WriteString("\tsnapshotsEnabled bool\n")
 	b.WriteString("\tsnapshots []memorySnapshot\n")
 	b.WriteString("\tsnapshotIdx int\n")
 	b.WriteString("}\n\n")
@@ -62,7 +70,7 @@ package generated
 	b.WriteString("const maxSnapshots = 128\n\n")
 
 	b.WriteString("func NewState() *State {\n")
-	b.WriteString("\ts := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots)}\n")
+	b.WriteString("\ts := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}\n")
 	for _, handle := range handles {
 		b.WriteString("\ts.")
 		b.WriteString(handle.name)
@@ -95,12 +103,24 @@ func (s *State) LoadFromClickHouse(ctx context.Context, httpPort int, blockNumbe
 var LoadStateFromClickHouseFn func(state *State, ctx context.Context, httpPort int, blockNumber uint64) error
 
 func (s *State) SaveSnapshot(blockNumber uint64) {
-	if s == nil || s.HotState == nil || len(s.snapshots) == 0 {
+	if s == nil || s.HotState == nil || len(s.snapshots) == 0 || !s.snapshotsEnabled {
 		return
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.saveSnapshotLocked(blockNumber)
+}
+
+// SetSnapshotsEnabled toggles in-memory fork-recovery snapshots. The ingestion
+// layer disables them during finalized backfill (no reorgs) to remove the
+// dominant GC/memory cost; cursor mode keeps them for reorg recovery.
+func (s *State) SetSnapshotsEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.snapshotsEnabled = enabled
+	s.mu.Unlock()
 }
 
 func (s *State) saveSnapshotLocked(blockNumber uint64) {

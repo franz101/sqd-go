@@ -486,11 +486,9 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		if spec.table.IsEvent {
 			continue
 		}
-		b.WriteString("\t\ts.dirty")
+		b.WriteString("\t\tclear(s.dirty")
 		b.WriteString(spec.baseName)
-		b.WriteString(" = make(map[")
-		b.WriteString(spec.keyType)
-		b.WriteString("]struct{})\n")
+		b.WriteString(")\n")
 	}
 	b.WriteString("\t\treturn nil\n")
 	b.WriteString("\t}\n")
@@ -516,11 +514,9 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString("\t\tif err := batch.Insert(ctx, conn, db); err != nil {\n")
 		b.WriteString("\t\t\treturn err\n")
 		b.WriteString("\t\t}\n")
-		b.WriteString("\t\ts.dirty")
+		b.WriteString("\t\tclear(s.dirty")
 		b.WriteString(spec.baseName)
-		b.WriteString(" = make(map[")
-		b.WriteString(spec.keyType)
-		b.WriteString("]struct{})\n")
+		b.WriteString(")\n")
 		b.WriteString("\t}\n")
 	}
 	b.WriteString("\treturn nil\n}\n")

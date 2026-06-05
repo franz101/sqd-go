@@ -209,6 +209,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			if last >= currentBlock {
 				currentBlock = last + 1
 			}
+		} else if currentBlock > 0 {
+			// No durable checkpoint, but a crash may have left committed-ahead hot
+			// state from a partially-processed run (hot state commits at a cadence,
+			// the checkpoint is written after). Truncate everything >= the start block
+			// so re-processing from currentBlock is idempotent and never double-applies.
+			if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, currentBlock-1); err != nil {
+				return fmt.Errorf("truncate orphaned state before start %d: %w", currentBlock, err)
+			}
 		}
 	}
 	effectiveEndBlock := chain.EndBlock
@@ -231,6 +239,19 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	defer sqd.Close()
 	jsonl := parser.NewFastJSONLParser(1024)
 	replayBuf := NewReplayBuffer(8192) // ~8K blocks of replay capacity
+	// No-data-loss (Invariant 0): if the processor reports a durable commit
+	// horizon, the persisted checkpoint is gated so it never leads that horizon.
+	// On crash the run resumes from durable state and re-fetches the cheap gap.
+	committedReporter, _ := proc.(CommitHorizonReporter)
+	flusher, _ := proc.(Flusher)
+	// durableCheckpoint is the highest block number written to sync_state so far.
+	var durableCheckpoint uint64
+	// Fork-recovery snapshots are only needed in cursor mode (reorgs above the
+	// finalized head). In finalized backfill they are pure GC/memory churn, so
+	// disable them — the single biggest in-memory cost in backfill.
+	if sc, ok := proc.(SnapshotController); ok {
+		sc.SetSnapshotsEnabled(cursorMode)
+	}
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
 	useParseDecodeV2 := os.Getenv("SQD_PARSE_DECODE_V2") != "" && fastJSONLOK
 	if os.Getenv("SQD_PARSE_DECODE_V2") != "" && !fastJSONLOK {
@@ -713,16 +734,39 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
 							return fmt.Errorf("update sync state %d: %w", entry.number, err)
 						}
+						if entry.number%10 == 0 {
+							if err := store.TruncateSyncState(ctx, chain.ID, current.Number); err != nil {
+								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+							}
+						}
 					}
 				} else {
-					if err := store.UpdateSyncState(ctx, chain.ID, entry.number); err != nil {
-						return fmt.Errorf("update sync state %d: %w", entry.number, err)
+					// Gate the checkpoint to the durable (committed) horizon: it must
+					// never lead durable state. With a periodic commit cadence the
+					// checkpoint lags by up to the cadence (blocks/time), which a crash
+					// re-fetches cheaply and re-processes idempotently (rollbackAfterBlock
+					// truncates anything beyond the checkpoint).
+					checkpointBlock := entry.number
+					if committedReporter != nil {
+						if c := committedReporter.CommittedBlock(); c < checkpointBlock {
+							checkpointBlock = c
+						}
 					}
-				}
-
-				if entry.number%10 == 0 {
-					if err := store.TruncateSyncState(ctx, chain.ID, entry.number); err != nil {
-						log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+					if checkpointBlock > durableCheckpoint {
+						// Make event-table rows for blocks <= checkpointBlock durable before
+						// the checkpoint advances past them, so a crash can't drop them.
+						if err := store.FlushAsyncInserts(ctx); err != nil {
+							return fmt.Errorf("flush async inserts before checkpoint %d: %w", checkpointBlock, err)
+						}
+						if err := store.UpdateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+							return fmt.Errorf("update sync state %d: %w", checkpointBlock, err)
+						}
+						durableCheckpoint = checkpointBlock
+						if checkpointBlock%10 == 0 {
+							if err := store.TruncateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+							}
+						}
 					}
 				}
 
@@ -857,6 +901,26 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		case <-statsTicker.C:
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			logStats("periodic")
+		}
+	}
+
+	// Clean completion (backfill): force a durable commit of the tail (the blocks
+	// processed since the last periodic commit) and advance the checkpoint to it,
+	// so nothing processed is lost on a clean exit. Crash/cancel paths intentionally
+	// skip this — they resume from the last durable checkpoint and re-fetch the gap.
+	if !cursorMode && flusher != nil && lastCheckpoint > 0 {
+		committed, err := flusher.Flush(ctx, store, lastCheckpoint)
+		if err != nil {
+			return fmt.Errorf("final flush at %d: %w", lastCheckpoint, err)
+		}
+		if committed > durableCheckpoint {
+			if err := store.FlushAsyncInserts(ctx); err != nil {
+				return fmt.Errorf("final flush async inserts at %d: %w", committed, err)
+			}
+			if err := store.UpdateSyncState(ctx, chain.ID, committed); err != nil {
+				return fmt.Errorf("final checkpoint %d: %w", committed, err)
+			}
+			durableCheckpoint = committed
 		}
 	}
 

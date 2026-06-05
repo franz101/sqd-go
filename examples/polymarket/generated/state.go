@@ -304,8 +304,16 @@ type State struct {
 	mu                      sync.RWMutex
 	LastSyncBlock           uint64
 	LastPruneBlock          uint64
-	snapshots               []memorySnapshot
-	snapshotIdx             int
+	// lastCommitWallNanos is the unix-nanos of the last hot-state commit, used
+	// by the hybrid block/time commit cadence. 0 means "not yet committed".
+	lastCommitWallNanos int64
+	// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only
+	// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized
+	// head); during finalized backfill they are pure GC/memory churn, so the
+	// ingestion layer disables them there. Default true (safe).
+	snapshotsEnabled bool
+	snapshots        []memorySnapshot
+	snapshotIdx      int
 }
 
 type memorySnapshot struct {
@@ -320,7 +328,7 @@ type memorySnapshot struct {
 const maxSnapshots = 128
 
 func NewState() *State {
-	s := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots)}
+	s := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}
 	s.Condition = ConditionState{state: s}
 	s.UserPosition = UserPositionState{state: s}
 	s.Market = MarketState{state: s}
@@ -354,12 +362,24 @@ func (s *State) LoadFromClickHouse(ctx context.Context, httpPort int, blockNumbe
 var LoadStateFromClickHouseFn func(state *State, ctx context.Context, httpPort int, blockNumber uint64) error
 
 func (s *State) SaveSnapshot(blockNumber uint64) {
-	if s == nil || s.HotState == nil || len(s.snapshots) == 0 {
+	if s == nil || s.HotState == nil || len(s.snapshots) == 0 || !s.snapshotsEnabled {
 		return
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.saveSnapshotLocked(blockNumber)
+}
+
+// SetSnapshotsEnabled toggles in-memory fork-recovery snapshots. The ingestion
+// layer disables them during finalized backfill (no reorgs) to remove the
+// dominant GC/memory cost; cursor mode keeps them for reorg recovery.
+func (s *State) SetSnapshotsEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.snapshotsEnabled = enabled
+	s.mu.Unlock()
 }
 
 func (s *State) saveSnapshotLocked(blockNumber uint64) {

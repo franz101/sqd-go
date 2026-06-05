@@ -2364,11 +2364,11 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if conn == nil {
-		s.dirtyConditions = make(map[ConditionsClockKey]struct{})
-		s.dirtyUserPositions = make(map[UserPositionsClockKey]struct{})
-		s.dirtyMarkets = make(map[MarketsClockKey]struct{})
-		s.dirtyNegRiskEvents = make(map[NegRiskEventsClockKey]struct{})
-		s.dirtyFixedProductMarketMakers = make(map[FixedProductMarketMakersClockKey]struct{})
+		clear(s.dirtyConditions)
+		clear(s.dirtyUserPositions)
+		clear(s.dirtyMarkets)
+		clear(s.dirtyNegRiskEvents)
+		clear(s.dirtyFixedProductMarketMakers)
 		return nil
 	}
 	if len(s.dirtyConditions) > 0 {
@@ -2381,7 +2381,7 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 		if err := batch.Insert(ctx, conn, db); err != nil {
 			return err
 		}
-		s.dirtyConditions = make(map[ConditionsClockKey]struct{})
+		clear(s.dirtyConditions)
 	}
 	if len(s.dirtyUserPositions) > 0 {
 		batch := NewMemoryUserPositionBatch()
@@ -2393,7 +2393,7 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 		if err := batch.Insert(ctx, conn, db); err != nil {
 			return err
 		}
-		s.dirtyUserPositions = make(map[UserPositionsClockKey]struct{})
+		clear(s.dirtyUserPositions)
 	}
 	if len(s.dirtyMarkets) > 0 {
 		batch := NewMemoryMarketBatch()
@@ -2405,7 +2405,7 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 		if err := batch.Insert(ctx, conn, db); err != nil {
 			return err
 		}
-		s.dirtyMarkets = make(map[MarketsClockKey]struct{})
+		clear(s.dirtyMarkets)
 	}
 	if len(s.dirtyNegRiskEvents) > 0 {
 		batch := NewMemoryNegRiskEventBatch()
@@ -2417,7 +2417,7 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 		if err := batch.Insert(ctx, conn, db); err != nil {
 			return err
 		}
-		s.dirtyNegRiskEvents = make(map[NegRiskEventsClockKey]struct{})
+		clear(s.dirtyNegRiskEvents)
 	}
 	if len(s.dirtyFixedProductMarketMakers) > 0 {
 		batch := NewMemoryFixedProductMarketMakerBatch()
@@ -2429,7 +2429,7 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 		if err := batch.Insert(ctx, conn, db); err != nil {
 			return err
 		}
-		s.dirtyFixedProductMarketMakers = make(map[FixedProductMarketMakersClockKey]struct{})
+		clear(s.dirtyFixedProductMarketMakers)
 	}
 	return nil
 }

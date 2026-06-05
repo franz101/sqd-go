@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/internal/database"
@@ -57,13 +58,37 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 }
 
 func commitCustomProcessing(ctx context.Context, store Store, state *State, blockNumber uint64) error {
-	commitInterval := uint64(1000)
+	// Hybrid commit cadence. Commit when EITHER bound is hit, whichever first:
+	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 5000): the crash re-fetch budget.
+	//     Bounds how many blocks a crash must re-fetch+re-process from the durable
+	//     checkpoint. Dominates during fast backfill.
+	//   - maxInterval (SQD_COMMIT_MAX_INTERVAL, default 3s): the durability-latency
+	//     bound. Ensures the live tail (few blocks/sec) still becomes durable
+	//     promptly instead of waiting maxBlocks (which could be ~30 min of wall
+	//     clock). Dominates at the head.
+	// This replaces the single magic block interval: the checkpoint never leads the
+	// durable horizon, and the gap is bounded in both blocks and wall-clock time.
+	maxBlocks := uint64(5000)
 	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
 		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
-			commitInterval = parsed
+			maxBlocks = parsed
 		}
 	}
-	if blockNumber >= state.LastSyncBlock+commitInterval {
+	maxInterval := 3 * time.Second
+	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
+		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
+			maxInterval = parsed
+		}
+	}
+
+	nowNanos := time.Now().UnixNano()
+	if state.lastCommitWallNanos == 0 {
+		state.lastCommitWallNanos = nowNanos
+	}
+	blocksElapsed := blockNumber >= state.LastSyncBlock+maxBlocks
+	timeElapsed := time.Duration(nowNanos-state.lastCommitWallNanos) >= maxInterval
+	if blocksElapsed || timeElapsed {
+		state.lastCommitWallNanos = nowNanos
 		state.SaveSnapshot(blockNumber)
 		if err := state.Commit(ctx, store); err != nil {
 			return err
@@ -338,6 +363,46 @@ func (p *Processor) LoadFromDatabase(blockNumber uint64) error {
 	p.State.LastSyncBlock = blockNumber
 	p.State.SaveSnapshot(blockNumber)
 	return nil
+}
+
+// CommittedBlock returns the highest block whose hot state has been durably
+// committed to ClickHouse (wait_for_async_insert=1). The ingestion checkpoint
+// must never lead this horizon, so a crash resumes from durable state and
+// re-fetches the (cheap) gap rather than losing un-committed updates.
+func (p *Processor) CommittedBlock() uint64 {
+	if p == nil || p.State == nil {
+		return 0
+	}
+	return p.State.LastSyncBlock
+}
+
+// Flush forces a durable commit of all hot state processed up to blockNumber and
+// advances the committed horizon. Called on clean completion / shutdown so the
+// tail (the < commit-cadence blocks since the last periodic commit) is persisted
+// and the checkpoint can advance to it. Returns the new committed horizon.
+func (p *Processor) Flush(ctx context.Context, store *database.Store, blockNumber uint64) (uint64, error) {
+	if p == nil || p.State == nil {
+		return 0, nil
+	}
+	if store != nil {
+		if err := p.State.Commit(ctx, store); err != nil {
+			return p.State.LastSyncBlock, err
+		}
+	}
+	if blockNumber > p.State.LastSyncBlock {
+		p.State.LastSyncBlock = blockNumber
+	}
+	p.State.lastCommitWallNanos = time.Now().UnixNano()
+	return p.State.LastSyncBlock, nil
+}
+
+// SetSnapshotsEnabled toggles in-memory fork-recovery snapshots. Disabled during
+// finalized backfill (no reorgs) to remove the dominant GC/memory cost.
+func (p *Processor) SetSnapshotsEnabled(enabled bool) {
+	if p == nil || p.State == nil {
+		return
+	}
+	p.State.SetSnapshotsEnabled(enabled)
 }
 
 func prefetchBlockState(ctx context.Context, store Store, state *State, block *ParsedBlock) error {

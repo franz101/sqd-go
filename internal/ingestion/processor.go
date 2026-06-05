@@ -33,6 +33,31 @@ type FastJSONLProcessor interface {
 	ProcessJSONL(ctx context.Context, store *database.Store, data []byte) (uint64, error)
 }
 
+// CommitHorizonReporter is optionally implemented by processors that durably
+// commit derived state at intervals. When implemented, the ingestion checkpoint
+// is gated so it never leads this horizon: a crash resumes from durable state
+// and re-fetches the (cheap) gap rather than losing un-committed updates.
+type CommitHorizonReporter interface {
+	// CommittedBlock returns the highest block whose derived state is durable.
+	CommittedBlock() uint64
+}
+
+// Flusher is optionally implemented by processors that can force a durable commit
+// of all state processed up to a block. Called on clean completion/shutdown so
+// the tail (blocks since the last periodic commit) is persisted and the
+// checkpoint can advance to it. Returns the new committed horizon.
+type Flusher interface {
+	Flush(ctx context.Context, store *database.Store, blockNumber uint64) (uint64, error)
+}
+
+// SnapshotController is optionally implemented by processors that keep in-memory
+// fork-recovery snapshots. The ingestion layer disables them during finalized
+// backfill (no reorgs) to remove their GC/memory cost, and enables them in cursor
+// mode where reorg recovery may need them.
+type SnapshotController interface {
+	SetSnapshotsEnabled(enabled bool)
+}
+
 // ProcessorFunc adapts individual callback functions to the Processor interface.
 // Any nil callbacks are treated as no-ops.
 type ProcessorFunc struct {
