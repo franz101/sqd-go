@@ -264,11 +264,16 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	flusher, _ := proc.(Flusher)
 	// durableCheckpoint is the highest block number written to sync_state so far.
 	var durableCheckpoint uint64
-	// Fork-recovery snapshots are only needed in cursor mode (reorgs above the
-	// finalized head). In finalized backfill they are pure GC/memory churn, so
-	// disable them — the single biggest in-memory cost in backfill.
+	// Fork-recovery snapshots are only needed near/above the finalized head
+	// (reorgs). In cursor mode the cursor often starts far below the finalized
+	// head and catches up over millions of blocks — keeping snapshots ON during
+	// that backfill phase is the single biggest GC/memory cost. Start disabled
+	// and dynamically enable once the consumer approaches the finalized head.
+	var snapshotController SnapshotController
+	var snapshotsActive bool
 	if sc, ok := proc.(SnapshotController); ok {
-		sc.SetSnapshotsEnabled(cursorMode)
+		snapshotController = sc
+		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
 	}
 	// Cold tier (Pebble): an evicted hot entry is served from local disk instead of
 	// a ClickHouse point-SELECT. Authoritative iff ClickHouse holds no rows for this
@@ -709,6 +714,18 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			if cursorMode {
 				blockRef := client.BlockRef{Number: entry.number, Hash: entry.hash}
 				state.ApplyBatch(entry.finalized, []client.BlockRef{blockRef})
+
+				// Dynamically enable snapshots once the consumer is near the finalized head.
+				// Below the finalized head forks can't happen so snapshots are pure waste.
+				const snapshotEnableMargin = 128
+				if snapshotController != nil && !snapshotsActive && entry.finalized != nil {
+					if entry.number+snapshotEnableMargin >= entry.finalized.Number {
+						snapshotController.SetSnapshotsEnabled(true)
+						snapshotsActive = true
+						log.Printf("Chain %d: snapshots enabled — consumer block %d is within %d of finalized head %d",
+							chain.ID, entry.number, snapshotEnableMargin, entry.finalized.Number)
+					}
+				}
 			}
 
 			if len(entry.events) > 0 {

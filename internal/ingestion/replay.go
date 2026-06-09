@@ -69,7 +69,10 @@ func NewReplayBuffer(capacity int) *ReplayBuffer {
 }
 
 // Write stores a block and its events in the ring buffer.
-// Events and logs are cloned so the caller retains ownership of the originals.
+// The caller transfers ownership of events/logs/typedEvents/raw — they must not
+// be modified after this call. The producer already builds fresh slices per
+// block (strings.Clone at parse time, fresh append-grown slices), so a deep
+// copy is unnecessary and was the second-largest allocation source in backfill.
 func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash string, blockTimestamp time.Time, events []parser.DecodedEvent, logs []CustomLog, typedEvents map[string][]parser.DecodedEvent, finalized *client.BlockRef, isLastInBatch bool, rangeLabel string, requestStartBlock uint64, raw []byte) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -79,44 +82,13 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 		delete(rb.index, rb.slots[idx].number)
 	}
 
-	// Clone events
-	clonedEvents := make([]parser.DecodedEvent, len(events))
-	for i, ev := range events {
-		clonedEvents[i] = cloneDecodedEvent(ev)
-	}
-
-	// Clone logs
-	clonedLogs := make([]CustomLog, len(logs))
-	for i, lg := range logs {
-		clonedLogs[i] = cloneCustomLog(lg)
-	}
-
-	// Clone typed events
-	var clonedTyped map[string][]parser.DecodedEvent
-	if typedEvents != nil {
-		clonedTyped = make(map[string][]parser.DecodedEvent, len(typedEvents))
-		for k, v := range typedEvents {
-			evs := make([]parser.DecodedEvent, len(v))
-			for i, ev := range v {
-				evs[i] = cloneDecodedEvent(ev)
-			}
-			clonedTyped[k] = evs
-		}
-	}
-
-	var clonedRaw []byte
-	if len(raw) > 0 {
-		clonedRaw = make([]byte, len(raw))
-		copy(clonedRaw, raw)
-	}
-
 	rb.slots[idx] = blockEntry{
 		number:            blockNumber,
 		hash:              blockHash,
 		timestamp:         blockTimestamp,
-		events:            clonedEvents,
-		logs:              clonedLogs,
-		typedEvents:       clonedTyped,
+		events:            events,
+		logs:              logs,
+		typedEvents:       typedEvents,
 		finalized:         finalized,
 		isLastInBatch:     isLastInBatch,
 		rangeLabel:        rangeLabel,
@@ -127,7 +99,7 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 			BlockTimestamp: blockTimestamp,
 			BlockHash:      blockHash,
 		},
-		raw: clonedRaw,
+		raw: raw,
 	}
 	rb.index[blockNumber] = idx
 
@@ -353,28 +325,6 @@ func (rb *ReplayBuffer) rebuildIndexLocked() {
 	}
 }
 
-// cloneDecodedEvent deep-copies a DecodedEvent so the buffer owns the data.
-func cloneDecodedEvent(ev parser.DecodedEvent) parser.DecodedEvent {
-	cloned := ev
-	if ev.Params != nil {
-		cloned.Params = make(map[string]any, len(ev.Params))
-		for k, v := range ev.Params {
-			cloned.Params[k] = v // Params values are immutable (uint256, string, []byte)
-		}
-	}
-	// Strings are immutable in Go, no need to clone.
-	return cloned
-}
-
-// cloneCustomLog deep-copies a CustomLog.
-func cloneCustomLog(lg CustomLog) CustomLog {
-	cloned := lg
-	if len(lg.Topics) > 0 {
-		cloned.Topics = make([]string, len(lg.Topics))
-		copy(cloned.Topics, lg.Topics)
-	}
-	return cloned
-}
 
 // ReplayFromBuffer replays blocks from the buffer through the full ingestion
 // pipeline: ClickHouse insert + custom processor. Called during fork recovery
