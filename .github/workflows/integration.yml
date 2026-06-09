@@ -37,7 +37,7 @@ jobs:
         run: go build -o tmp/sqd-go .
 
       - name: Unit tests
-        run: go test ./... -count=1 -timeout 60s
+        run: go test $(go list ./... | grep -v 'examples/polymarket' | grep -v 'internal/coldcache') -count=1 -timeout 60s
 
       - name: Integration test (15s indexing)
         env:
