@@ -22,18 +22,46 @@ REMOTE_CH_AUTH = ("crypto", "")
 
 GOLDSKY_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/pnl-subgraph/0.0.14/gn"
 
-WALLET = sys.argv[1].lower() if len(sys.argv) > 1 else "0x27b92311397f495dde200ad9cc3684f71d3ad493"
+# Default wallets from test.md for debugging
+DEFAULT_WALLET = "0xf05b670c0f91f8171984db945a28d2ad0f170cc4"  # Missing 6 of 16 positions
+# Alternative test wallets:
+# "0xf05b670c0f91f8171984db945a28d2ad0f170cc4"  # Missing ALL 4 positions
+# "0x6de391f369a4d7f2e93553cbd8939b270269668a"  # FPMM - has negative token ID bug
+# "0x979d66a41f5b99399a76c5db6f318461b2ad1132"  # Has 0 positions (sanity check)
+WALLET = sys.argv[1].lower() if len(sys.argv) > 1 else DEFAULT_WALLET
 
 HEADERS_JSON = {"Content-Type": "text/plain; charset=UTF-8", "Accept": "*/*"}
-SCALE = Decimal(1e6)  # Goldsky subgraph stores values × 1e6
+SCALE = Decimal("1000000")  # Goldsky subgraph stores values × 1e6
+UINT256_MOD = 1 << 256
+UINT256_MASK = UINT256_MOD - 1
+
+DISCOVERED_TOKENS = set()
 
 def dec(s) -> Decimal:
     """Parse Decimal, stripping trailing .000... from CH Decimal(76,18)"""
     return Decimal(str(s))
 
+def normalize_token_id(value) -> str:
+    """Normalize hex, unsigned decimal, or signed Int256-style token ids."""
+    tid_val = str(value)
+    if "." in tid_val:
+        tid_val = tid_val.split(".")[0]
+    tid_val = tid_val.replace("\n", "").replace("\r", "").strip()
+
+    if re.match(r"^-?\d+$", tid_val):
+        n = int(tid_val)
+        if n < 0:
+            n += UINT256_MOD
+        tid_hex = f"{n & UINT256_MASK:064x}"
+    else:
+        tid_hex = tid_val[2:] if tid_val.startswith(("0x", "0X")) else tid_val
+        tid_hex = tid_hex.lower().zfill(64)
+
+    return "0x" + tid_hex.lower()
+
 def ch_data_to_positions(data_rows: list, token_key="token_id", amount_key="amount",
                          price_key="avg_price", pnl_key="realized_pnl",
-                         bought_key="total_bought", block_key=None, scale=True) -> list:
+                         bought_key="total_bought", block_key=None, scale=True, scale_price=True) -> list:
     """Convert ClickHouse JSON 'data' rows to normalized position dicts."""
     positions = []
     for r in data_rows:
@@ -43,14 +71,12 @@ def ch_data_to_positions(data_rows: list, token_key="token_id", amount_key="amou
         tb = dec(r[bought_key])
         if scale:
             amt /= SCALE
-            prc /= SCALE
             rpnl /= SCALE
             tb /= SCALE
-        # Token ID: might be hex string (local CH FixedString(32)) or decimal string (remote CH)
-        tid = str(r[token_key]).rstrip("0").rstrip(".")  # strip Decimal(76,18) trailing zeros
-        # If it's a pure decimal number, convert to hex
-        if re.match(r"^\d+$", tid):
-            tid = hex(int(tid))
+            if scale_price:
+                prc /= SCALE
+        tid = normalize_token_id(r[token_key])
+        DISCOVERED_TOKENS.add(tid)
         positions.append({
             "token_id": tid,
             "amount": amt, "avg_price": prc,
@@ -65,10 +91,25 @@ def now(): return time.time()
 # LOCAL ClickHouse — memory_user_positions
 # ============================================================
 def fetch_local_ch(wallet: str):
+    wallet_clean = wallet.lower().replace("0x", "")
+    # Check which database has data
+    dbs = [os.getenv("CLICKHOUSE_DATABASE", "polymarket"), "polymarket_debug", "dev_polymarket", "polymarket"]
+    db_to_use = "polymarket"
+    for db in dbs:
+        try:
+            chk_sql = f"SELECT count() FROM {db}.memory_user_positions WHERE user = unhex('{wallet_clean}')"
+            r = requests.post(LOCAL_CH_URL, data=chk_sql.encode(), headers=HEADERS_JSON,
+                              auth=HTTPBasicAuth(*LOCAL_CH_AUTH), timeout=10)
+            if r.status_code == 200 and int(r.text.strip()) > 0:
+                db_to_use = db
+                break
+        except Exception:
+            pass
+
     sql = f"""
-    SELECT token_id, amount, avg_price, realized_pn_l, total_bought, block_number
-    FROM polymarket.memory_user_positions FINAL
-    WHERE user = '{wallet}' AND total_bought > 0
+    SELECT hex(token_id) as token_id, amount, avg_price, realized_pn_l, total_bought, block_number
+    FROM {db_to_use}.memory_user_positions FINAL
+    WHERE user = unhex('{wallet_clean}') AND total_bought > 0
     ORDER BY block_number DESC
     FORMAT JSON
     """
@@ -81,7 +122,7 @@ def fetch_local_ch(wallet: str):
     d = r.json()
     rows = d.get("data", [])
     positions = ch_data_to_positions(rows, pnl_key="realized_pn_l", block_key="block_number",
-                                     scale=False)  # local stores already-scaled values?
+                                     scale=True, scale_price=False)  # local stores amount/pnl/bought scaled, but not avg_price
     return positions, elapsed
 
 # ============================================================
@@ -103,48 +144,55 @@ def fetch_remote_ch(wallet: str):
     elapsed = now() - t0
     d = r.json()
     rows = d.get("data", [])
-    positions = ch_data_to_positions(rows, scale=True)
+    positions = ch_data_to_positions(rows, scale=True, scale_price=True)
     return positions, elapsed
 
 # ============================================================
 # Goldsky Subgraph
 # ============================================================
 def fetch_goldsky(wallet: str):
+    wallet_lower = wallet.lower()
     positions = []
-    PAGE_SIZE = 50  # smaller pages avoid timeout
+    page_size = 250
     skip = 0
     t0 = now()
     while True:
-        r = requests.post(GOLDSKY_URL,
-            json={"query": """
-            query GetUserPnL($user: String!, $first: Int!, $skip: Int!) {
-              userPositions(where: {user: $user, totalBought_gt: "0"}, first: $first, skip: $skip) {
-                tokenId realizedPnl amount avgPrice totalBought
-              }
-            }""", "variables": {"user": wallet, "first": PAGE_SIZE, "skip": skip}},
-            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
-            timeout=60)
+        query = """
+        query GetUserPnL($user: String!, $first: Int!, $skip: Int!) {
+          userPositions(where: {user: $user, totalBought_gt: "0"}, first: $first, skip: $skip) {
+            tokenId
+            realizedPnl
+            amount
+            avgPrice
+            totalBought
+          }
+        }
+        """
+        variables = {"user": wallet_lower, "first": page_size, "skip": skip}
+        r = requests.post(GOLDSKY_URL, json={"query": query, "variables": variables},
+                          headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                          timeout=60)
         r.raise_for_status()
         data = r.json()
         if "errors" in data:
             print(f"  Goldsky error: {data['errors'][0]['message'][:120]}", file=sys.stderr)
-            break
-        batch = data["data"]["userPositions"]
-        for p in batch:
+            return [], now() - t0
+        rows = data.get("data", {}).get("userPositions", [])
+        for p in rows:
+            tid = normalize_token_id(p["tokenId"])
+            DISCOVERED_TOKENS.add(tid)
             positions.append({
-                "token_id": "0x" + p["tokenId"],
+                "token_id": tid,
                 "amount": dec(p["amount"]) / SCALE,
                 "avg_price": dec(p["avgPrice"]) / SCALE,
                 "realized_pnl": dec(p["realizedPnl"]) / SCALE,
                 "total_bought": dec(p["totalBought"]) / SCALE,
                 "block": None,
             })
-        if len(batch) < PAGE_SIZE:
+        if len(rows) < page_size:
             break
-        skip += PAGE_SIZE
-        print(f"  Goldsky fetched {len(positions)}...", file=sys.stderr)
-    elapsed = now() - t0
-    return positions, elapsed
+        skip += page_size
+    return positions, now() - t0
 
 # ============================================================
 # Compute PnL
@@ -156,7 +204,9 @@ def compute_pnl(positions):
         realized += p["realized_pnl"]
         holdings += p["amount"] * p["avg_price"]
     return {"realized_pnl": realized, "holdings_cost": holdings,
-            "net_equity": realized + holdings, "count": len(positions)}
+            "net_equity": realized + holdings,
+            "realized_minus_holdings": realized - holdings,
+            "count": len(positions)}
 
 # ============================================================
 # MAIN
@@ -177,7 +227,8 @@ for name, fetcher in sources:
         pnl = compute_pnl(positions)
         results[name] = {"pnl": pnl, "positions": positions, "elapsed": elapsed}
         print(f"  {name:12s}  {pnl['count']:>4d} pos  |  Realized: ${pnl['realized_pnl']:>12,.2f}  "
-              f"Holdings: ${pnl['holdings_cost']:>12,.2f}  |  Net: ${pnl['net_equity']:>12,.2f}  "
+              f"Holdings: ${pnl['holdings_cost']:>12,.2f}  |  Equity: ${pnl['net_equity']:>12,.2f}  "
+              f"R-H: ${pnl['realized_minus_holdings']:>12,.2f}  "
               f"({elapsed:.1f}s)")
     except Exception as e:
         print(f"  {name:12s}  ERROR: {e}")
@@ -218,10 +269,10 @@ for tid in sorted(all_tokens.keys()):
 
 # --- Summary ---
 print(f"\n{'─'*80}")
-print(f"{'Source':>12s}  {'Count':>5s}  {'Realized':>14s}  {'Holdings':>14s}  {'Net':>14s}")
+print(f"{'Source':>12s}  {'Count':>5s}  {'Realized':>14s}  {'Holdings':>14s}  {'Equity':>14s}  {'R-H':>14s}")
 for src in active_sources:
     pnl = results[src]["pnl"]
-    print(f"{src:>12s}  {pnl['count']:>5d}  ${pnl['realized_pnl']:>13,.2f}  ${pnl['holdings_cost']:>13,.2f}  ${pnl['net_equity']:>13,.2f}")
+    print(f"{src:>12s}  {pnl['count']:>5d}  ${pnl['realized_pnl']:>13,.2f}  ${pnl['holdings_cost']:>13,.2f}  ${pnl['net_equity']:>13,.2f}  ${pnl['realized_minus_holdings']:>13,.2f}")
 
 # --- Save JSON ---
 (out_dir := project_root / "tmp").mkdir(exist_ok=True)

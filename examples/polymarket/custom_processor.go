@@ -5,17 +5,16 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
-	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
-	"github.com/franz101/sqd-go/drafts/protomath"
 	generated "github.com/franz101/sqd-go/examples/polymarket/generated"
 	"github.com/franz101/sqd-go/internal/cli"
 	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/drafts/protomath"
 	"github.com/holiman/uint256"
-	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/shopspring/decimal"
 )
 
@@ -37,6 +36,9 @@ func fromDecimal(v decimal.Decimal) protomath.Decimal256 {
 	if v.IsZero() {
 		return protomath.Decimal256{}
 	}
+	if v.Exponent() < -18 {
+		v = v.Round(18)
+	}
 	coeff := v.Coefficient()
 	exp := int(v.Exponent())
 
@@ -57,7 +59,6 @@ func fromDecimal(v decimal.Decimal) protomath.Decimal256 {
 				return res
 			}
 		} else {
-			// Extreme shift — compute 10^shift on the fly (rare).
 			scaled := new(big.Int).Mul(coeff, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(shift)), nil))
 			res, ok := protomath.FromDecimal256ScaledBigInt(scaled)
 			if ok {
@@ -65,8 +66,8 @@ func fromDecimal(v decimal.Decimal) protomath.Decimal256 {
 			}
 		}
 	}
-	// Fallback for negative shift (division, precision loss) or overflow above.
-	res, _ := protomath.ParseDecimal256(v.String(), protomath.Decimal256Scale18)
+	// Fallback: value already rounded to 18dp above, so ParseDecimal256 won't reject it.
+	res, _ := protomath.ParseDecimal256(v.StringFixed(18), protomath.Decimal256Scale18)
 	return res
 }
 
@@ -91,11 +92,18 @@ var (
 	ctParityBit                    = new(big.Int).Lsh(big.NewInt(1), 254)
 	ctLow254Mask                   = new(big.Int).Sub(new(big.Int).Set(ctParityBit), ctOne)
 	ctSqrtExponent                 = new(big.Int).Rsh(new(big.Int).Add(new(big.Int).Set(ctP), ctOne), 2)
-	collectionCache                = xsync.NewMapOf[collectionKey, common.Hash]()
-	collectionCacheLen       int32 = 0
-	positionCache                  = xsync.NewMapOf[positionKey, uint256.Int]()
-	positionCacheLen         int32 = 0
-	lastPnLSummaryBlock      uint64
+	// CLOCK (second-chance) caches for the pure ID derivations. Each entry is a
+	// memoized result of an expensive keccak / elliptic-curve computation; the
+	// CLOCK eviction keeps the hot working set across the cap instead of flushing
+	// the whole table (see clockcache.go).
+	collectionCache = newClockCache[collectionKey, common.Hash](maxCryptoCacheLen, 64, hashCollectionKey)
+	positionCache   = newClockCache[positionKey, uint256.Int](maxCryptoCacheLen, 64, hashPositionKey)
+	// negRiskPosCache memoizes the neg-risk position ID keyed by (conditionID,
+	// outcome). Its miss path runs computeCollectionId, whose Legendre-symbol
+	// loop is a 256-bit modular exponentiation — the single most expensive
+	// primitive in the processor — so this is the highest-value cache of the three.
+	negRiskPosCache = newClockCache[negRiskKey, uint256.Int](maxCryptoCacheLen, 64, hashNegRiskKey)
+	lastPnLSummaryBlock uint64
 )
 
 const maxCryptoCacheLen = 65536
@@ -109,6 +117,25 @@ type collectionKey struct {
 type positionKey struct {
 	collateral common.Address
 	collection common.Hash
+}
+
+type negRiskKey struct {
+	condition common.Hash
+	outcome   uint8
+}
+
+// Shard hashes read 8 bytes from a field that is itself a keccak output, so the
+// low bits are already uniformly distributed across shards.
+func hashCollectionKey(k collectionKey) uint64 {
+	return binary.LittleEndian.Uint64(k.condition[:8]) ^ binary.LittleEndian.Uint64(k.index[:8])
+}
+
+func hashPositionKey(k positionKey) uint64 {
+	return binary.LittleEndian.Uint64(k.collection[:8])
+}
+
+func hashNegRiskKey(k negRiskKey) uint64 {
+	return binary.LittleEndian.Uint64(k.condition[:8]) + uint64(k.outcome)
 }
 
 func ensureConditionsLoaded(state *generated.State, conditionIDs []common.Hash) {
@@ -130,6 +157,37 @@ func ensureConditionsLoaded(state *generated.State, conditionIDs []common.Hash) 
 				})
 			}
 		}
+	}
+}
+
+// fpmmResolveNanos / fpmmResolveRoundTrips are diagnostic counters (single-goroutine processor).
+var fpmmResolveNanos int64
+var fpmmResolveRoundTrips int64
+
+func ensureFPMMMarketsLoaded(state *generated.State, fpmmAddrs []common.Address) {
+	if state.Store == nil || state.Store.Conn() == nil {
+		return
+	}
+	queued := 0
+	for _, fpmmAddr := range fpmmAddrs {
+		// Check if already loaded in hot state (or tombstoned from a prior miss).
+		key := generated.FixedProductMarketMakersClockKey{ID: fpmmAddr}
+		if _, ok := state.HotState.FixedProductMarketMakers.Get(key); ok {
+			continue
+		}
+		state.HotState.FixedProductMarketMakersResolver.Queue(key)
+		queued++
+	}
+	// One batched round-trip per block instead of one per missing address: the
+	// resolver issues WHERE id IN (...) and tombstones not-found keys, so the
+	// queued set and the consumed results are identical to the per-address path.
+	if queued > 0 {
+		t0 := time.Now()
+		fpmmResolveRoundTrips++
+		if err := state.HotState.FixedProductMarketMakersResolver.Resolve(context.Background(), state.Store.Conn(), state.Store.DB()); err != nil {
+			// Some markets might not exist yet; tombstone handles the negative case.
+		}
+		fpmmResolveNanos += time.Since(t0).Nanoseconds()
 	}
 }
 
@@ -155,6 +213,21 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 		conditionIDs = append(conditionIDs, ev.ConditionID)
 	}
 	ensureConditionsLoaded(state, conditionIDs)
+
+	var fpmmAddrs []common.Address
+	for i := range block.FixedProductMarketMakerFPMMBuys {
+		fpmmAddrs = append(fpmmAddrs, block.FixedProductMarketMakerFPMMBuys[i].ContractAddress)
+	}
+	for i := range block.FixedProductMarketMakerFPMMSells {
+		fpmmAddrs = append(fpmmAddrs, block.FixedProductMarketMakerFPMMSells[i].ContractAddress)
+	}
+	for i := range block.FixedProductMarketMakerFPMMFundingAddeds {
+		fpmmAddrs = append(fpmmAddrs, block.FixedProductMarketMakerFPMMFundingAddeds[i].ContractAddress)
+	}
+	for i := range block.FixedProductMarketMakerFPMMFundingRemoveds {
+		fpmmAddrs = append(fpmmAddrs, block.FixedProductMarketMakerFPMMFundingRemoveds[i].ContractAddress)
+	}
+	ensureFPMMMarketsLoaded(state, fpmmAddrs)
 
 	for ev := range block.EventsIter() {
 		switch e := ev.(type) {
@@ -224,6 +297,22 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 		conditionIDs = append(conditionIDs, ev.ConditionID())
 	})
 	ensureConditionsLoaded(state, conditionIDs)
+
+	// Prefetch FPMM markets referenced in buy/sell/funding events
+	var fpmmAddrs []common.Address
+	block.QueryFixedProductMarketMakerFPMMBuy().Map(func(ev generated.FixedProductMarketMakerFPMMBuyProtoView) {
+		fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
+	})
+	block.QueryFixedProductMarketMakerFPMMSell().Map(func(ev generated.FixedProductMarketMakerFPMMSellProtoView) {
+		fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
+	})
+	block.QueryFixedProductMarketMakerFPMMFundingAdded().Map(func(ev generated.FixedProductMarketMakerFPMMFundingAddedProtoView) {
+		fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
+	})
+	block.QueryFixedProductMarketMakerFPMMFundingRemoved().Map(func(ev generated.FixedProductMarketMakerFPMMFundingRemovedProtoView) {
+		fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
+	})
+	ensureFPMMMarketsLoaded(state, fpmmAddrs)
 
 	var conditionPreparationIdx int
 	var conditionResolutionIdx int
@@ -461,8 +550,9 @@ func handleOrderFilledValues(state *generated.State, maker common.Address, maker
 	var baseAmount, quoteAmount decimal.Decimal
 	var isBuy bool
 
-	makerFilled := Uint256ToDecimal(makerAmountFilled)
-	takerFilled := Uint256ToDecimal(takerAmountFilled)
+	// Exchange amounts are in raw outcome tokens - divide by 1e6 to get stake units
+	makerFilled := Uint256ToDecimal(makerAmountFilled).Div(decimal.NewFromInt(1e6))
+	takerFilled := Uint256ToDecimal(takerAmountFilled).Div(decimal.NewFromInt(1e6))
 
 	if makerAssetID.IsZero() { // BUY
 		isBuy = true
@@ -476,6 +566,7 @@ func handleOrderFilledValues(state *generated.State, maker common.Address, maker
 		quoteAmount = takerFilled
 	}
 
+	// Price = quote / base (both in stake units now, quote in USDC, base in stake units)
 	price := decimal.Zero
 	if !baseAmount.IsZero() {
 		price = quoteAmount.Div(baseAmount)
@@ -513,8 +604,11 @@ func handleFPMMBuy(state *generated.State, ev *generated.FixedProductMarketMaker
 		return
 	}
 
-	amount := Uint256ToDecimal(ev.OutcomeTokensBought)
-	price := Uint256ToDecimal(ev.InvestmentAmount).Div(amount)
+	// Divide by 1e6 to convert raw outcome tokens to "full stake" units
+	amountRaw := Uint256ToDecimal(ev.OutcomeTokensBought)
+	amount := amountRaw.Div(decimal.NewFromInt(1e6))
+	// Price calculation: investmentAmount / amount (in stake units) gives USDC per stake
+	price := CollateralToDecimal(ev.InvestmentAmount).Div(amount)
 	posID := getFixedProductMarketMakerPositionID(fpmm, outcomeIndex)
 	updateUserPositionWithBuy(state, ev.Buyer, posID, price, amount, decimal.Zero, ev.EventMeta)
 }
@@ -532,8 +626,11 @@ func handleFPMMSell(state *generated.State, ev *generated.FixedProductMarketMake
 		return
 	}
 
-	amount := Uint256ToDecimal(ev.OutcomeTokensSold)
-	price := Uint256ToDecimal(ev.ReturnAmount).Div(amount)
+	// Divide by 1e6 to convert raw outcome tokens to "full stake" units
+	amountRaw := Uint256ToDecimal(ev.OutcomeTokensSold)
+	amount := amountRaw.Div(decimal.NewFromInt(1e6))
+	// Price calculation: returnAmount / amount (in stake units) gives USDC per stake
+	price := CollateralToDecimal(ev.ReturnAmount).Div(amount)
 	posID := getFixedProductMarketMakerPositionID(fpmm, outcomeIndex)
 	updateUserPositionWithSell(state, ev.Seller, posID, price, amount, ev.EventMeta)
 }
@@ -547,27 +644,33 @@ func handleFPMMFundingAdded(state *generated.State, ev *generated.FixedProductMa
 		return
 	}
 
-	outcomeIndex := uint8(0)
+	// The FPMM sends back the smaller outcome. The user effectively buys the
+	// difference between the larger and smaller outcome balances.
+	sendbackOutcomeIndex := uint8(0)
 	if ev.AmountsAdded[0].Gt(&ev.AmountsAdded[1]) {
-		outcomeIndex = 1
+		sendbackOutcomeIndex = 1
 	}
+	largerOutcomeIndex := 1 - sendbackOutcomeIndex
 
-	amountRaw := new(uint256.Int).Sub(&ev.AmountsAdded[1-outcomeIndex], &ev.AmountsAdded[outcomeIndex])
-	amount := Uint256ToDecimal(*amountRaw)
-	price := computeFpmmPriceDecimal(ev.AmountsAdded, outcomeIndex)
-	posID := getFixedProductMarketMakerPositionID(fpmm, outcomeIndex)
+	amountRaw := new(uint256.Int).Sub(&ev.AmountsAdded[largerOutcomeIndex], &ev.AmountsAdded[sendbackOutcomeIndex])
+	// Divide by 1e6 to convert to "full stake" units
+	amount := Uint256ToDecimal(*amountRaw).Div(decimal.NewFromInt(1e6))
+	price := computeFpmmPriceDecimal(ev.AmountsAdded, sendbackOutcomeIndex)
+	posID := getFixedProductMarketMakerPositionID(fpmm, sendbackOutcomeIndex)
 	updateUserPositionWithBuy(state, ev.Funder, posID, price, amount, decimal.Zero, ev.EventMeta)
 
 	if ev.SharesMinted.IsZero() {
 		return
 	}
 
-	totalSpend := ev.AmountsAdded[0]
-	if ev.AmountsAdded[1].Gt(&totalSpend) {
-		totalSpend = ev.AmountsAdded[1]
+	// totalSpend is max(amountsAdded) in USDC's 1e6 collateral scale.
+	totalSpendWei := ev.AmountsAdded[0]
+	if ev.AmountsAdded[1].Gt(&totalSpendWei) {
+		totalSpendWei = ev.AmountsAdded[1]
 	}
+	totalSpend := CollateralToDecimal(totalSpendWei)
 	tokenCost := amount.Mul(price)
-	lpShareCost := Uint256ToDecimal(totalSpend).Sub(tokenCost)
+	lpShareCost := totalSpend.Sub(tokenCost)
 	lpSharePrice := lpShareCost.Div(Uint256ToDecimal(ev.SharesMinted))
 	updateUserPositionWithBuy(state, ev.Funder, uint256FromAddress(fpmm.ID), lpSharePrice, Uint256ToDecimal(ev.SharesMinted), decimal.Zero, ev.EventMeta)
 }
@@ -584,7 +687,8 @@ func handleFPMMFundingRemoved(state *generated.State, ev *generated.FixedProduct
 	tokensCost := decimal.Zero
 	for i := uint8(0); i < 2; i++ {
 		tokenPrice := computeFpmmPriceDecimal(ev.AmountsRemoved, i)
-		tokenAmount := Uint256ToDecimal(ev.AmountsRemoved[i])
+		// Divide by 1e6 to convert to "full stake" units
+		tokenAmount := Uint256ToDecimal(ev.AmountsRemoved[i]).Div(decimal.NewFromInt(1e6))
 		tokensCost = tokensCost.Add(tokenPrice.Mul(tokenAmount))
 		posID := getFixedProductMarketMakerPositionID(fpmm, i)
 		updateUserPositionWithBuy(state, ev.Funder, posID, tokenPrice, tokenAmount, decimal.Zero, ev.EventMeta)
@@ -594,8 +698,13 @@ func handleFPMMFundingRemoved(state *generated.State, ev *generated.FixedProduct
 		return
 	}
 
-	lpSalePrice := Uint256ToDecimal(ev.CollateralRemovedFromFeePool).Sub(tokensCost).Div(Uint256ToDecimal(ev.SharesBurnt))
-	updateUserPositionWithSell(state, ev.Funder, uint256FromAddress(fpmm.ID), lpSalePrice, Uint256ToDecimal(ev.SharesBurnt), ev.EventMeta)
+	lpSalePrice := CollateralToDecimal(ev.CollateralRemovedFromFeePool).Sub(tokensCost).Div(Uint256ToDecimal(ev.SharesBurnt))
+	lpPosID := uint256FromAddress(fpmm.ID)
+	// Skip LP share sell if position doesn't exist in hot state
+	up := getUserPosition(state, ev.Funder, lpPosID)
+	if up != nil {
+		updateUserPositionWithSell(state, ev.Funder, lpPosID, lpSalePrice, Uint256ToDecimal(ev.SharesBurnt), ev.EventMeta)
+	}
 }
 
 func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokensPositionSplit) {
@@ -607,7 +716,8 @@ func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokens
 		return
 	}
 
-	amount := Uint256ToDecimal(ev.Amount)
+	// Divide by 1e6 to convert to "full stake" units
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	if amount.IsZero() {
 		return
 	}
@@ -629,7 +739,8 @@ func handlePositionsMerge(state *generated.State, ev *generated.ConditionalToken
 		return
 	}
 
-	amount := Uint256ToDecimal(ev.Amount)
+	// Divide by 1e6 to convert to "full stake" units
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	if amount.IsZero() {
 		return
 	}
@@ -638,6 +749,8 @@ func handlePositionsMerge(state *generated.State, ev *generated.ConditionalToken
 		indexSet := new(uint256.Int).Lsh(uint256.NewInt(1), uint(outcomeIndex))
 		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSet.ToBig())
 		posID := getPositionID(ev.CollateralToken, collID)
+
+
 		updateUserPositionWithSell(state, ev.Stakeholder, posID, fiftyCents, amount, ev.EventMeta)
 	}
 }
@@ -658,7 +771,8 @@ func handleNegRiskPositionSplit(state *generated.State, ev *generated.NegRiskAda
 		state.Condition.Save(cond, ev.EventMeta)
 	}
 
-	amount := Uint256ToDecimal(ev.Amount)
+	// Divide by 1e6 to convert to "full stake" units
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	posIDYes := getNegRiskPositionIDByCondition(ev.ConditionID, 0)
 	updateUserPositionWithBuy(state, ev.Stakeholder, posIDYes, fiftyCents, amount, decimal.Zero, ev.EventMeta)
 
@@ -682,7 +796,8 @@ func handleNegRiskPositionsMerge(state *generated.State, ev *generated.NegRiskAd
 		state.Condition.Save(cond, ev.EventMeta)
 	}
 
-	amount := Uint256ToDecimal(ev.Amount)
+	// Divide by 1e6 to convert to "full stake" units
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	posIDYes := getNegRiskPositionIDByCondition(ev.ConditionID, 0)
 	updateUserPositionWithSell(state, ev.Stakeholder, posIDYes, fiftyCents, amount, ev.EventMeta)
 
@@ -696,30 +811,12 @@ func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapt
 		return
 	}
 
-	amount := Uint256ToDecimal(ev.Amount)
+	// Divide by 1e6 to convert to "full stake" units
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	questionCount := nr.QuestionCount
 	indexSet := ev.IndexSet
 
-	useQuestionIDs := false
-	for _, qid := range nr.QuestionIDs {
-		if qid != (common.Hash{}) {
-			useQuestionIDs = true
-			break
-		}
-	}
-
 	resolvePositionID := func(questionIndex uint32, outcomeIndex uint8) (uint256.Int, bool) {
-		if useQuestionIDs {
-			if questionIndex >= uint32(len(nr.QuestionIDs)) {
-				return uint256.Int{}, false
-			}
-			questionID := nr.QuestionIDs[questionIndex]
-			if questionID == (common.Hash{}) {
-				return uint256.Int{}, false
-			}
-			conditionID := getConditionID(negRiskAdapterAddr, questionID)
-			return getNegRiskPositionIDByCondition(conditionID, outcomeIndex), true
-		}
 		return getNegRiskPositionID(ev.MarketID, questionIndex, outcomeIndex), true
 	}
 
@@ -765,7 +862,9 @@ func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapt
 	}
 
 	for _, sell := range noSells {
-		updateUserPositionWithSell(state, ev.Stakeholder, sell.posID, sell.price, amount, ev.EventMeta)
+		// Sell NO tokens at fiftyCents (0.5), not at user's avgPrice
+		// This generates PnL when avgPrice differs from 0.5
+		updateUserPositionWithSell(state, ev.Stakeholder, sell.posID, fiftyCents, amount, ev.EventMeta)
 	}
 
 	if len(yesBuys) == 0 {
@@ -782,16 +881,23 @@ func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapt
 }
 
 func handleMarketPrepared(state *generated.State, ev *generated.NegRiskAdapterMarketPrepared) {
-	nr := &generated.NegRiskEvent{
-		ID: ev.MarketID,
+	// Only create NegRiskEvent if it doesn't exist (QuestionPrepared might have created it first)
+	_, ok := state.NegRiskEvent.Get(ev.MarketID)
+	if !ok {
+		nr := &generated.NegRiskEvent{
+			ID: ev.MarketID,
+		}
+		state.NegRiskEvent.Save(nr, ev.EventMeta)
 	}
-	state.NegRiskEvent.Save(nr, ev.EventMeta)
 }
 
 func handleQuestionPrepared(state *generated.State, ev *generated.NegRiskAdapterQuestionPrepared) {
 	nr, ok := state.NegRiskEvent.Get(ev.MarketID)
 	if !ok {
-		return
+		// Create NegRiskEvent if it doesn't exist yet (QuestionPrepared can fire before MarketPrepared)
+		nr = &generated.NegRiskEvent{
+			ID: ev.MarketID,
+		}
 	}
 
 	idx := ev.Index
@@ -832,7 +938,16 @@ func handleConditionPreparation(state *generated.State, ev *generated.Conditiona
 func handleConditionResolution(state *generated.State, ev *generated.ConditionalTokensConditionResolution) {
 	cond, ok := state.Condition.Get(ev.ConditionID)
 	if !ok {
-		return
+		outcomes := len(ev.PayoutNumerators)
+		if outcomes != 2 {
+			return
+		}
+		cond = &generated.Condition{
+			ID:               ev.ConditionID,
+			Oracle:           ev.Oracle,
+			QuestionID:       ev.QuestionID,
+			OutcomeSlotCount: uint8(outcomes),
+		}
 	}
 	cond.Resolved = true
 	cond.Payouts = ev.PayoutNumerators
@@ -880,7 +995,7 @@ func handlePayoutRedemptionNR(state *generated.State, ev *generated.NegRiskAdapt
 	for i := uint8(0); i < 2; i++ {
 		if int(i) < len(ev.Amounts) && int(i) < len(cond.Payouts) {
 			posID := getNegRiskPositionIDByCondition(ev.ConditionID, i)
-			amount := Uint256ToDecimal(ev.Amounts[i])
+			amount := Uint256ToDecimal(ev.Amounts[i]).Div(decimal.NewFromInt(1e6))
 			price := Uint256ToDecimal(cond.Payouts[i]).Div(denomDec)
 			updateUserPositionWithSell(state, ev.Redeemer, posID, price, amount, ev.EventMeta)
 		}
@@ -912,12 +1027,25 @@ func computeFpmmPriceDecimal(amounts []uint256.Int, outcomeIndex uint8) decimal.
 	if denom.IsZero() {
 		return decimal.Zero
 	}
-	return Uint256ToDecimal(amounts[1-outcomeIndex]).Div(Uint256ToDecimal(*denom))
+	// Price is calculated as ratio of amounts (both in raw outcome tokens)
+	// Since we divide amounts by 1e6 elsewhere, the ratio stays the same
+	return Uint256ToDecimal(amounts[1-outcomeIndex]).DivRound(Uint256ToDecimal(*denom), 28)
 }
 
 func uint256FromAddress(addr common.Address) uint256.Int {
+	// Match graph-ts BigInt.fromByteArray(Address): the address bytes are
+	// interpreted as signed little-endian when converted into the LP share
+	// token id, so high-bit addresses must be sign-extended.
+	src := addr.Bytes()
 	var buf [32]byte
-	copy(buf[12:], addr.Bytes())
+	if len(src) > 0 && src[len(src)-1]&0x80 != 0 {
+		for i := 0; i < len(buf)-len(src); i++ {
+			buf[i] = 0xff
+		}
+	}
+	for i := 0; i < len(src); i++ {
+		buf[len(buf)-1-i] = src[i]
+	}
 	var out uint256.Int
 	out.SetBytes(buf[:])
 	return out
@@ -926,6 +1054,9 @@ func uint256FromAddress(addr common.Address) uint256.Int {
 func updateUserPositionWithBuy(state *generated.State, user common.Address, tokenID uint256.Int, price, amount, pnlAdj decimal.Decimal, meta generated.EventMeta) {
 	if amount.IsZero() {
 		return
+	}
+	if user.Hex() == "0xf05B670C0F91F8171984db945A28D2Ad0F170cC4" || user.Hex() == "0xf05b670c0f91f8171984db945a28d2ad0f170cc4" {
+		fmt.Printf("[DEBUG BUY] block=%d token=%s amount=%s price=%s pnlAdj=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), amount.String(), price.String(), pnlAdj.String())
 	}
 	up := getUserPosition(state, user, tokenID)
 	if up == nil {
@@ -942,6 +1073,12 @@ func updateUserPositionWithBuy(state *generated.State, user common.Address, toke
 	if !pnlAdj.IsZero() {
 		up.RealizedPnL = fromDecimal(toDecimal(up.RealizedPnL).Add(pnlAdj))
 	}
+	// Amount and price are both in "human-readable" units now:
+	// - amount: in "full stake" units (divided by 1e6)
+	// - price: in USDC (0-1 range)
+	// So amount * price = USDC value directly
+	// Note: prices are stored in Decimal256 (1e18 scale), so the average price
+	// calculation works correctly
 	up.AvgPrice = fromDecimal(updateAvgPriceDecimal(toDecimal(up.AvgPrice), toDecimal(up.Amount), price, amount))
 	up.Amount = fromDecimal(toDecimal(up.Amount).Add(amount))
 	up.TotalBought = fromDecimal(toDecimal(up.TotalBought).Add(amount))
@@ -949,9 +1086,21 @@ func updateUserPositionWithBuy(state *generated.State, user common.Address, toke
 }
 
 func updateUserPositionWithSell(state *generated.State, user common.Address, tokenID uint256.Int, price, amount decimal.Decimal, meta generated.EventMeta) {
+	isTargetUser := user.Hex() == "0xf05B670C0F91F8171984db945A28D2Ad0F170cC4" || user.Hex() == "0xf05b670c0f91f8171984db945a28d2ad0f170cc4"
+	if isTargetUser {
+		fmt.Printf("[DEBUG SELL START] block=%d token=%s amount=%s price=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), amount.String(), price.String())
+	}
 	up := getUserPosition(state, user, tokenID)
 	if up == nil {
+		if isTargetUser {
+			fmt.Printf("[DEBUG SELL] position not found\n")
+		}
 		return
+	}
+
+	if isTargetUser {
+		fmt.Printf("[DEBUG SELL BEFORE] up.Amount=%s up.AvgPrice=%s up.RealizedPnL=%s\n",
+			toDecimal(up.Amount).String(), toDecimal(up.AvgPrice).String(), toDecimal(up.RealizedPnL).String())
 	}
 
 	adjAmt := amount
@@ -959,11 +1108,23 @@ func updateUserPositionWithSell(state *generated.State, user common.Address, tok
 		adjAmt = toDecimal(up.Amount)
 	}
 	if adjAmt.IsZero() {
+		if isTargetUser {
+			fmt.Printf("[DEBUG SELL] adjAmt is zero\n")
+		}
 		return
 	}
+	// PnL = amount * (price - avgPrice)
+	// toDecimal handles the 1e18 scaling, so prices are in correct USDC range
 	pnl := adjAmt.Mul(price.Sub(toDecimal(up.AvgPrice)))
-	up.RealizedPnL = fromDecimal(toDecimal(up.RealizedPnL).Add(pnl))
+	newRealizedPnL := toDecimal(up.RealizedPnL).Add(pnl)
+	up.RealizedPnL = fromDecimal(newRealizedPnL)
 	up.Amount = fromDecimal(toDecimal(up.Amount).Sub(adjAmt))
+
+	if isTargetUser {
+		fmt.Printf("[DEBUG SELL AFTER] pnl=%s newRealizedPnL=%s up.Amount=%s up.RealizedPnL=%s (scaledBig=%s)\n",
+			pnl.String(), newRealizedPnL.String(), toDecimal(up.Amount).String(), toDecimal(up.RealizedPnL).String(), up.RealizedPnL.ScaledBig().String())
+	}
+
 	state.Position.Save(up, meta)
 }
 
@@ -1003,6 +1164,27 @@ func calculatePayoutDenominator(cond *generated.Condition) (decimal.Decimal, boo
 }
 
 func Uint256ToDecimal(i uint256.Int) decimal.Decimal {
+	// Convert uint256 (raw from Solidity) to decimal for arithmetic
+	// Uses exponent 0 (raw value) - caller responsible for handling scaling
+	return decimal.NewFromBigInt(i.ToBig(), 0)
+}
+
+// WeiToDecimal converts uint256 (wei, 1e18 scale) to decimal by dividing by 1e18
+// Use this for USDC and other wei-scaled investment/collateral amounts
+func WeiToDecimal(i uint256.Int) decimal.Decimal {
+	return decimal.NewFromBigInt(i.ToBig(), -18)
+}
+
+// CollateralToDecimal converts Polymarket's USDC-scaled integer values to a
+// human decimal. The original PnL subgraph uses COLLATERAL_SCALE = 1e6.
+func CollateralToDecimal(i uint256.Int) decimal.Decimal {
+	return decimal.NewFromBigInt(i.ToBig(), -6)
+}
+
+// CTFOutcomeToDecimal converts CTF outcome token amounts to decimal (raw value)
+// CTF events use "outcome tokens" where 1 full stake = 1e6 outcome tokens
+// This returns the raw value - scaling is applied in updateUserPositionWithBuy
+func CTFOutcomeToDecimal(i uint256.Int) decimal.Decimal {
 	return decimal.NewFromBigInt(i.ToBig(), 0)
 }
 
@@ -1051,9 +1233,18 @@ func getFixedProductMarketMakerPositionID(fpmm *generated.FixedProductMarketMake
 }
 
 func getNegRiskPositionIDByCondition(conditionID common.Hash, outcome uint8) uint256.Int {
-	indexSet := new(big.Int).Lsh(big.NewInt(1), uint(outcome))
-	collID := getCollectionID(common.Hash{}, conditionID, indexSet)
-	return getPositionID(negRiskWrappedCollateral, collID)
+	key := negRiskKey{condition: conditionID, outcome: outcome}
+	if val, ok := negRiskPosCache.Load(key); ok {
+		return val
+	}
+	// Use BabyJubJub curve computation for collection ID (correct neg-risk token ID generation).
+	// computeCollectionId's Legendre-symbol loop is a 256-bit modexp, so memoizing
+	// the whole (conditionID, outcome) -> positionID chain elides the processor's
+	// most expensive primitive on the hot neg-risk event paths.
+	collID := getNegRiskCollectionID(conditionID, outcome)
+	val := getPositionID(negRiskWrappedCollateral, collID)
+	negRiskPosCache.Store(key, val)
+	return val
 }
 
 func getNegRiskFallbackQuestionID(marketID common.Hash, questionIndex uint32) common.Hash {
@@ -1094,10 +1285,6 @@ func getPositionID(collateral common.Address, collection common.Hash) uint256.In
 	var val uint256.Int
 	val.SetBytes(crypto.Keccak256(buf[:]))
 
-	if atomic.AddInt32(&positionCacheLen, 1) > maxCryptoCacheLen {
-		positionCache = xsync.NewMapOf[positionKey, uint256.Int]()
-		atomic.StoreInt32(&positionCacheLen, 1)
-	}
 	positionCache.Store(key, val)
 	return val
 }
@@ -1150,10 +1337,6 @@ func getCollectionID(parentCollectionID common.Hash, conditionID common.Hash, in
 	}
 
 	res := common.BigToHash(x1)
-	if atomic.AddInt32(&collectionCacheLen, 1) > maxCryptoCacheLen {
-		collectionCache = xsync.NewMapOf[collectionKey, common.Hash]()
-		atomic.StoreInt32(&collectionCacheLen, 1)
-	}
 	collectionCache.Store(key, res)
 	return res
 }

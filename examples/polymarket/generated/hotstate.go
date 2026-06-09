@@ -316,7 +316,7 @@ func (b *MemoryConditionBatch) Insert(ctx context.Context, conn *ch.Client, db s
 	if b.Rows() == 0 {
 		return nil
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `oracle`, `question_id`, `outcome_slot_count`, `resolved`, `payouts`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}})
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `oracle`, `question_id`, `outcome_slot_count`, `resolved`, `payouts`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}})
 }
 
 func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
@@ -797,7 +797,7 @@ func (b *MemoryUserPositionBatch) Insert(ctx context.Context, conn *ch.Client, d
 	if b.Rows() == 0 {
 		return nil
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`user`, `token_id`, `amount`, `avg_price`, `realized_pn_l`, `total_bought`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}})
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`user`, `token_id`, `amount`, `avg_price`, `realized_pn_l`, `total_bought`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}})
 }
 
 func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
@@ -1250,7 +1250,7 @@ func (b *MemoryMarketBatch) Insert(ctx context.Context, conn *ch.Client, db stri
 	if b.Rows() == 0 {
 		return nil
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}})
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}})
 }
 
 func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
@@ -1684,7 +1684,7 @@ func (b *MemoryNegRiskEventBatch) Insert(ctx context.Context, conn *ch.Client, d
 	if b.Rows() == 0 {
 		return nil
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}})
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}})
 }
 
 func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
@@ -2132,7 +2132,7 @@ func (b *MemoryFixedProductMarketMakerBatch) Insert(ctx context.Context, conn *c
 	if b.Rows() == 0 {
 		return nil
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `condition_id`, `collateral_token`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}})
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("INSERT INTO %s.%s (`id`, `condition_id`, `collateral_token`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index`) VALUES", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}})
 }
 
 func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
@@ -2763,6 +2763,7 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 		clear(s.dirtyFixedProductMarketMakers)
 		return nil
 	}
+	hadWork := len(s.dirtyConditions) > 0 || len(s.dirtyUserPositions) > 0 || len(s.dirtyMarkets) > 0 || len(s.dirtyNegRiskEvents) > 0 || len(s.dirtyFixedProductMarketMakers) > 0
 	if len(s.dirtyConditions) > 0 {
 		batch := NewMemoryConditionBatch()
 		for key := range s.dirtyConditions {
@@ -2822,6 +2823,11 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 			return err
 		}
 		clear(s.dirtyFixedProductMarketMakers)
+	}
+	if hadWork {
+		if err := conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"}); err != nil {
+			return err
+		}
 	}
 	return nil
 }

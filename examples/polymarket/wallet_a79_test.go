@@ -76,7 +76,6 @@ func TestWalletA79V1PnL(t *testing.T) {
 	}
 	flush()
 
-	million := decimal.NewFromInt(1_000_000)
 	realized := decimal.Zero
 	openValueHalf := decimal.Zero // value @ $0.50 marker
 	var n, nonzero int
@@ -92,14 +91,14 @@ func TestWalletA79V1PnL(t *testing.T) {
 		}
 		t.Logf("pos token=%s amt=%s avg=%s pnl=%s",
 			pos.TokenID.Hex()[:12],
-			toDecimal(pos.Amount).Div(million).StringFixed(4),
+			toDecimal(pos.Amount).StringFixed(4),
 			toDecimal(pos.AvgPrice).StringFixed(6),
-			toDecimal(pos.RealizedPnL).Div(million).StringFixed(4))
+			toDecimal(pos.RealizedPnL).StringFixed(4))
 		return true
 	})
 
-	pnl := realized.Div(million)
-	openVal := openValueHalf.Div(million)
+	pnl := realized
+	openVal := openValueHalf
 	t.Logf("positions=%d nonzero=%d", n, nonzero)
 	t.Logf("Realized PnL = $%s (expected -13.93)", pnl.StringFixed(4))
 	t.Logf("Open value @0.50 = $%s (expected 3.00)", openVal.StringFixed(4))

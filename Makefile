@@ -6,7 +6,7 @@ include .env
 export
 endif
 
-.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
+.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-fast dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
 
 DETECTOR_CONTAINER := $(shell docker ps --filter "publish=9003" --format "{{.Names}}" | head -n 1)
 CLICKHOUSE_CONTAINER ?= $(if $(DETECTOR_CONTAINER),$(DETECTOR_CONTAINER),$(shell docker ps --filter "name=clickhouse" --format "{{.Names}}" | head -n 1))
@@ -67,7 +67,15 @@ dev-v2: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 3664531 $(POLYMARKET_ARGS)
 
 dev-v2-live: codegen-polymarket build
-	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 2364531 $(POLYMARKET_ARGS)
+	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23364531 $(POLYMARKET_ARGS)
+
+# dev-fast: clean V2 fast-path run from block 23M. Every speed setting is now a
+# codegen/config default (V2 proto, cold cache on, 20k commit interval,
+# async-pipelined hot-state inserts drained by one SYSTEM FLUSH per commit), so
+# this is just the normal pipeline from a fresh checkpoint. --restart drops +
+# recreates the DB so it genuinely begins at block 23,000,000.
+dev-fast: codegen-polymarket build
+	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23000000 --restart $(POLYMARKET_ARGS)
 
 dev-v1: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 3664531 --no-proto $(POLYMARKET_ARGS)

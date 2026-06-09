@@ -15,10 +15,9 @@ import (
 type parsedArgs struct {
 	command      string
 	project      string
-	restart      bool
-	noColdCache  bool
-	protoMode bool
-	coldCache    bool
+	restart     bool
+	noColdCache bool
+	protoMode   bool
 	initSource   string
 	initABI      string
 	initName     string
@@ -87,8 +86,6 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.cpuprofile = args[i]
 		case "--no-proto":
 			p.protoMode = false
-		case "--cold-cache":
-			p.coldCache = true
 		case "--no-cold-cache":
 			p.noColdCache = true
 		case "-p", "--pagesize":
@@ -166,14 +163,14 @@ func Run(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
 		}
-		return runStartPipeline(p.project, p.restart, p.protoMode, p.coldCache, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.protoMode, p.coldCache, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "stop":
 		return runStop()
@@ -192,7 +189,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, p.restart, p.protoMode, p.coldCache, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 	}
 }
 
@@ -312,8 +309,7 @@ Flags:
   --pagesize, -p        (start/dev) Fixed page size range to fetch (default: 0 for dynamic)
   --no-proto            (start/dev) Use V1 legacy parsed mode instead of proto (struct-based event
                        processing with JSON decode; useful for debugging or unvalidated contracts)
-  --cold-cache          (start/dev) Force-enable Pebble cold tier (on by default)
-  --no-cold-cache       (start/dev) Disable the Pebble cold tier
+  --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default; config: cold_cache: false)
 
 Examples:
   sqd-go

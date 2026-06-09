@@ -111,15 +111,15 @@ func TestDevPolymarketSplitMergePrefetchesConditionStateFromEvents(t *testing.T)
 	if yes == nil {
 		t.Fatal("expected YES position to include order fill and split/merge updates")
 	}
-	assertDecimalEqual(t, "YES amount", yes.Amount, decimal.NewFromInt(11_500_000))
-	assertDecimalEqual(t, "YES total_bought", yes.TotalBought, decimal.NewFromInt(12_000_000))
+	assertDecimalEqual(t, "YES amount", yes.Amount, decimal.NewFromFloat(11.5))
+	assertDecimalEqual(t, "YES total_bought", yes.TotalBought, decimal.NewFromFloat(12.0))
 
 	no := state.GetUserPosition(user, noTokenID)
 	if no == nil {
 		t.Fatal("expected NO position from split/merge updates")
 	}
-	assertDecimalEqual(t, "NO amount", no.Amount, decimal.NewFromInt(1_500_000))
-	assertDecimalEqual(t, "NO total_bought", no.TotalBought, decimal.NewFromInt(2_000_000))
+	assertDecimalEqual(t, "NO amount", no.Amount, decimal.NewFromFloat(1.5))
+	assertDecimalEqual(t, "NO total_bought", no.TotalBought, decimal.NewFromFloat(2.0))
 }
 
 func newPolymarketIntegrationStore(t *testing.T, ctx context.Context) *database.Store {

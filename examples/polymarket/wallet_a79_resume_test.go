@@ -95,7 +95,6 @@ func assertA79(t *testing.T, db string) (pnl, openVal decimal.Decimal) {
 		t.Fatalf("recover positions: %v", err)
 	}
 	wallet := common.HexToAddress("0xa79af3bab636f41f1f7bd1c568857dbdf4650beb")
-	million := decimal.NewFromInt(1_000_000)
 	realized := decimal.Zero
 	openHalf := decimal.Zero
 	var n int
@@ -113,8 +112,8 @@ func assertA79(t *testing.T, db string) (pnl, openVal decimal.Decimal) {
 	if n == 0 {
 		t.Fatal("no A79 positions in ClickHouse")
 	}
-	pnl = realized.Div(million)
-	openVal = openHalf.Div(million)
+	pnl = realized
+	openVal = openHalf
 	if pnl.Sub(decimal.NewFromFloat(-13.93)).Abs().GreaterThan(decimal.NewFromFloat(0.01)) {
 		t.Errorf("realized PnL = %s, want -13.93 (data loss?)", pnl.StringFixed(4))
 	}

@@ -70,6 +70,10 @@ func TestWallet0xf05b67Positions(t *testing.T) {
 		}
 	}()
 
+	// Disable snapshots during backfill — this is historical data below the finalized
+	// head so fork-recovery snapshots are pure overhead (the dominant GC cost).
+	proc.State.SetSnapshotsEnabled(false)
+
 	// Parse and process all zstd files
 	stats, err := processDataFiles(ctx, t, proc, store, dataDir)
 	if err != nil {
@@ -415,10 +419,12 @@ func processDataFiles(ctx context.Context, t *testing.T, proc *generated.Process
 		return nil, fmt.Errorf("no zstd files found in %s", dataDir)
 	}
 
+	var ioNanos, procNanos int64
 	for _, filePath := range files {
 		baseName := filepath.Base(filePath)
 		t.Logf("processing: %s", baseName)
 
+		ioStart := time.Now()
 		compressed, err := os.ReadFile(filePath)
 		if err != nil {
 			return nil, fmt.Errorf("read file %s: %w", filePath, err)
@@ -428,9 +434,11 @@ func processDataFiles(ctx context.Context, t *testing.T, proc *generated.Process
 		if err != nil {
 			return nil, fmt.Errorf("decompress file %s: %w", filePath, err)
 		}
+		ioNanos += time.Since(ioStart).Nanoseconds()
 
 		// Parse JSONL and process each block in source order. UserPosition sell
 		// updates clamp to the current amount, so replay order is part of the state.
+		procStart := time.Now()
 		err = jsonlParser.Parse(decompressed, func(block *parser.Block) error {
 			stats.blocks++
 			stats.lastBlock = block.Header.Number
@@ -468,11 +476,16 @@ func processDataFiles(ctx context.Context, t *testing.T, proc *generated.Process
 			}
 			return nil
 		})
+		procNanos += time.Since(procStart).Nanoseconds()
 		if err != nil {
 			return nil, fmt.Errorf("parse JSONL from file %s: %w", filePath, err)
 		}
 	}
 
+	t.Logf("[TIMING] read+decompress: %.2fs | parse+process: %.2fs",
+		float64(ioNanos)/1e9, float64(procNanos)/1e9)
+	t.Logf("[TIMING] fpmm resolve: %.2fs over %d round-trips",
+		float64(fpmmResolveNanos)/1e9, fpmmResolveRoundTrips)
 	return stats, nil
 }
 

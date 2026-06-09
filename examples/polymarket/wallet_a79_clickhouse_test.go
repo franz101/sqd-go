@@ -83,7 +83,6 @@ func TestWalletA79V1ClickHouse(t *testing.T) {
 		t.Fatalf("recover positions from clickhouse: %v", err)
 	}
 
-	million := decimal.NewFromInt(1_000_000)
 	realized := decimal.Zero
 	openValueHalf := decimal.Zero
 	var n, nonzero int
@@ -100,8 +99,8 @@ func TestWalletA79V1ClickHouse(t *testing.T) {
 		return true
 	})
 
-	pnl := realized.Div(million)
-	openVal := openValueHalf.Div(million)
+	pnl := realized
+	openVal := openValueHalf
 	t.Logf("[ClickHouse] positions=%d nonzero=%d realized=$%s open=$%s",
 		n, nonzero, pnl.StringFixed(4), openVal.StringFixed(4))
 

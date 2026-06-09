@@ -46,23 +46,29 @@ RINGBUFFER" running alongside "WAIT FOR NEW SLOT → CUSTOM_PROCESSOR → INGEST
 
 ---
 
-## 1. Entry point & the `--proto-mode` flag
+## 1. Entry point & proto mode (default)
 
 - `main.go` registers the Polymarket project and calls `cli.Run` ([main.go](main.go)).
 - `sqd-go dev <project>` resolves to `runDev` → `runStartPipelineInternal`
   ([internal/cli/run.go:19](internal/cli/run.go)). This loads the project config,
   runs codegen, brings up `docker compose` (ClickHouse), and starts ingestion.
-- The `--proto-mode` flag flows through `applyOverrides` →
-  `cfg.ProtoMode` ([internal/cli/run.go:79](internal/cli/run.go)) and is also
-  pushed into a process-global via `SetProtoMode`
+- **Proto mode is on by default.** The `--no-proto` flag disables it, falling
+  back to the V1 legacy parsed mode (struct-based JSON decode). Proto mode flows
+  through `applyOverrides` → `cfg.ProtoMode`
+  ([internal/cli/run.go:79](internal/cli/run.go)) and is also pushed into a
+  process-global via `SetProtoMode`
   ([internal/cli/processor_registry.go:19](internal/cli/processor_registry.go)).
 - When the processor is constructed, it reads that global:
   `generated.NewProcessor(cli.GetProtoMode())`
   ([internal/cli/init.go:783](internal/cli/init.go)). Proto mode therefore
   selects the **columnar proto ring + zero-copy view** code path inside the
   processor rather than the legacy struct path.
-- Useful related flags: `--no-resume` (ignore saved checkpoint, start fresh),
-  `--restart`, `--start-block` / `--end-block`, `--pagesize`, `--cpuprofile`.
+- **Cold cache is on by default.** The Pebble cold tier (§6.5) is enabled
+  unless `--no-cold-cache` is passed or the config sets `cold_cache: false`.
+  `--cold-cache` force-enables it. Resolution logic: `resolveColdCache`
+  ([internal/cli/run.go:296](internal/cli/run.go)).
+- Useful related flags: `--restart` (drop DB and re-index from scratch),
+  `--start-block` / `--end-block`, `--pagesize`, `--cpuprofile`.
 
 Everything below happens inside `ingestion.Run` →
 `processChain` ([internal/ingestion/ingestion.go:70](internal/ingestion/ingestion.go),
@@ -240,7 +246,10 @@ in **CLOCK-evicted hot caches** in `state.HotState`
   per-entity **Resolver** (`Queue` the key, `Resolve` against the DB, re-`Get`),
   e.g. `UserPositionState.Get`
   ([examples/polymarket/generated/state.go:58](examples/polymarket/generated/state.go)).
-  So: **hot cache → ClickHouse on miss**, with full state durable in ClickHouse.
+  So the base path is **hot cache → ClickHouse on miss**, with full state durable
+  in ClickHouse. With the optional **cold tier** enabled the path becomes **hot
+  cache → cold tier (Pebble) → ClickHouse**, and the **V3** negative filter can
+  short-circuit a provably-new key before either — see §6.5.
 
 ### Hybrid commit cadence (durability)
 
@@ -264,6 +273,82 @@ checkpoint can be gated to it.
 > **Correctness gate:** the Wallet A79 PnL value (−$13.93 / $3.00) is the
 > end-to-end check that V2 is at parity with V1. See
 > `examples/polymarket/wallet_a79_*_test.go`.
+
+---
+
+## 6.5 Cold tier (V2) and the V3 negative-lookup filter
+
+The `hot cache → ClickHouse on miss` path above has one pathological case: a
+**from-genesis backfill**, where almost every hot miss is a brand-new key whose
+lazy `Resolve` is a ClickHouse point-SELECT (~1.9 ms) that returns *nothing*. That
+SELECT storm caps the indexer at ~500 blk/s.
+
+**V2 — Pebble cold tier** ([`internal/coldcache`](internal/coldcache/coldcache.go),
+**on by default**; disable with `--no-cold-cache`). A bounded, off-heap Pebble KV
+sits *under* the CLOCK caches and *above* ClickHouse for the pointer-free entities
+(UserPositions, FPMMs):
+
+- On CLOCK **eviction**, the victim is **spilled** to Pebble
+  ([hotstate.go `SetByKey`](examples/polymarket/generated/hotstate.go)).
+- On a hot **miss**, the entry is served from Pebble (~8 µs) and promoted back
+  ([hotstate.go `Get`](examples/polymarket/generated/hotstate.go)).
+- When the tier is opened against an **empty** ClickHouse (from-genesis /
+  `--restart`) it is **authoritative**: a hot+cold miss is *provably* new, so the
+  ClickHouse SELECT is skipped entirely (`coldAuthoritative`,
+  [state.go:67](examples/polymarket/generated/state.go)).
+
+This removes the SELECT storm and is the big V1→V2 win at the head of a backfill.
+
+**V3 — in-RAM negative-lookup filter** (opt-in via `--dev-ch-type`, implies proto + cold).
+V2 still pays *one negative Pebble `Get` per brand-new key* — and during a
+from-genesis backfill that is nearly every event. V3 puts a fixed-size **blocked
+Bloom filter** in front of Pebble
+([`internal/coldcache/filter.go`](internal/coldcache/filter.go)):
+
+- `Put` (on spill) adds the key; `Get` tests it first. If the filter says
+  **absent**, the key was never spilled, so the Pebble probe (and, when
+  authoritative, the ClickHouse SELECT) is skipped — resolved from a **single
+  64-byte cache-line test in RAM**.
+- **Correctness is structural:** keys are only ever added, so the filter has **no
+  false negatives** — "absent" is always truthful. A false positive merely falls
+  through to a correct Pebble `Get`; if the filter ever saturates it degrades to
+  V2 behaviour, never to a wrong answer. The A79 gate (−$13.93 / $3.00) holds.
+- **Blocked, not classic:** all k probes land in one cache line (one cache miss),
+  so the filter is actually faster than a hot Pebble negative `Get`. A classic
+  scattered Bloom (k random probes) is *slower* once the bitset exceeds L2 — that
+  was measured and rejected.
+- **Bounded memory:** a power-of-two bitset allocated once at startup (default
+  ~64 MiB/cache, [ingestion.go `coldNegativeFilterBits`](internal/ingestion/ingestion.go)).
+
+The CLI wires this through `ColdNegativeFilterProcessor`
+([processor.go](internal/ingestion/processor.go) →
+[hotstate.go `EnableColdNegativeFilter`](examples/polymarket/generated/hotstate.go)).
+
+### Synthetic-load result (V2 vs V3)
+
+`TestLoadV2VsV3` ([wallet_a79_loadtest_test.go](examples/polymarket/wallet_a79_loadtest_test.go))
+replays a deterministic stream of distinct-wallet `OrderFilled` logs (each a new
+UserPosition, growing the ring past its capacity so the cold tier is exercised)
+with the real A79 events sprinkled in, through V2 and V3 on separate ClickHouse
+DBs, and takes the median over alternating-order rounds so neither version gets a
+warm-cache slot advantage. Both must reproduce A79 = −$13.93 / $3.00.
+
+```bash
+LOAD_TEST=1 LOAD_TEST_BYTES=1073741824 LOAD_TEST_ROUNDS=3 \
+  go test ./examples/polymarket/ -run '^TestLoadV2VsV3$' -v -count=1 -timeout 900s
+```
+
+Representative local run (Apple silicon, 1 GiB workload, ClickHouse on :9003):
+
+| Version | Cold path | Median throughput | A79 PnL |
+|---------|-----------|------------------:|---------|
+| V2 | proto + Pebble cold tier | ~302k blk/s | −$13.9310 / $3.00 ✅ |
+| V3 | + in-RAM negative filter | ~325k blk/s (**1.07×**) | −$13.9310 / $3.00 ✅ |
+
+V3 skipped ~1.3M negative Pebble `Get`s/run at 1 GiB; the margin **grows with the
+cold-store size** (the larger Pebble gets, the more a negative `Get` costs), to
+~1.08× at 2 GiB and more across a full 26M→40M backfill where the on-disk DB far
+exceeds Pebble's block cache. Same harness covers V1→V2 (`TestLoadV1VsV2`).
 
 ---
 
@@ -334,7 +419,7 @@ processed is lost.
 
 **On startup / crash recovery** (per `ARCHITECTURE.md`): read the latest
 `sync_state` entry, treat everything above it as un-durable, and continue from
-`lastBlock + 1`. `--no-resume` ignores the saved checkpoint and starts from the
+`lastBlock + 1`. `--restart` ignores the saved checkpoint and starts from the
 configured start block. `rollbackAfterBlock` guarantees any rows beyond the
 checkpoint are truncated before reprocessing, so resume is idempotent.
 
@@ -371,6 +456,8 @@ checkpoint are truncated before reprocessing, so resume is idempotent.
 | Pointer-free CLOCK hot cache + flat int index | O(1) lookup/insert/eviction and **O(1) GC scan** of derived state |
 | Snapshots disabled during finalized backfill | removes the largest in-memory churn where reorgs are impossible |
 | Bounded ring buffers (replay + proto) | working-set memory is constant regardless of chain length |
+| Pebble cold tier + authoritative-skip (V2, §6.5) | evicted keys served from local disk, provably-new keys skip ClickHouse — kills the from-genesis SELECT storm |
+| In-RAM blocked-Bloom negative filter (V3, §6.5) | provably-new keys skip even the Pebble probe (one cache-line test); ~1.07× over V2 on the synthetic load, A79-correct |
 
 Expected order-of-magnitude wins (parser allocation, ring memory, GC scan time,
 position math, ClickHouse ingest) are tabulated in
@@ -392,5 +479,7 @@ position math, ClickHouse ingest) are tabulated in
 | Proto ring buffer | [examples/polymarket/generated/ringbuffer.go](examples/polymarket/generated/ringbuffer.go) |
 | CLOCK hot cache | [examples/polymarket/generated/hotstate.go](examples/polymarket/generated/hotstate.go) |
 | Hot/DB state + resolvers | [examples/polymarket/generated/state.go](examples/polymarket/generated/state.go) |
+| Cold tier (V2) + negative filter (V3) | [internal/coldcache/coldcache.go](internal/coldcache/coldcache.go), [internal/coldcache/filter.go](internal/coldcache/filter.go) |
+| V2/V3 synthetic load + A79 gate | [examples/polymarket/wallet_a79_loadtest_test.go](examples/polymarket/wallet_a79_loadtest_test.go) |
 | Domain logic (PnL) | [examples/polymarket/custom_processor.go](examples/polymarket/custom_processor.go) |
-| Design intent | [ARCHITECTURE.md](ARCHITECTURE.md), [ecs/V2_FLAG.md](ecs/V2_FLAG.md) |
+| Design intent | [ARCHITECTURE.md](ARCHITECTURE.md), [ecs/V2_FLAG.md](ecs/V2_FLAG.md), [COLD.md](COLD.md) |

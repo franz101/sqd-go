@@ -369,16 +369,25 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 
 func commitCustomProcessing(ctx context.Context, store Store, state *State, blockNumber uint64) error {
 	// Hybrid commit cadence. Commit when EITHER bound is hit, whichever first:
-	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 5000): the crash re-fetch budget.
+	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 20000): the crash re-fetch budget.
 	//     Bounds how many blocks a crash must re-fetch+re-process from the durable
-	//     checkpoint. Dominates during fast backfill.
+	//     checkpoint. Dominates (and binds) during fast block-bound backfill. Every
+	//     commit re-persists each hot entity touched since the previous one, so a
+	//     frequently-updated entity (e.g. an active position written on every trade)
+	//     is re-written once per commit — pure redundancy. A larger interval folds
+	//     those repeated writes into one, which is the dominant backfill cost; 20000
+	//     blocks is still only a few portal responses to re-fetch on crash (cheap),
+	//     and dirty-but-evicted entries are preserved by the cold-tier spill, so
+	//     nothing is lost between commits.
 	//   - maxInterval (SQD_COMMIT_MAX_INTERVAL, default 3s): the durability-latency
 	//     bound. Ensures the live tail (few blocks/sec) still becomes durable
 	//     promptly instead of waiting maxBlocks (which could be ~30 min of wall
-	//     clock). Dominates at the head.
+	//     clock). Dominates at the head and binds during fetch-bound backfill
+	//     (~3k blk/s, where maxBlocks worth of blocks takes >maxInterval), which is
+	//     why raising maxBlocks does not loosen the live durability guarantee.
 	// This replaces the single magic block interval: the checkpoint never leads the
 	// durable horizon, and the gap is bounded in both blocks and wall-clock time.
-	maxBlocks := uint64(5000)
+	maxBlocks := uint64(20000)
 	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
 		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
 			maxBlocks = parsed
@@ -411,6 +420,15 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 				return fmt.Errorf("invalid CLICKHOUSE_PRUNE_INTERVAL %q: %w", envVal, err)
 			}
 			pruneInterval = parsed
+		}
+		if state.LastPruneBlock == 0 {
+			// Anchor the prune baseline to the first committed block of the run so the
+			// first prune fires pruneInterval blocks later. A fresh/--restart run loads
+			// LastPruneBlock as 0; without this a high start block (e.g. 23M) trips the
+			// threshold on block 1 and runs a full OPTIMIZE/DELETE prune immediately —
+			// pointless (nothing old to prune yet) and needlessly heavy on the live
+			// connection while the first batch is still streaming.
+			state.LastPruneBlock = blockNumber
 		}
 		if blockNumber >= state.LastPruneBlock+pruneInterval {
 			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {

@@ -294,8 +294,7 @@ func findLastBlockNumber(decompressed []byte) (uint64, error) {
 	var lastBlock uint64
 	var found bool
 
-	lines := bytes.Split(decompressed, []byte("
-"))
+	lines := bytes.Split(decompressed, []byte("\n"))
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
 		if len(line) == 0 {
