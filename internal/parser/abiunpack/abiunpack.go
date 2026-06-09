@@ -5,15 +5,73 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// AppendHexBytes appends the bytes represented by s to dst.
+// It matches common.FromHex for valid event data, including optional 0x
+// prefixes and odd-length input, while allowing callers to reuse dst.
+func AppendHexBytes(dst []byte, s string) []byte {
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		s = s[2:]
+	}
+	if len(s) == 0 {
+		return dst[:0]
+	}
+	outLen := (len(s) + 1) >> 1
+	if cap(dst) < outLen {
+		dst = make([]byte, 0, outLen)
+	} else {
+		dst = dst[:0]
+	}
+	if len(s)&1 == 1 {
+		lo, ok := fromHexChar(s[0])
+		if !ok {
+			return dst
+		}
+		dst = append(dst, lo)
+		s = s[1:]
+	}
+	for i := 0; i < len(s); i += 2 {
+		hi, ok := fromHexChar(s[i])
+		if !ok {
+			return dst
+		}
+		lo, ok := fromHexChar(s[i+1])
+		if !ok {
+			return dst
+		}
+		dst = append(dst, hi<<4|lo)
+	}
+	return dst
+}
+
 // TopicBool returns the boolean value of a topic.
 func TopicBool(topic string) bool {
-	hash := common.HexToHash(topic)
+	hash := DecodeTopicHash(topic)
 	return hash[31] == 1
+}
+
+// DecodeTopicHash decodes a 32-byte indexed topic.
+func DecodeTopicHash(topic string) common.Hash {
+	var hash common.Hash
+	if decodeCanonicalTopic(topic, hash[:]) {
+		return hash
+	}
+	return common.HexToHash(topic)
+}
+
+// DecodeTopicAddress decodes an indexed address topic.
+func DecodeTopicAddress(topic string) common.Address {
+	var hash common.Hash
+	if decodeCanonicalTopic(topic, hash[:]) {
+		var address common.Address
+		copy(address[:], hash[12:])
+		return address
+	}
+	return common.HexToAddress(topic)
 }
 
 // DecodeTopicUint256 decodes a topic into a uint256.Int.
 func DecodeTopicUint256(topic string, dst *uint256.Int) {
-	hash := common.HexToHash(topic)
+	hash := DecodeTopicHash(topic)
 	dst.SetBytes32(hash[:])
 }
 
@@ -28,8 +86,45 @@ func DecodeTopicFixedBytes(topic string, dst []byte, n int) {
 	if n > 32 {
 		n = 32
 	}
-	hash := common.HexToHash(topic)
+	hash := DecodeTopicHash(topic)
 	copy(dst[:n], hash[:n])
+}
+
+func decodeCanonicalTopic(topic string, dst []byte) bool {
+	if len(dst) != common.HashLength {
+		return false
+	}
+	if len(topic) >= 2 && topic[0] == '0' && (topic[1] == 'x' || topic[1] == 'X') {
+		topic = topic[2:]
+	}
+	if len(topic) != common.HashLength*2 {
+		return false
+	}
+	for i := 0; i < common.HashLength; i++ {
+		hi, ok := fromHexChar(topic[i*2])
+		if !ok {
+			return false
+		}
+		lo, ok := fromHexChar(topic[i*2+1])
+		if !ok {
+			return false
+		}
+		dst[i] = hi<<4 | lo
+	}
+	return true
+}
+
+func fromHexChar(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 // Word returns the 32-byte word at the given word index.

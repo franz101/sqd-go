@@ -15,7 +15,12 @@ package generated
 
 import (
 	"fmt"
+	"iter"
 )
+
+// =============================================================================
+// V1: Struct-based ring buffer (legacy, high memory usage)
+// =============================================================================
 
 type EventType uint8
 
@@ -29,7 +34,7 @@ const (
 
 	buf.WriteString(`)
 
-type BlockEventsSlot struct {
+type ParsedBlock struct {
 	BlockNumber   uint64
 	BlockHash     string
 	Sequence      []uint8
@@ -42,7 +47,7 @@ type BlockEventsSlot struct {
 	buf.WriteString(`}
 
 type OrderedHistoricRingBuffer struct {
-	slots         []BlockEventsSlot
+	slots         []ParsedBlock
 	blockNumbers  []uint64
 	length        uint32
 	bitWiseLength uint32
@@ -55,9 +60,9 @@ func NewOrderedHistoricRingBuffer(size uint32) (*OrderedHistoricRingBuffer, erro
 	if size == 0 || (size&(size-1) != 0) {
 		return nil, fmt.Errorf("buffer size must be a power of two")
 	}
-	slots := make([]BlockEventsSlot, size)
+	slots := make([]ParsedBlock, size)
 	for i := range slots {
-		slots[i] = BlockEventsSlot{
+		slots[i] = ParsedBlock{
 			Sequence: make([]uint8, 0, 128),
 `)
 
@@ -75,7 +80,7 @@ func NewOrderedHistoricRingBuffer(size uint32) (*OrderedHistoricRingBuffer, erro
 	}, nil
 }
 
-func (r *OrderedHistoricRingBuffer) Push(blockNum uint64, blockHash string, logs []DecodedLog) {
+func (r *OrderedHistoricRingBuffer) NextSlot(blockNum uint64, blockHash string) *ParsedBlock {
 	targetIdx := r.headIndex & r.bitWiseLength
 	slot := &r.slots[targetIdx]
 
@@ -83,16 +88,34 @@ func (r *OrderedHistoricRingBuffer) Push(blockNum uint64, blockHash string, logs
 	slot.BlockHash = blockHash
 	slot.Sequence = slot.Sequence[:0]
 
+	r.resetSlotSlices(slot)
+
+	r.blockNumbers[targetIdx] = blockNum
+	r.headIndex = (r.headIndex + 1) & r.bitWiseLength
+	if r.count < r.length {
+		r.count++
+	} else {
+		r.tailIndex = (r.tailIndex + 1) & r.bitWiseLength
+	}
+	return slot
+}
+
+func (r *OrderedHistoricRingBuffer) resetSlotSlices(slot *ParsedBlock) {
+	_ = slot
 `)
 
 	for _, ev := range events {
 		buf.WriteString(fmt.Sprintf("\tslot.%ss = slot.%ss[:0]\n", ev.GoTypeName, ev.GoTypeName))
 	}
 
-	buf.WriteString(`
+	buf.WriteString(`}
+
+func (r *OrderedHistoricRingBuffer) Push(blockNum uint64, blockHash string, logs []DecodedLog) {
+	slot := r.NextSlot(blockNum, blockHash)
+
 	for _, log := range logs {
 		switch ev := log.Value.(type) {
-`)
+		`)
 
 	for _, ev := range events {
 		buf.WriteString(fmt.Sprintf(`		case *%s:
@@ -103,21 +126,13 @@ func (r *OrderedHistoricRingBuffer) Push(blockNum uint64, blockHash string, logs
 
 	buf.WriteString(`		}
 	}
-
-	r.blockNumbers[targetIdx] = blockNum
-	r.headIndex = (r.headIndex + 1) & r.bitWiseLength
-	if r.count < r.length {
-		r.count++
-	} else {
-		r.tailIndex = (r.tailIndex + 1) & r.bitWiseLength
-	}
 }
 
 func (r *OrderedHistoricRingBuffer) GetBlockNumber(idx uint32) uint64 {
 	return r.blockNumbers[idx&r.bitWiseLength]
 }
 
-func (r *OrderedHistoricRingBuffer) GetBlockEvents(blockNum uint64) (*BlockEventsSlot, bool) {
+func (r *OrderedHistoricRingBuffer) GetParsedBlock(blockNum uint64) (*ParsedBlock, bool) {
 	curr := r.tailIndex
 	for i := uint32(0); i < r.count; i++ {
 		slotIdx := curr & r.bitWiseLength
@@ -129,44 +144,173 @@ func (r *OrderedHistoricRingBuffer) GetBlockEvents(blockNum uint64) (*BlockEvent
 	return nil, false
 }
 
-func (slot *BlockEventsSlot) Reconstruct(
+// Reset resets the ring buffer to empty state.
+func (r *OrderedHistoricRingBuffer) Reset() {
+	r.headIndex = 0
+	r.tailIndex = 0
+	r.count = 0
+	for i := range r.blockNumbers {
+		r.blockNumbers[i] = 0
+	}
+}
+
+
+func (b *ParsedBlock) EventsIter() iter.Seq[Event] {
+	return func(yield func(Event) bool) {
+		var (
 `)
 
 	for _, ev := range events {
-		buf.WriteString(fmt.Sprintf("\ton%s func(*%s) error,\n", ev.GoTypeName, ev.GoTypeName))
+		buf.WriteString(fmt.Sprintf("\t\t\t%sIdx int\n", ev.GoTypeName))
 	}
 
-	buf.WriteString(`) error {
+	buf.WriteString(`		)
+
+		for _, typ := range b.Sequence {
+			var ev Event
+			switch EventType(typ) {
 `)
 
 	for _, ev := range events {
-		buf.WriteString(fmt.Sprintf("\tvar %sIdx int\n", ev.GoTypeName))
+		buf.WriteString(fmt.Sprintf(`			case EventType%s:
+				ev = &b.%ss[%sIdx]
+				%sIdx++
+`, ev.GoTypeName, ev.GoTypeName, ev.GoTypeName, ev.GoTypeName))
 	}
 
-	buf.WriteString(`
-	for _, typ := range slot.Sequence {
-		switch EventType(typ) {
-`)
+	buf.WriteString(`			}
 
-	for _, ev := range events {
-		buf.WriteString(fmt.Sprintf(`		case EventType%s:
-			ev := &slot.%ss[%sIdx]
-			if err := on%s(ev); err != nil {
-				return err
+			if ev != nil {
+				if !yield(ev) {
+					return
+				}
 			}
-			%sIdx++
-`, ev.GoTypeName, ev.GoTypeName, ev.GoTypeName, ev.GoTypeName, ev.GoTypeName))
+		}
 	}
-
-	buf.WriteString(`		}
-	}
-	return nil
 }
 `)
 
 	formatted, err := format.Source(buf.Bytes())
 	if err != nil {
 		return buf.Bytes(), fmt.Errorf("format source: %w", err)
+	}
+
+	// Append proto ring buffer
+	protoRingCode, err := generateProtoRingBuffer(events)
+	if err != nil {
+		return formatted, fmt.Errorf("proto ring buffer: %w", err)
+	}
+
+	// Combine both files
+	result := fmt.Sprintf("%s\n\n%s", string(formatted), string(protoRingCode))
+
+	return []byte(result), nil
+}
+
+// generateProtoRingBuffer generates the V2 proto ring buffer
+// This stores events in columnar proto format, reducing memory by ~50x
+func generateProtoRingBuffer(events []eventSpec) ([]byte, error) {
+	var buf bytes.Buffer
+
+	buf.WriteString(`
+// =============================================================================
+// V2: Proto ring buffer (columnar storage, ~50x memory reduction)
+// =============================================================================
+
+// ProtoRingBuffer stores parsed events in columnar proto format.
+// This is the ClickHouse-native storage format with ~50x less memory than struct slices.
+type ProtoRingBuffer struct {
+	slots         []*ProtoEventBlock
+	blockNumbers  []uint64
+	length        uint32
+	bitWiseLength uint32
+	headIndex     uint32
+	tailIndex     uint32
+	count         uint32
+}
+
+// NewProtoRingBuffer creates a new proto ring buffer with power-of-two size.
+func NewProtoRingBuffer(size uint32) (*ProtoRingBuffer, error) {
+	if size == 0 || (size&(size-1) != 0) {
+		return nil, fmt.Errorf("buffer size must be a power of two")
+	}
+	slots := make([]*ProtoEventBlock, size)
+	for i := range slots {
+		slots[i] = NewProtoEventBlock()
+	}
+	return &ProtoRingBuffer{
+		slots:         slots,
+		blockNumbers:  make([]uint64, size),
+		length:        size,
+		bitWiseLength: size - 1,
+	}, nil
+}
+
+// NextProtoSlot returns a proto slot for the given block number.
+// The slot is reset before return.
+func (r *ProtoRingBuffer) NextProtoSlot(blockNum uint64, blockHash string) *ProtoEventBlock {
+	targetIdx := r.headIndex & r.bitWiseLength
+	slot := r.slots[targetIdx]
+
+	slot.Reset()
+	slot.HeaderBlockNumber = blockNum
+	slot.HeaderBlockHash = blockHash
+
+	r.blockNumbers[targetIdx] = blockNum
+	r.headIndex = (r.headIndex + 1) & r.bitWiseLength
+	if r.count < r.length {
+		r.count++
+	} else {
+		r.tailIndex = (r.tailIndex + 1) & r.bitWiseLength
+	}
+	return slot
+}
+
+// Push stores decoded logs for a block in the next proto slot.
+func (r *ProtoRingBuffer) Push(blockNum uint64, blockHash string, logs []DecodedLog) {
+	slot := r.NextProtoSlot(blockNum, blockHash)
+	for _, log := range logs {
+		slot.AppendDecodedLog(log)
+	}
+}
+
+// GetProtoBlockNumber returns the block number at the given index.
+func (r *ProtoRingBuffer) GetProtoBlockNumber(idx uint32) uint64 {
+	return r.blockNumbers[idx&r.bitWiseLength]
+}
+
+// GetProtoEventBlock returns the proto event block for the given block number.
+func (r *ProtoRingBuffer) GetProtoEventBlock(blockNum uint64) (*ProtoEventBlock, bool) {
+	curr := r.tailIndex
+	for i := uint32(0); i < r.count; i++ {
+		slotIdx := curr & r.bitWiseLength
+		if r.blockNumbers[slotIdx] == blockNum {
+			return r.slots[slotIdx], true
+		}
+		curr = (curr + 1) & r.bitWiseLength
+	}
+	return nil, false
+}
+
+// Len returns the number of blocks currently in the buffer.
+func (r *ProtoRingBuffer) Len() int {
+	return int(r.count)
+}
+
+// Reset resets the ring buffer to empty state.
+func (r *ProtoRingBuffer) Reset() {
+	r.headIndex = 0
+	r.tailIndex = 0
+	r.count = 0
+	for i := range r.blockNumbers {
+		r.blockNumbers[i] = 0
+	}
+}
+`)
+
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		return buf.Bytes(), fmt.Errorf("format proto ring buffer: %w", err)
 	}
 	return formatted, nil
 }

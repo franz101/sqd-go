@@ -16,6 +16,8 @@ type parsedArgs struct {
 	command      string
 	project      string
 	restart      bool
+	noColdCache  bool
+	protoMode bool
 	initSource   string
 	initABI      string
 	initName     string
@@ -24,16 +26,21 @@ type parsedArgs struct {
 	initStartBlk string
 	initEndBlk   string
 	cpuprofile   string
+	pageSize     string
 }
 
 func parseArgs(args []string) (*parsedArgs, error) {
-	p := &parsedArgs{}
+	p := &parsedArgs{
+		protoMode: true,
+	}
 	positional := make([]string, 0, len(args))
 
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
 		case "-r", "--restart":
+			p.restart = true
+		case "--no-resume":
 			p.restart = true
 		case "-a", "--abi":
 			i++
@@ -77,6 +84,16 @@ func parseArgs(args []string) (*parsedArgs, error) {
 				return nil, fmt.Errorf("--cpuprofile requires a value")
 			}
 			p.cpuprofile = args[i]
+		case "--no-proto":
+			p.protoMode = false
+		case "--no-cold-cache":
+			p.noColdCache = true
+		case "-p", "--pagesize":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--pagesize requires a value")
+			}
+			p.pageSize = args[i]
 		default:
 			if !strings.HasPrefix(a, "-") {
 				positional = append(positional, a)
@@ -146,14 +163,14 @@ func Run(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
 		}
-		return runStartPipeline(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 
 	case "stop":
 		return runStop()
@@ -172,7 +189,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, false, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
 	}
 }
 
@@ -289,6 +306,10 @@ Flags:
   --blockchain, -b      (init/start) Chain ID or name (default: 1)
   --start-block, -s     (init/start) Start block (default: 0)
   --end-block, -e       (start) End block (0 for infinite)
+  --pagesize, -p        (start/dev) Fixed page size range to fetch (default: 0 for dynamic)
+  --no-proto            (start/dev) Use V1 legacy parsed mode instead of proto (struct-based event
+                       processing with JSON decode; useful for debugging or unvalidated contracts)
+  --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default)
 
 Examples:
   sqd-go
@@ -296,6 +317,7 @@ Examples:
   sqd-go codegen examples/uniswap
   sqd-go start examples/uniswap
   sqd-go start examples/uniswap --blockchain polygon --start-block 80000000 --restart
+  sqd-go start examples/uniswap --restart
   sqd-go dev examples/uniswap --restart
   sqd-go stop
   sqd-go init contract-import local --abi erc20.json --name USDC --address 0xA0...

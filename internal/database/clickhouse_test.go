@@ -114,6 +114,50 @@ func TestFixedStringHexRoundTripMatchesCanonicalString(t *testing.T) {
 	}
 }
 
+func BenchmarkFixedStringValueColumnAppendAddressString(b *testing.B) {
+	address := common.HexToAddress("0x8236a87084f8B84306f72007F36F2618A5634494").Hex()
+	col := newFixedStringValueColumn("address", common.AddressLength)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		col.col.Reset()
+		col.append(address)
+	}
+}
+
+func BenchmarkFixedStringValueColumnAppendHashString(b *testing.B) {
+	hash := common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").Hex()
+	col := newFixedStringValueColumn("hash", common.HashLength)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		col.col.Reset()
+		col.append(hash)
+	}
+}
+
+func BenchmarkFixedStringValueColumnAppendAddressRaw(b *testing.B) {
+	address := common.HexToAddress("0x8236a87084f8B84306f72007F36F2618A5634494")
+	col := newFixedStringValueColumn("address", common.AddressLength)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		col.col.Reset()
+		col.append(address)
+	}
+}
+
+func BenchmarkFixedStringValueColumnAppendHashRaw(b *testing.B) {
+	hash := common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+	col := newFixedStringValueColumn("hash", common.HashLength)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		col.col.Reset()
+		col.append(hash)
+	}
+}
+
 func TestStringValueColumnAppend(t *testing.T) {
 	col := &stringValueColumn{name: "params"}
 
@@ -170,5 +214,17 @@ func TestSplitSQLStatements(t *testing.T) {
 
 	if statements[2] != "SELECT * FROM test_db.table1" {
 		t.Errorf("statement 2 mismatch, got %q", statements[2])
+	}
+}
+
+func TestRewriteSQLDatabase(t *testing.T) {
+	raw := "CREATE DATABASE IF NOT EXISTS `source_db`; CREATE TABLE IF NOT EXISTS `source_db`.`table1` (id UInt64);"
+	got := rewriteSQLDatabase(raw, "source_db", "target_db")
+
+	if strings.Contains(got, "`source_db`") {
+		t.Fatalf("old database name still present: %s", got)
+	}
+	if !strings.Contains(got, "`target_db`.`table1`") {
+		t.Fatalf("target database name missing: %s", got)
 	}
 }

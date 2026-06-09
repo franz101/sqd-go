@@ -17,11 +17,13 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// Store wraps a ClickHouse native-protocol connection and the target database name.
 type Store struct {
 	conn *ch.Client
 	db   string
 }
 
+// BlockRow is a single row in the blocks table, used during fork tracking.
 type BlockRow struct {
 	ChainID        uint64
 	BlockNumber    uint64
@@ -29,11 +31,13 @@ type BlockRow struct {
 	BlockHash      string
 }
 
+// TypedEventTable describes a ClickHouse table generated from an ABI event.
 type TypedEventTable struct {
 	Name string
 	Args []TypedEventArg
 }
 
+// TypedEventArg maps one ABI event parameter to its ClickHouse column.
 type TypedEventArg struct {
 	Name           string
 	ColumnName     string
@@ -41,17 +45,28 @@ type TypedEventArg struct {
 	ClickHouseType string
 }
 
+// SyncCursor records a block number and hash for checkpoint persistence.
 type SyncCursor struct {
 	Number uint64 `json:"number"`
 	Hash   string `json:"hash"`
 }
 
+// SyncState is the persisted ingestion checkpoint: current head, finalized
+// block, and any rollback chain from fork recovery.
 type SyncState struct {
 	Current       SyncCursor
 	Finalized     *SyncCursor
 	RollbackChain []SyncCursor
 }
 
+// EnsureTablesOptions controls which optional tables are created during schema setup.
+type EnsureTablesOptions struct {
+	StoreBlocks bool
+	StoreLogs   bool
+}
+
+// NewClickHouse connects to ClickHouse via the native protocol, creates the
+// target database if it doesn't exist, and returns a Store.
 func NewClickHouse(ctx context.Context, host string, port int, user, password, db string) (*Store, error) {
 	conn, err := ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
@@ -69,6 +84,7 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 	return &Store{conn: conn, db: db}, nil
 }
 
+// DropClickHouseDatabase drops the named database (used by --restart).
 func DropClickHouseDatabase(ctx context.Context, host string, port int, user, password, db string) error {
 	conn, err := ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
@@ -88,10 +104,16 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Conn() *ch.Client {
+	if s == nil {
+		return nil
+	}
 	return s.conn
 }
 
 func (s *Store) DB() string {
+	if s == nil {
+		return ""
+	}
 	return s.db
 }
 
@@ -103,7 +125,11 @@ func (s *Store) EnsureTablesWithCollapsing(ctx context.Context, collapsing bool)
 	return s.EnsureTablesWithCollapsingAndOmit(ctx, collapsing, false)
 }
 
-func (s *Store) EnsureTablesWithCollapsingAndOmit(ctx context.Context, collapsing bool, omitLogs bool) error {
+func (s *Store) EnsureTablesWithCollapsingAndOmit(ctx context.Context, collapsing bool, storeLogs bool) error {
+	return s.EnsureTablesWithOptions(ctx, collapsing, EnsureTablesOptions{StoreBlocks: true, StoreLogs: storeLogs})
+}
+
+func (s *Store) EnsureTablesWithOptions(ctx context.Context, collapsing bool, opts EnsureTablesOptions) error {
 	db := quoteIdent(s.db)
 	engine := "MergeTree()"
 	signColumn := ""
@@ -111,17 +137,19 @@ func (s *Store) EnsureTablesWithCollapsingAndOmit(ctx context.Context, collapsin
 		engine = "CollapsingMergeTree(sign)"
 		signColumn = "sign Int8 DEFAULT 1,"
 	}
-	blocksDDL := fmt.Sprintf(`
+	if opts.StoreBlocks {
+		blocksDDL := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s.blocks (
 			chain_id UInt64, block_number UInt64,
 			block_timestamp DateTime64(3, 'UTC'), block_hash String,
 			%s
 			inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
 		) ENGINE = %s ORDER BY (chain_id, block_number)`, db, signColumn, engine)
-	if err := s.conn.Do(ctx, ch.Query{Body: blocksDDL}); err != nil {
-		return fmt.Errorf("create blocks: %w", err)
+		if err := s.conn.Do(ctx, ch.Query{Body: blocksDDL}); err != nil {
+			return fmt.Errorf("create blocks: %w", err)
+		}
 	}
-	if !omitLogs {
+	if opts.StoreLogs {
 		logsDDL := fmt.Sprintf(`
 			CREATE TABLE IF NOT EXISTS %s.logs (
 				chain_id UInt64, block_number UInt64,
@@ -150,11 +178,20 @@ func (s *Store) EnsureTablesWithCollapsingAndOmit(ctx context.Context, collapsin
 }
 
 func (s *Store) ApplySQLFile(ctx context.Context, path string) error {
+	return s.applySQLFile(ctx, path, "")
+}
+
+func (s *Store) ApplySQLFileWithDatabase(ctx context.Context, path, sourceDB string) error {
+	return s.applySQLFile(ctx, path, sourceDB)
+}
+
+func (s *Store) applySQLFile(ctx context.Context, path, sourceDB string) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	for _, stmt := range splitSQLStatements(string(raw)) {
+	sql := rewriteSQLDatabase(string(raw), sourceDB, s.db)
+	for _, stmt := range splitSQLStatements(sql) {
 		if err := s.conn.Do(ctx, ch.Query{Body: stmt}); err != nil {
 			return fmt.Errorf("%s: %w", firstSQLLine(stmt), err)
 		}
@@ -162,6 +199,14 @@ func (s *Store) ApplySQLFile(ctx context.Context, path string) error {
 	return nil
 }
 
+func rewriteSQLDatabase(sql, sourceDB, targetDB string) string {
+	if sourceDB == "" || targetDB == "" || sourceDB == targetDB {
+		return sql
+	}
+	return strings.ReplaceAll(sql, quoteIdent(sourceDB), quoteIdent(targetDB))
+}
+
+// Inserter batches block-level rows (blocks + raw logs) for native-protocol insertion.
 type Inserter struct {
 	store *Store
 
@@ -225,6 +270,10 @@ func (in *Inserter) InsertBlocks(ctx context.Context, blocks []BlockRow) error {
 			{Name: "chain_id", Data: &in.blockChain}, {Name: "block_number", Data: &in.blockNum},
 			{Name: "block_timestamp", Data: &in.blockTime}, {Name: "block_hash", Data: &in.blockHash},
 		},
+		Settings: []ch.Setting{
+			{Key: "async_insert", Value: "1", Important: true},
+			{Key: "wait_for_async_insert", Value: "0", Important: true},
+		},
 	})
 }
 
@@ -249,6 +298,10 @@ func (in *Inserter) InsertLogs(ctx context.Context, events []parser.DecodedEvent
 	return in.store.conn.Do(ctx, ch.Query{
 		Body:  fmt.Sprintf("INSERT INTO %s.logs (chain_id, block_number, block_timestamp, block_hash, transaction_hash, transaction_index, log_index, address, event_name, topic0, params) VALUES", quoteIdent(in.store.db)),
 		Input: cols,
+		Settings: []ch.Setting{
+			{Key: "async_insert", Value: "1", Important: true},
+			{Key: "wait_for_async_insert", Value: "0", Important: true},
+		},
 		OnInput: func(ctx context.Context) error {
 			in.colChain.Reset()
 			in.colBlock.Reset()
@@ -361,6 +414,7 @@ func (s *Store) NewTypedInserter(table TypedEventTable) *TypedInserter {
 	return in
 }
 
+// TypedInserter batches rows for a single typed event table (one per ABI event).
 type TypedInserter struct {
 	store *Store
 	table TypedEventTable
@@ -391,6 +445,10 @@ func (in *TypedInserter) Insert(ctx context.Context, events []parser.DecodedEven
 	return in.store.conn.Do(ctx, ch.Query{
 		Body:  in.query,
 		Input: in.inputCols,
+		Settings: []ch.Setting{
+			{Key: "async_insert", Value: "1", Important: true},
+			{Key: "wait_for_async_insert", Value: "0", Important: true},
+		},
 		OnInput: func(ctx context.Context) error {
 			in.colChain.Reset()
 			in.colBlock.Reset()
@@ -455,7 +513,7 @@ func (c *fixedStringValueColumn) input() proto.InputColumn {
 }
 
 func (c *fixedStringValueColumn) append(v any) {
-	c.col.Append(fixedStringBytes(v, c.size))
+	appendFixedStringValue(&c.col, v, c.size)
 }
 
 func (c *fixedStringValueColumn) reset() {
@@ -463,17 +521,60 @@ func (c *fixedStringValueColumn) reset() {
 }
 
 func fixedStringBytes(v any, size int) []byte {
+	var col proto.ColFixedStr
+	col.SetSize(size)
+	appendFixedStringValue(&col, v, size)
+	return col.Row(0)
+}
+
+func appendFixedStringValue(col *proto.ColFixedStr, v any, size int) {
 	if size == common.AddressLength {
-		if raw, ok := rawBytes(v); ok {
-			return common.BytesToAddress(raw).Bytes()
+		switch t := v.(type) {
+		case common.Address:
+			appendFixedBytes(col, t[:])
+			return
+		case string:
+			if appendCanonicalHexFixed(col, t, size) {
+				return
+			}
+			addr := common.HexToAddress(t)
+			appendFixedBytes(col, addr[:])
+			return
+		case []byte:
+			appendLeftPaddedFixed(col, t, size)
+			return
 		}
-		return common.HexToAddress(fmt.Sprint(v)).Bytes()
+		s := fmt.Sprint(v)
+		if appendCanonicalHexFixed(col, s, size) {
+			return
+		}
+		addr := common.HexToAddress(s)
+		appendFixedBytes(col, addr[:])
+		return
 	}
 	if size == common.HashLength {
-		if raw, ok := rawBytes(v); ok {
-			return common.BytesToHash(raw).Bytes()
+		switch t := v.(type) {
+		case common.Hash:
+			appendFixedBytes(col, t[:])
+			return
+		case string:
+			if appendCanonicalHexFixed(col, t, size) {
+				return
+			}
+			hash := common.HexToHash(t)
+			appendFixedBytes(col, hash[:])
+			return
+		case []byte:
+			appendLeftPaddedFixed(col, t, size)
+			return
 		}
-		return common.HexToHash(fmt.Sprint(v)).Bytes()
+		s := fmt.Sprint(v)
+		if appendCanonicalHexFixed(col, s, size) {
+			return
+		}
+		hash := common.HexToHash(s)
+		appendFixedBytes(col, hash[:])
+		return
 	}
 
 	raw, ok := rawBytes(v)
@@ -481,11 +582,77 @@ func fixedStringBytes(v any, size int) []byte {
 		raw = common.FromHex(fmt.Sprint(v))
 	}
 	if len(raw) == size {
-		return raw
+		appendFixedBytes(col, raw)
+		return
+	}
+	var scratch [64]byte
+	if size <= len(scratch) {
+		buf := scratch[:size]
+		copy(buf, raw)
+		appendFixedBytes(col, buf)
+		return
 	}
 	padded := make([]byte, size)
 	copy(padded, raw)
-	return padded
+	appendFixedBytes(col, padded)
+}
+
+func appendCanonicalHexFixed(col *proto.ColFixedStr, s string, size int) bool {
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		s = s[2:]
+	}
+	if len(s) != size*2 {
+		return false
+	}
+	var scratch [common.HashLength]byte
+	dst := scratch[:size]
+	for i := 0; i < size; i++ {
+		hi, ok := fromHexChar(s[i*2])
+		if !ok {
+			return false
+		}
+		lo, ok := fromHexChar(s[i*2+1])
+		if !ok {
+			return false
+		}
+		dst[i] = hi<<4 | lo
+	}
+	appendFixedBytes(col, dst)
+	return true
+}
+
+func appendLeftPaddedFixed(col *proto.ColFixedStr, raw []byte, size int) {
+	var scratch [common.HashLength]byte
+	dst := scratch[:size]
+	if len(raw) >= size {
+		copy(dst, raw[len(raw)-size:])
+	} else {
+		copy(dst[size-len(raw):], raw)
+	}
+	appendFixedBytes(col, dst)
+}
+
+func appendFixedBytes(col *proto.ColFixedStr, b []byte) {
+	if col.Size == 0 {
+		col.Size = len(b)
+	}
+	if len(b) != col.Size {
+		panic("invalid size")
+	}
+	col.Buf = append(col.Buf, b...)
+}
+
+func fromHexChar(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 func rawBytes(v any) ([]byte, bool) {
@@ -638,6 +805,15 @@ func (s *Store) SaveSyncState(ctx context.Context, chainID uint64, state SyncSta
 	})
 }
 
+// FlushAsyncInserts forces all server-side async-insert buffers to flush to
+// storage, making prior async (wait_for_async_insert=0) inserts durable. Called
+// before advancing the durable checkpoint so event rows for blocks <= checkpoint
+// are guaranteed persisted (no gap on crash). Cheap because the checkpoint only
+// advances at the commit cadence.
+func (s *Store) FlushAsyncInserts(ctx context.Context) error {
+	return s.conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
+}
+
 func (s *Store) TruncateSyncState(ctx context.Context, chainID, lastBlock uint64) error {
 	db := quoteIdent(s.db)
 	q := fmt.Sprintf("DELETE FROM %s.sync_state WHERE chain_id = %d AND last_block < %d SETTINGS lightweight_deletes_sync = 1", db, chainID, lastBlock)
@@ -649,17 +825,22 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 	if err != nil {
 		return err
 	}
+	start := time.Now()
+	rollbackSQL := rollbackSQLLoggingEnabled()
 	for _, table := range tables {
 		where := fmt.Sprintf("block_number > %d", lastBlock)
 		if table.HasChainID {
 			where = fmt.Sprintf("chain_id = %d AND %s", chainID, where)
 		}
 		q := fmt.Sprintf("DELETE FROM %s.%s WHERE %s SETTINGS lightweight_deletes_sync = 1", quoteIdent(s.db), quoteIdent(table.Name), where)
-		log.Printf("[ROLLBACK] Truncating table '%s' for blocks > %d (query: DELETE FROM %s.%s WHERE %s)", table.Name, lastBlock, quoteIdent(s.db), quoteIdent(table.Name), where)
+		if rollbackSQL {
+			log.Printf("[ROLLBACK] delete table %q for blocks > %d: %s", table.Name, lastBlock, q)
+		}
 		if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("rollback %s: %w", table.Name, err)
 		}
 	}
+	log.Printf("[ROLLBACK] issued lightweight delete for %d table(s) with blocks > %d in %s", len(tables), lastBlock, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -668,6 +849,10 @@ func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint6
 	if err != nil {
 		return err
 	}
+	start := time.Now()
+	rollbackSQL := rollbackSQLLoggingEnabled()
+	signFlipped := 0
+	deleted := 0
 	for _, table := range tables {
 		if !table.HasSign {
 			where := fmt.Sprintf("block_number > %d", lastBlock)
@@ -675,10 +860,13 @@ func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint6
 				where = fmt.Sprintf("chain_id = %d AND %s", chainID, where)
 			}
 			q := fmt.Sprintf("DELETE FROM %s.%s WHERE %s SETTINGS lightweight_deletes_sync = 1", quoteIdent(s.db), quoteIdent(table.Name), where)
-			log.Printf("[ROLLBACK] Truncating non-collapsing table '%s' for blocks > %d (query: %s)", table.Name, lastBlock, q)
+			if rollbackSQL {
+				log.Printf("[ROLLBACK] delete non-collapsing table %q for blocks > %d: %s", table.Name, lastBlock, q)
+			}
 			if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
 				return fmt.Errorf("rollback %s: %w", table.Name, err)
 			}
+			deleted++
 			continue
 		}
 		columns, err := s.tableColumns(ctx, table.Name)
@@ -705,12 +893,25 @@ func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint6
 			quoteIdent(s.db), quoteIdent(table.Name), strings.Join(quotedColumns, ", "),
 			strings.Join(selectExprs, ", "), quoteIdent(s.db), quoteIdent(table.Name), where,
 		)
-		log.Printf("[ROLLBACK] Collapsing table '%s' by inserting sign-flipped rows for blocks > %d (query: %s)", table.Name, lastBlock, q)
+		if rollbackSQL {
+			log.Printf("[ROLLBACK] sign-flip collapsing table %q for blocks > %d: %s", table.Name, lastBlock, q)
+		}
 		if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("collapse rollback %s: %w", table.Name, err)
 		}
+		signFlipped++
 	}
+	log.Printf("[ROLLBACK] issued rollback for %d table(s) with blocks > %d in %s (%d sign-flip, %d lightweight delete)", len(tables), lastBlock, time.Since(start).Round(time.Millisecond), signFlipped, deleted)
 	return nil
+}
+
+func rollbackSQLLoggingEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SQD_LOG_ROLLBACK_SQL"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 type blockNumberTable struct {
@@ -852,6 +1053,14 @@ func (s *Store) LastBlock(ctx context.Context, chainID uint64) (uint64, bool, er
 }
 
 func (s *Store) lastBlockFromBlocks(ctx context.Context, chainID uint64) (uint64, bool, error) {
+	exists, err := s.tableExists(ctx, "blocks")
+	if err != nil {
+		return 0, false, err
+	}
+	if !exists {
+		return 0, false, nil
+	}
+
 	var last proto.ColUInt64
 	var count proto.ColUInt64
 	if err := s.conn.Do(ctx, ch.Query{
@@ -870,6 +1079,20 @@ func (s *Store) lastBlockFromBlocks(ctx context.Context, chainID uint64) (uint64
 		return 0, false, nil
 	}
 	return last.Row(0), true, nil
+}
+
+func (s *Store) tableExists(ctx context.Context, tableName string) (bool, error) {
+	var count proto.ColUInt64
+	if err := s.conn.Do(ctx, ch.Query{
+		Body: fmt.Sprintf(
+			"SELECT count() AS count FROM system.tables WHERE database = %s AND name = %s",
+			quoteString(s.db), quoteString(tableName),
+		),
+		Result: proto.Results{{Name: "count", Data: &count}},
+	}); err != nil {
+		return false, fmt.Errorf("check table %s: %w", tableName, err)
+	}
+	return count.Rows() > 0 && count.Row(0) > 0, nil
 }
 
 func quoteIdent(name string) string {

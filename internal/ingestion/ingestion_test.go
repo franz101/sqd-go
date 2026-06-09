@@ -1,15 +1,23 @@
 package ingestion
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/franz101/sqd-go/internal/client"
+	"github.com/franz101/sqd-go/internal/config"
+	"github.com/franz101/sqd-go/internal/parser"
+	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
 
-func TestNextRequestRangeCursorOmitsToBlockWithLocalEnd(t *testing.T) {
+func TestNextRequestRangeCursorCapsToLocalEnd(t *testing.T) {
 	end := uint64(20)
 
 	toBlock, label, ok := nextRequestRange(10, 0, &end, true)
@@ -17,11 +25,37 @@ func TestNextRequestRangeCursorOmitsToBlockWithLocalEnd(t *testing.T) {
 	if !ok {
 		t.Fatal("range should be fetchable")
 	}
-	if toBlock != nil {
-		t.Fatalf("cursor request toBlock = %d, want nil", *toBlock)
+	if toBlock == nil || *toBlock != 20 {
+		t.Fatalf("cursor request toBlock = %v, want 20", toBlock)
 	}
-	if label != "[10-tail]" {
-		t.Fatalf("label = %q, want [10-tail]", label)
+	if label != "[10-20]" {
+		t.Fatalf("label = %q, want [10-20]", label)
+	}
+}
+
+func TestNextProducerRequestRangeAdaptiveCursorCapsToLocalEnd(t *testing.T) {
+	end := uint64(6259530)
+
+	toBlock, label, ok := nextProducerRequestRange(6254531, 0, 5000, 0, &end, true)
+
+	if !ok {
+		t.Fatal("range should be fetchable")
+	}
+	if toBlock == nil || *toBlock != 6259530 {
+		t.Fatalf("adaptive cursor toBlock = %v, want 6259530", toBlock)
+	}
+	if label != "[6254531-6259530]" {
+		t.Fatalf("label = %q, want [6254531-6259530]", label)
+	}
+}
+
+func TestNextProducerRequestRangeStopsPastLocalEnd(t *testing.T) {
+	end := uint64(6259530)
+
+	_, _, ok := nextProducerRequestRange(6259531, 0, 5000, 10000000, &end, true)
+
+	if ok {
+		t.Fatal("range past local end should stop")
 	}
 }
 
@@ -91,4 +125,114 @@ func TestEmptyCursorCheckpointIgnoresFinalizedHeadBeforeCurrentBlock(t *testing.
 	if ok {
 		t.Fatalf("checkpoint = %d, want no checkpoint", checkpoint)
 	}
+}
+
+func TestPrintProfilePrintsWithoutParseIterations(t *testing.T) {
+	var buf bytes.Buffer
+	oldOutput := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldOutput)
+		log.SetFlags(oldFlags)
+	}()
+
+	var before, after runtime.MemStats
+	printProfile(10*time.Millisecond, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, time.Now().Add(-time.Second), before, after)
+
+	got := buf.String()
+	if !strings.Contains(got, "PROFILE") {
+		t.Fatalf("profile output missing header:\n%s", got)
+	}
+	if !strings.Contains(got, "0 iterations") {
+		t.Fatalf("profile output missing zero-iteration parse line:\n%s", got)
+	}
+}
+
+func TestFastJSONLParserRetainedStringsSurviveParserReuse(t *testing.T) {
+	p := parser.NewFastJSONLParser(2)
+
+	firstRaw := []byte(`{"header":{"number":1,"hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timestamp":1},"logs":[{"address":"0x1111111111111111111111111111111111111111","transactionHash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","transactionIndex":1,"logIndex":2,"topics":["0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],"data":"0x01"}]}` + "\n")
+	var retained parser.Block
+	if err := p.Parse(firstRaw, func(block *parser.Block) error {
+		retained.Header = block.Header
+		retained.Logs = append(retained.Logs[:0], block.Logs...)
+		retained.Logs[0].Topics = append([]string(nil), block.Logs[0].Topics...)
+		return nil
+	}); err != nil {
+		t.Fatalf("parse first JSONL: %v", err)
+	}
+
+	secondRaw := []byte(`{"header":{"number":2,"hash":"0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","timestamp":2},"logs":[{"address":"0x2222222222222222222222222222222222222222","transactionHash":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","transactionIndex":3,"logIndex":4,"topics":["0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"data":"0x02"}]}` + "\n")
+	if err := p.Parse(secondRaw, func(block *parser.Block) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("parse second JSONL: %v", err)
+	}
+
+	if retained.Header.Hash != "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("retained hash changed after parser reuse: %s", retained.Header.Hash)
+	}
+	if retained.Logs[0].Address != "0x1111111111111111111111111111111111111111" {
+		t.Fatalf("retained address changed after parser reuse: %s", retained.Logs[0].Address)
+	}
+	if retained.Logs[0].Data != "0x01" {
+		t.Fatalf("retained data changed after parser reuse: %s", retained.Logs[0].Data)
+	}
+	if retained.Logs[0].Topics[0] != "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" {
+		t.Fatalf("retained topic changed after parser reuse: %s", retained.Logs[0].Topics[0])
+	}
+}
+
+func TestIngestionDecodeScratchDoesNotCorruptSecondLogData(t *testing.T) {
+	contracts := []config.ChainContractConfig{{
+		Name:    "Scratch",
+		Address: config.Address{"0x1111111111111111111111111111111111111111"},
+		Events:  []config.EventConfig{{Event: "Value(uint256 value)"}},
+	}}
+	decoders, filters, err := parser.BuildEventDecoder(contracts)
+	if err != nil {
+		t.Fatalf("build decoder: %v", err)
+	}
+	topic0 := filters[0].Topic0[0]
+	raw := []byte(`{"header":{"number":100,"hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timestamp":1},"logs":[` +
+		`{"address":"0x1111111111111111111111111111111111111111","transactionHash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","transactionIndex":0,"logIndex":0,"topics":["` + topic0 + `"],"data":"` + abiWordHex(1) + `"},` +
+		`{"address":"0x1111111111111111111111111111111111111111","transactionHash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","transactionIndex":0,"logIndex":1,"topics":["` + topic0 + `"],"data":"` + abiWordHex(2) + `"}` +
+		`]}` + "\n")
+
+	var values []string
+	var dataScratch []byte
+	p := parser.NewFastJSONLParser(2)
+	if err := p.ParseWithLine(raw, func(block *parser.Block, rawLine []byte) error {
+		for _, lg := range block.Logs {
+			def, ok := decoders[abiunpack.DecodeTopicHash(lg.Topics[0])]
+			if !ok {
+				t.Fatalf("missing decoder for topic %s", lg.Topics[0])
+			}
+			dataScratch = abiunpack.AppendHexBytes(dataScratch, lg.Data)
+			ev, err := def.Decode(lg.Address, lg.Topics, dataScratch)
+			if err != nil {
+				t.Fatalf("decode log %d: %v", lg.LogIndex, err)
+			}
+			values = append(values, ev.Params["value"].(string))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+
+	if len(values) != 2 {
+		t.Fatalf("decoded values = %v, want two values", values)
+	}
+	if values[0] != "1" || values[1] != "2" {
+		t.Fatalf("decoded values = %v, want [1 2]", values)
+	}
+	if len(dataScratch) != 32 {
+		t.Fatalf("dataScratch length = %d, want one ABI word", len(dataScratch))
+	}
+}
+
+func abiWordHex(v uint64) string {
+	return "0x" + strings.Repeat("0", 64-len(strconv.FormatUint(v, 16))) + strconv.FormatUint(v, 16)
 }

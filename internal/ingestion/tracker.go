@@ -5,6 +5,7 @@ import (
 	"github.com/franz101/sqd-go/internal/config"
 )
 
+// ForkTracker tracks block ancestry and detects chain reorganizations.
 type ForkTracker interface {
 	Init(current, finalized *client.BlockRef, rollbackChain []client.BlockRef)
 	Head() *client.BlockRef
@@ -15,6 +16,7 @@ type ForkTracker interface {
 	RecentUnfinalizedBlocks() []client.BlockRef
 }
 
+// NewForkTracker returns a ring-buffer-backed fork tracker.
 func NewForkTracker(_ config.ForkMode) ForkTracker {
 	return &ringBufferTracker{BlockRingBuffer: NewBlockRingBuffer()}
 }

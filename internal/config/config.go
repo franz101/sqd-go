@@ -19,11 +19,16 @@ type Config struct {
 	Chains          []Chain                `yaml:"chains" json:"chains"`
 	RollbackOnReorg *bool                  `yaml:"rollback_on_reorg,omitempty" json:"rollback_on_reorg,omitempty"`
 	RawEvents       *bool                  `yaml:"raw_events,omitempty" json:"raw_events,omitempty"`
-	OmitRawLogs     *bool                  `yaml:"omit_raw_logs,omitempty" json:"omit_raw_logs,omitempty"`
+	StoreBlocks     *bool                  `yaml:"store_blocks,omitempty" json:"store_blocks,omitempty"`
+	StoreRawLogs    *bool                  `yaml:"store_raw_logs,omitempty" json:"store_raw_logs,omitempty"`
+	ProtoMode       *bool                  `yaml:"proto_mode,omitempty" json:"proto_mode,omitempty"`
+	ColdCache       *bool                  `yaml:"cold_cache,omitempty" json:"cold_cache,omitempty"`
 	IncludeMetadata []string               `yaml:"include_metadata,omitempty" json:"include_metadata,omitempty"`
 	ExcludeMetadata []map[string]string    `yaml:"exclude_metadata,omitempty" json:"exclude_metadata,omitempty"`
+	State           []StateConfig          `yaml:"state,omitempty" json:"state,omitempty"`
 }
 
+// ForkMode selects the fork-recovery strategy for the ingestion pipeline.
 type ForkMode string
 
 const (
@@ -56,18 +61,30 @@ func (m ForkMode) Valid() bool {
 	}
 }
 
+// GlobalContractConfig defines a contract and its events at the top level,
+// shared across all chains.
 type GlobalContractConfig struct {
 	Name        string        `yaml:"name" json:"name"`
 	ABIFilePath *string       `yaml:"abi_file_path,omitempty" json:"abi_file_path,omitempty"`
 	Events      []EventConfig `yaml:"events" json:"events"`
 }
 
+// EventConfig is one ABI event to index, with optional field omissions.
 type EventConfig struct {
 	Event string   `yaml:"event" json:"event"`
 	Name  *string  `yaml:"name,omitempty" json:"name,omitempty"`
 	Omit  []string `yaml:"omit,omitempty" json:"omit,omitempty"`
 }
 
+// StateConfig declares a hot-state entity backed by a ClickHouse table.
+type StateConfig struct {
+	Name        string   `yaml:"name" json:"name"`
+	SourceTable string   `yaml:"source_table" json:"source_table"`
+	Key         []string `yaml:"key,omitempty" json:"key,omitempty"`
+	Mode        string   `yaml:"mode,omitempty" json:"mode,omitempty"`
+}
+
+// Chain is one EVM chain to index, with a start block and per-chain contracts.
 type Chain struct {
 	ID         uint64                `yaml:"id" json:"id"`
 	StartBlock uint64                `yaml:"start_block" json:"start_block"`
@@ -75,12 +92,14 @@ type Chain struct {
 	Contracts  []ChainContractConfig `yaml:"contracts,omitempty" json:"contracts,omitempty"`
 }
 
+// ChainContractConfig overrides a global contract for a specific chain.
 type ChainContractConfig struct {
 	Name    string        `yaml:"name" json:"name"`
 	Address Address       `yaml:"address,omitempty" json:"address,omitempty"`
 	Events  []EventConfig `yaml:"events,omitempty" json:"events,omitempty"`
 }
 
+// Address is one or more hex contract addresses (YAML accepts a single string or a list).
 type Address []string
 
 func (a *Address) UnmarshalYAML(value *yaml.Node) error {
@@ -97,12 +116,15 @@ func (a *Address) UnmarshalYAML(value *yaml.Node) error {
 	return fmt.Errorf("line %d: address must be a string or a list of strings", value.Line)
 }
 
+// Project is a loaded project: the parsed config plus the resolved root directory.
 type Project struct {
 	Root       string
 	ConfigPath string
 	Config     *Config
 }
 
+// LoadProject loads, parses, and validates a project from the given path
+// (directory or config file).
 func LoadProject(path string) (*Project, error) {
 	root, configPath, err := ResolveProjectPath(path)
 	if err != nil {
@@ -118,6 +140,8 @@ func LoadProject(path string) (*Project, error) {
 	return &Project{Root: root, ConfigPath: configPath, Config: cfg}, nil
 }
 
+// ResolveProjectPath returns (root dir, config file path) from a user-supplied
+// path that may be a directory or a direct config file reference.
 func ResolveProjectPath(path string) (string, string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", "", fmt.Errorf("project path is required")
@@ -138,6 +162,7 @@ func ResolveProjectPath(path string) (string, string, error) {
 	return filepath.Dir(path), path, nil
 }
 
+// LoadFile reads and parses a YAML config file with strict field validation.
 func LoadFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -198,6 +223,7 @@ func parseEventName(sig string) string {
 	return strings.TrimSpace(sig[:open])
 }
 
+// Validate checks that the config has a name, valid fork mode, and at least one chain.
 func Validate(cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
@@ -232,14 +258,32 @@ func Validate(cfg *Config) error {
 			}
 		}
 	}
+	for i, state := range cfg.State {
+		if strings.TrimSpace(state.Name) == "" {
+			return fmt.Errorf("state[%d].name is required", i)
+		}
+		mode := strings.TrimSpace(strings.ToLower(state.Mode))
+		switch mode {
+		case "", "db_prefetch", "hotstate":
+		default:
+			return fmt.Errorf("state[%d].mode must be db_prefetch or hotstate", i)
+		}
+	}
 	return nil
 }
 
-func (cfg *Config) ShouldOmitRawLogs() bool {
-	if cfg == nil || cfg.OmitRawLogs == nil {
+func (cfg *Config) ShouldStoreRawLogs() bool {
+	if cfg == nil || cfg.StoreRawLogs == nil {
 		return false
 	}
-	return *cfg.OmitRawLogs
+	return *cfg.StoreRawLogs
+}
+
+func (cfg *Config) ShouldStoreBlocks() bool {
+	if cfg == nil || cfg.StoreBlocks == nil {
+		return false
+	}
+	return *cfg.StoreBlocks
 }
 
 func (cfg *Config) MetadataIncluded(field string) bool {

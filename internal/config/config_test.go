@@ -134,6 +134,23 @@ func TestForkModeUsesCollapsingMergeTree(t *testing.T) {
 	}
 }
 
+func TestStoreBlocksDefaultsToFalse(t *testing.T) {
+	cfg := &Config{}
+
+	if cfg.ShouldStoreBlocks() {
+		t.Fatal("store_blocks should default to false")
+	}
+}
+
+func TestStoreBlocksCanBeEnabled(t *testing.T) {
+	enabled := true
+	cfg := &Config{StoreBlocks: &enabled}
+
+	if !cfg.ShouldStoreBlocks() {
+		t.Fatal("store_blocks=true should enable block ledger storage")
+	}
+}
+
 func TestConfigParsesRollbackOnReorgAndAliases(t *testing.T) {
 	yamlConfig := []byte(`name: test_aliases
 fork: sqd
@@ -160,5 +177,38 @@ chains:
 	err = Validate(&cfg)
 	if err != nil {
 		t.Fatalf("Validate failed for valid alias: %v", err)
+	}
+}
+
+func TestConfigParsesStateTables(t *testing.T) {
+	yamlConfig := []byte(`name: market_fixture
+state:
+  - name: condition_cache
+    source_table: market_condition_preparation_events
+    key:
+      - conditionId
+    mode: db_prefetch
+chains:
+  - id: 137
+`)
+
+	var cfg Config
+	err := yaml.Unmarshal(yamlConfig, &cfg)
+	if err != nil {
+		t.Fatalf("failed to parse state config: %v", err)
+	}
+
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("Validate failed for state config: %v", err)
+	}
+	if len(cfg.State) != 1 {
+		t.Fatalf("state entries = %d, want 1", len(cfg.State))
+	}
+	state := cfg.State[0]
+	if state.Name != "condition_cache" || state.SourceTable != "market_condition_preparation_events" || state.Mode != "db_prefetch" {
+		t.Fatalf("unexpected state config: %#v", state)
+	}
+	if len(state.Key) != 1 || state.Key[0] != "conditionId" {
+		t.Fatalf("unexpected state key: %#v", state.Key)
 	}
 }

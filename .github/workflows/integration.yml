@@ -1,0 +1,70 @@
+name: Integration Test
+
+on:
+  push:
+    branches: [main, update-internal]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:latest
+        ports:
+          - 9000:9000
+          - 8123:8123
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: sqd-clickhouse
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        options: >-
+          --health-cmd "clickhouse-client --password sqd-clickhouse -q 'SELECT 1'"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build
+        run: go build -o tmp/sqd-go .
+
+      - name: Unit tests
+        run: go test $(go list ./... | grep -v 'examples/polymarket' | grep -v 'internal/coldcache') -count=1 -timeout 60s
+
+      - name: Init from ABI (contract-import)
+        run: |
+          ./tmp/sqd-go init contract-import local \
+            --abi examples/erc20.json \
+            --name USDC \
+            --blockchain ethereum \
+            --start-block 6082465 \
+            --address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+          test -f usdc/config.yaml || (echo "config.yaml not created" && exit 1)
+          test -f usdc/.env || (echo ".env not created" && exit 1)
+          test -f usdc/compose.yml || (echo "compose.yml not created" && exit 1)
+          echo "init contract-import: OK"
+
+      - name: Codegen from init project
+        run: |
+          ./tmp/sqd-go codegen usdc/
+          test -f usdc/generated/events.go || (echo "events.go not generated" && exit 1)
+          test -f usdc/generated/schema.go || (echo "schema.go not generated" && exit 1)
+          echo "codegen: OK"
+
+      - name: Integration test (15s indexing)
+        env:
+          CLICKHOUSE_HOST: 127.0.0.1
+          CLICKHOUSE_NATIVE_PORT: "9000"
+          CLICKHOUSE_HTTP_PORT: "8123"
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: sqd-clickhouse
+        run: |
+          go test -v -run TestIntegrationIndexSmallRange -count=1 -timeout 30s ./internal/ingestion/

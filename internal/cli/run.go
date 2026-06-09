@@ -9,20 +9,25 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
+	"strconv"
+	"syscall"
 
 	"github.com/franz101/sqd-go/internal/codegen"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string) int {
+// runDev loads the project, runs codegen, starts docker compose, then runs the
+// ingestion pipeline. On exit it tears down docker compose. Use this for local
+// development where ClickHouse is managed by compose.
+func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return 1
 	}
-	applyOverrides(project.Config, startBlockStr, endBlockStr, chainIDStr)
+	applyOverrides(project.Config, protoMode, startBlockStr, endBlockStr, chainIDStr)
 	loadEnv(filepath.Join(project.Root, ".env"))
 	outPath, err := codegen.GenerateProject(project)
 	if err != nil {
@@ -51,16 +56,19 @@ func runDev(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, c
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, outPath, cpuprofile)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr)
 }
 
-func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string) int {
+// runStartPipeline loads the project, runs codegen, then starts ingestion.
+// Unlike runDev it does not manage docker compose — the user is responsible for
+// running ClickHouse externally.
+func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return 1
 	}
-	applyOverrides(project.Config, startBlockStr, endBlockStr, chainIDStr)
+	applyOverrides(project.Config, protoMode, startBlockStr, endBlockStr, chainIDStr)
 	loadEnv(filepath.Join(project.Root, ".env"))
 	outPath, err := codegen.GenerateProject(project)
 	if err != nil {
@@ -69,10 +77,14 @@ func runStartPipeline(path string, restart bool, startBlockStr, endBlockStr, cha
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, outPath, cpuprofile)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr)
 }
 
-func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr string) {
+func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
+	if protoMode {
+		cfg.ProtoMode = &protoMode
+	}
+
 	if chainIDStr != "" {
 		id, err := chainIDFromName(chainIDStr)
 		if err == nil {
@@ -82,7 +94,7 @@ func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr s
 		}
 	}
 	if startBlockStr != "" {
-		start, err := parseUintFlag("--start-block", startBlockStr, 0)
+		start, err := strconv.ParseUint(startBlockStr, 10, 64)
 		if err == nil {
 			for i := range cfg.Chains {
 				cfg.Chains[i].StartBlock = start
@@ -90,23 +102,30 @@ func applyOverrides(cfg *config.Config, startBlockStr, endBlockStr, chainIDStr s
 		}
 	}
 	if endBlockStr != "" {
-		end, err := parseUintFlag("--end-block", endBlockStr, 0)
+		end, err := strconv.ParseUint(endBlockStr, 10, 64)
 		if err == nil {
-			if end == 0 {
-				for i := range cfg.Chains {
-					cfg.Chains[i].EndBlock = nil
-				}
-			} else {
-				for i := range cfg.Chains {
-					cfg.Chains[i].EndBlock = &end
-				}
+			for i := range cfg.Chains {
+				cfg.Chains[i].EndBlock = &end
 			}
 		}
 	}
 }
 
-func runStartPipelineInternal(project *config.Project, path string, restart bool, outPath, cpuprofile string) int {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+// runStartPipelineInternal is the shared core of runDev and runStartPipeline.
+// It configures the ingestion options (ClickHouse connection, page size, cold
+// cache), resolves the custom processor, and calls ingestion.Run.
+//
+// V1 (parsed mode) is still accessible via --no-proto. When proto mode is off,
+// the pipeline falls back to the legacy JSON-decoded path with struct-based
+// event processing. This is useful for debugging or when proto support has not
+// been validated for a new contract.
+func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string) int {
+	if protoMode {
+		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
+	}
+	SetProtoMode(protoMode)
+	SetV3Mode(false)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if cpuprofile != "" {
@@ -115,8 +134,26 @@ func runStartPipelineInternal(project *config.Project, path string, restart bool
 			fmt.Fprintf(os.Stderr, "create cpu profile: %v\n", err)
 			return 1
 		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			fmt.Fprintf(os.Stderr, "start cpu profile: %v\n", err)
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			if err := f.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "close cpu profile: %v\n", err)
+				return
+			}
+			log.Printf("cpu profile written: %s", cpuprofile)
+		}()
+	}
+
+	var pageSize uint64 = 0
+	if pageSizeStr != "" {
+		if val, err := parseUintFlag("--pagesize", pageSizeStr, 0); err == nil {
+			pageSize = val
+		}
 	}
 
 	opts := ingestion.Options{
@@ -124,13 +161,23 @@ func runStartPipelineInternal(project *config.Project, path string, restart bool
 		ClickHousePort:     envOrDefaultInt("CLICKHOUSE_NATIVE_PORT", 9000),
 		ClickHouseUser:     envOrDefault("CLICKHOUSE_USER", "default"),
 		ClickHousePassword: envOrDefault("CLICKHOUSE_PASSWORD", "sqd-clickhouse"),
-		ClickHouseDatabase: project.Config.Name,
+		ClickHouseDatabase: envOrDefault("CLICKHOUSE_DATABASE", project.Config.Name),
 		Restart:            restart,
 		GeneratedSQLDir:    filepath.Dir(outPath),
 		CursorMode:         true,
+		PageSize:           pageSize,
+		ColdCache: resolveColdCache(noColdCache, project.Config.ColdCache),
 	}
-
-	log.Printf("starting ingestion for %s", project.Config.Name)
+	if opts.ColdCache {
+		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")
+	}
+	processor, err := processorForProject(project.Config.Name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "custom processor: %v\n", err)
+		return 1
+	}
+	opts.Processor = processor
+	log.Printf("starting ingestion for %s (pageSize=%d)", project.Config.Name, pageSize)
 	if err := ingestion.Run(ctx, project.Config, opts); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "ingestion error: %v\n", err)
 		return 1
@@ -230,6 +277,19 @@ func runInitContractImport(p *parsedArgs) int {
 	}
 	fmt.Printf("initialized %s (%d events)\n", configPath, len(events))
 	return 0
+}
+
+// resolveColdCache determines whether the cold cache should be enabled. The
+// cold cache is ON by default. It is disabled when --no-cold-cache is passed or
+// when the config explicitly sets cold_cache: false.
+func resolveColdCache(flagOff bool, configVal *bool) bool {
+	if flagOff {
+		return false
+	}
+	if configVal != nil {
+		return *configVal
+	}
+	return true
 }
 
 func findComposeFile(root string) string {

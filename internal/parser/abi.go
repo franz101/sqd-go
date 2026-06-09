@@ -101,7 +101,7 @@ func (e *EventDef) Decode(address string, topics []string, data []byte) (*Decode
 		if i+1 >= len(topics) {
 			break
 		}
-		val, err := decodeIndexedTopic(common.HexToHash(topics[i+1]), arg.Type)
+		val, err := decodeIndexedTopic(topics[i+1], arg.Type)
 		if err != nil {
 			return nil, fmt.Errorf("decode indexed %q: %w", arg.Name, err)
 		}
@@ -192,19 +192,20 @@ func (e *EventDef) EventName() string {
 	return e.eventName
 }
 
-func decodeIndexedTopic(topic common.Hash, t abi.Type) (any, error) {
+func decodeIndexedTopic(topic string, t abi.Type) (any, error) {
 	switch t.T {
 	case abi.AddressTy:
-		return common.BytesToAddress(topic.Bytes()).Hex(), nil
+		return abiunpack.DecodeTopicAddress(topic), nil
 	case abi.BoolTy:
-		return topic[31] == 1, nil
+		return abiunpack.TopicBool(topic), nil
 	case abi.BytesTy, abi.FixedBytesTy, abi.HashTy, abi.StringTy, abi.SliceTy, abi.ArrayTy:
-		return topic.Hex(), nil
+		return abiunpack.DecodeTopicHash(topic), nil
 	case abi.UintTy, abi.IntTy:
-		n := new(uint256.Int).SetBytes(topic.Bytes())
+		n := new(uint256.Int)
+		abiunpack.DecodeTopicUint256(topic, n)
 		return n, nil
 	default:
-		return topic.Hex(), nil
+		return abiunpack.DecodeTopicHash(topic), nil
 	}
 }
 
@@ -299,9 +300,9 @@ func normalizeParamValue(v any) any {
 	case uint256.Int:
 		return t.Dec()
 	case common.Address:
-		return t.Hex()
+		return t
 	case common.Hash:
-		return t.Hex()
+		return t
 	case []byte:
 		return "0x" + hex.EncodeToString(t)
 
@@ -355,17 +356,9 @@ func normalizeParamValue(v any) any {
 
 	// Slices of other EVM types
 	case []common.Address:
-		out := make([]string, len(t))
-		for i, x := range t {
-			out[i] = x.Hex()
-		}
-		return out
+		return t
 	case []common.Hash:
-		out := make([]string, len(t))
-		for i, x := range t {
-			out[i] = x.Hex()
-		}
-		return out
+		return t
 	case []string:
 		return t
 	case []bool:
@@ -410,12 +403,12 @@ func normalizeParamValue(v any) any {
 		if t == nil {
 			return nil
 		}
-		return t.Hex()
+		return *t
 	case *common.Hash:
 		if t == nil {
 			return nil
 		}
-		return t.Hex()
+		return *t
 	}
 
 	// Rare fallback using reflect for arbitrary/custom/nested types (e.g. tuples)

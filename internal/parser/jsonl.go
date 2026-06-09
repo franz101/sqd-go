@@ -3,7 +3,6 @@ package parser
 import (
 	"bytes"
 	"fmt"
-	"unsafe"
 
 	"github.com/valyala/fastjson"
 )
@@ -19,6 +18,12 @@ type Header struct {
 	Timestamp uint64
 }
 
+// Log is a decoded log view valid only for the duration of the onBlock
+// callback. The parser reuses the Block, its Logs slice, and each Log's
+// Topics backing array across blocks to minimize allocations. Consumers that
+// RETAIN a log beyond the callback MUST deep-copy Topics (the strings are
+// freshly allocated, but the []string backing array is reused). Address/
+// TransactionHash/Data are fresh strings and safe to keep.
 type Log struct {
 	Address          string
 	TransactionHash  string
@@ -42,6 +47,12 @@ func NewFastJSONLParser(logCapacity int) *FastJSONLParser {
 }
 
 func (p *FastJSONLParser) Parse(data []byte, onBlock func(*Block) error) error {
+	return p.ParseWithLine(data, func(block *Block, _ []byte) error {
+		return onBlock(block)
+	})
+}
+
+func (p *FastJSONLParser) ParseWithLine(data []byte, onBlock func(*Block, []byte) error) error {
 	for len(data) > 0 {
 		lineData := data
 		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
@@ -85,7 +96,7 @@ func (p *FastJSONLParser) Parse(data []byte, onBlock func(*Block) error) error {
 				lg.Topics[j] = bytesToString(t.GetStringBytes())
 			}
 		}
-		if err := onBlock(&p.block); err != nil {
+		if err := onBlock(&p.block, lineData); err != nil {
 			return err
 		}
 	}
@@ -93,5 +104,5 @@ func (p *FastJSONLParser) Parse(data []byte, onBlock func(*Block) error) error {
 }
 
 func bytesToString(b []byte) string {
-	return unsafe.String(unsafe.SliceData(b), len(b))
+	return string(b)
 }
