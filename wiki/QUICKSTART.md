@@ -122,8 +122,7 @@ See [Custom Schema](CUSTOM_SCHEMA.md) and [Custom Processor](CUSTOM_PROCESSOR.md
 --end-block <n>       Stop at this block (0 = infinite)
 --blockchain <name>   Override chain (ethereum, polygon, or numeric ID)
 --no-proto            Use V1 legacy parsed mode
---cold-cache          Force-enable Pebble cold tier
---no-cold-cache       Disable Pebble cold tier
+--no-cold-cache       Disable Pebble cold tier (on by default)
 --pagesize <n>        Fixed fetch page size (0 = adaptive)
 --cpuprofile <file>   Write CPU profile
 ```
