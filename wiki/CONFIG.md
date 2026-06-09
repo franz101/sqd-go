@@ -6,16 +6,10 @@ The `config.yaml` file defines what your indexer tracks: which chain, which cont
 
 ```yaml
 # Required. Used as ClickHouse database name and processor lookup key.
-name: my-indexer
+name: uniswap_v2
 
 # Optional. Only "evm" is supported.
 ecosystem: evm
-
-# Optional. Fork recovery strategy: "default" | "sqd" | "ringbuffer"
-# default = CollapsingMergeTree (natural fork handling via ClickHouse)
-# sqd = SQD's HTTP 409 fork recovery protocol
-# ringbuffer = in-memory ring buffer replay
-fork: default
 
 # Optional. Store raw log hex data in a separate table.
 store_raw_logs: false
@@ -36,29 +30,29 @@ include_metadata:
 exclude_metadata:
   - OrderFilled: orderhash
 
-# Optional. Hot state table declarations for custom schema entities.
+# Optional. Hot state declarations for custom schema entities.
+# Links a custom_schema.go struct to the hot state system for in-memory
+# caching, ClickHouse persistence, and snapshot-based fork recovery.
 state:
-  - name: Position
-    source_table: memory_user_positions
-    key:
+  - name: Position                      # must match struct name minus "Schema" suffix
+    source_table: memory_user_positions  # ClickHouse table name (default: auto from struct name)
+    key:                                 # primary key fields used for Get() lookups and ClickHouse ORDER BY
       - User
       - TokenID
-    mode: hotstate
 
 # Required. At least one chain.
 chains:
-  - id: 137
-    start_block: 33605403
-    end_block: 40000000     # optional, omit for infinite
+  - id: 1                               # 1 = Ethereum, 137 = Polygon
+    start_block: 10000835                # Uniswap V2 Router deploy block
     contracts:
-      - name: MyContract
-        address: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+      - name: UniswapV2Router
+        address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
         events:
-          - event: Transfer(address indexed from, address indexed to, uint256 value)
-          - event: Approval(address indexed owner, address indexed spender, uint256 value)
-            name: CustomName        # optional rename
-            omit:                   # optional field exclusions
-              - spender
+          - event: Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)
+      - name: UniswapV2Factory
+        address: "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+        events:
+          - event: PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)
 ```
 
 ## Fields
@@ -69,7 +63,6 @@ chains:
 |-------|------|----------|---------|-------------|
 | `name` | string | yes | -- | Project name. Becomes the ClickHouse database name. |
 | `ecosystem` | string | no | `"evm"` | Only `"evm"` supported. |
-| `fork` | string | no | `"default"` | Fork recovery mode. |
 | `store_raw_logs` | bool | no | `false` | Create a `raw_logs` table with hex-encoded log data. |
 | `store_blocks` | bool | no | `false` | Create a `blocks` table with block headers. |
 | `include_metadata` | string[] | no | `[]` | Extra metadata columns on event tables. |
@@ -107,8 +100,7 @@ chains:
 |-------|------|----------|---------|-------------|
 | `name` | string | yes | -- | Entity name matching `custom_schema.go` struct (minus `Schema` suffix). |
 | `source_table` | string | no | auto | Override the ClickHouse table name. Default is pluralized snake_case of name. |
-| `key` | string[] | no | auto | Primary key field(s) for prefetch queries. |
-| `mode` | string | no | `"hotstate"` | `"hotstate"` or `"db_prefetch"`. |
+| `key` | string[] | no | auto | Primary key for this entity. Used for `Get()` lookups, ClickHouse `ORDER BY`, and prefetch queries. Must match the `// pk:` comment on your schema struct. |
 
 ## Event Signature Format
 
@@ -127,12 +119,13 @@ The `indexed` keyword must appear for indexed parameters. Parameter names are re
 Single address:
 
 ```yaml
-address: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
 ```
 
-Multiple addresses (indexed by the same contract):
+Multiple addresses (same contract ABI deployed at multiple addresses):
 
 ```yaml
+# Polymarket CLOB Exchange + NegRisk Exchange share the same OrderFilled event
 address:
   - "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
   - "0xC5d563A36AE78145C45a50134d48A1215220f80a"
@@ -141,28 +134,20 @@ address:
 No address (factory pattern -- index events from any address matching the topic0):
 
 ```yaml
-- name: FixedProductMarketMaker
+# Uniswap V2 pairs are deployed dynamically by the factory
+- name: UniswapV2Pair
   events:
-    - event: FPMMBuy(address indexed buyer, uint256 investmentAmount, ...)
+    - event: Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)
+    - event: Sync(uint112 reserve0, uint112 reserve1)
 ```
-
-## State Modes
-
-### `hotstate`
-
-In-memory CLOCK cache with periodic ClickHouse persistence. Best for entities that are read and written frequently (positions, balances). Supports snapshot-based fork recovery.
-
-### `db_prefetch`
-
-Query ClickHouse before each block's processing. No in-memory cache. Best for entities that are rarely updated but need to be read occasionally.
 
 ## Minimal Example
 
 ```yaml
-name: usdc-transfers
+name: usdc_transfers
 chains:
   - id: 1
-    start_block: 21000000
+    start_block: 6082465
     contracts:
       - name: USDC
         address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -170,7 +155,7 @@ chains:
           - event: Transfer(address indexed from, address indexed to, uint256 value)
 ```
 
-## Multi-Contract Example (Polymarket)
+## Multi-Contract Example (Polymarket on Polygon)
 
 ```yaml
 name: polymarket
@@ -182,22 +167,19 @@ exclude_metadata:
 state:
   - name: Condition
     source_table: memory_conditions
-    key:
+    key:                          # primary key: single field
       - ID
-    mode: hotstate
   - name: Position
     source_table: memory_user_positions
-    key:
+    key:                          # composite primary key: two fields
       - User
       - TokenID
-    mode: hotstate
   - name: NegRiskEvent
     source_table: memory_neg_risk_events
     key:
       - ID
-    mode: hotstate
 chains:
-  - id: 137
+  - id: 137                      # Polygon
     start_block: 33605403
     contracts:
       - name: ConditionalTokens
@@ -230,7 +212,7 @@ chains:
 CLI flags override config values:
 
 ```bash
-sqd-go start my-project/ \
+sqd-go start examples/polymarket/ \
   --blockchain polygon \
   --start-block 80000000 \
   --end-block 80001000 \
@@ -240,5 +222,5 @@ sqd-go start my-project/ \
 Override via environment:
 
 ```bash
-CLICKHOUSE_DATABASE=my_custom_db sqd-go start my-project/
+CLICKHOUSE_DATABASE=polymarket_dev sqd-go start examples/polymarket/
 ```

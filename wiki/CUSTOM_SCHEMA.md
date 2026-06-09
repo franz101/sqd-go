@@ -157,20 +157,22 @@ To connect a custom schema to the hot state system, declare it in `config.yaml`:
 
 ```yaml
 state:
-  - name: Conditions
+  - name: Condition
     source_table: memory_conditions
-    mode: hotstate
-  - name: UserPositions
+    key:                          # primary key — used for Get() lookups and ClickHouse ORDER BY
+      - ID
+  - name: Position
     source_table: memory_user_positions
-    mode: hotstate
+    key:                          # composite primary key
+      - User
+      - TokenID
 ```
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Entity name (matches schema struct name minus `Schema`) |
 | `source_table` | No | Override the table name (default: pluralized+snake_cased) |
-| `mode` | No | `hotstate` or `db_prefetch` (default: `hotstate`) |
-| `key` | No | Override prefetch key fields |
+| `key` | No | Primary key field(s). Must match the `// pk:` comment on the schema struct. Used for `Get()` lookups, ClickHouse `ORDER BY`, and prefetch queries. |
 
 The `state` config drives:
 - Prefetch queries (load existing state from ClickHouse before processing)

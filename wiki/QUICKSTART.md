@@ -25,13 +25,15 @@ go build -o sqd-go .
 
 ### From an ABI
 
+Download the [Uniswap V2 Router ABI](https://etherscan.io/address/0x7a250d5630b4cf539739df2c5dacb4c659f2488d#code) or use any contract ABI JSON:
+
 ```bash
 sqd-go init contract-import local \
-  --abi mytoken.json \
-  --name MyToken \
+  --abi uniswap_v2_router.json \
+  --name UniswapV2Router \
   --blockchain ethereum \
-  --start-block 21000000 \
-  --address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+  --start-block 10000835 \
+  --address 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
 ```
 
 ### From the ERC20 Template
@@ -49,7 +51,7 @@ sqd-go
 All three produce the same structure:
 
 ```
-my-token/
+uniswap-v2-router/
   config.yaml       # event definitions, chain, start block
   .env              # ClickHouse connection
   compose.yml       # local ClickHouse via Docker
@@ -111,15 +113,6 @@ sqd-go start my-token/ --restart
 ```
 
 See [Custom Schema](CUSTOM_SCHEMA.md) and [Custom Processor](CUSTOM_PROCESSOR.md) for the full guide.
-
-## Pipeline Modes
-
-| Mode | Flag | Description |
-|------|------|-------------|
-| V2 (proto) | default | Zero-copy protobuf views, fastest path |
-| V1 (parsed) | `--no-proto` | Legacy JSON-decoded structs, useful for debugging |
-| Cold cache | default (on) | Pebble-backed local disk cache for finalized state |
-| No cold cache | `--no-cold-cache` | Disable Pebble tier, fall back to ClickHouse point-SELECTs |
 
 ## Common Flags
 

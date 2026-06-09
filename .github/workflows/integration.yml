@@ -39,6 +39,26 @@ jobs:
       - name: Unit tests
         run: go test $(go list ./... | grep -v 'examples/polymarket' | grep -v 'internal/coldcache') -count=1 -timeout 60s
 
+      - name: Init from ABI (contract-import)
+        run: |
+          ./tmp/sqd-go init contract-import local \
+            --abi examples/erc20.json \
+            --name USDC \
+            --blockchain ethereum \
+            --start-block 6082465 \
+            --address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+          test -f usdc/config.yaml || (echo "config.yaml not created" && exit 1)
+          test -f usdc/.env || (echo ".env not created" && exit 1)
+          test -f usdc/compose.yml || (echo "compose.yml not created" && exit 1)
+          echo "init contract-import: OK"
+
+      - name: Codegen from init project
+        run: |
+          ./tmp/sqd-go codegen usdc/
+          test -f usdc/generated/events.go || (echo "events.go not generated" && exit 1)
+          test -f usdc/generated/schema.go || (echo "schema.go not generated" && exit 1)
+          echo "codegen: OK"
+
       - name: Integration test (15s indexing)
         env:
           CLICKHOUSE_HOST: 127.0.0.1
