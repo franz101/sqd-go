@@ -17,11 +17,13 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// Store wraps a ClickHouse native-protocol connection and the target database name.
 type Store struct {
 	conn *ch.Client
 	db   string
 }
 
+// BlockRow is a single row in the blocks table, used during fork tracking.
 type BlockRow struct {
 	ChainID        uint64
 	BlockNumber    uint64
@@ -29,11 +31,13 @@ type BlockRow struct {
 	BlockHash      string
 }
 
+// TypedEventTable describes a ClickHouse table generated from an ABI event.
 type TypedEventTable struct {
 	Name string
 	Args []TypedEventArg
 }
 
+// TypedEventArg maps one ABI event parameter to its ClickHouse column.
 type TypedEventArg struct {
 	Name           string
 	ColumnName     string
@@ -41,22 +45,28 @@ type TypedEventArg struct {
 	ClickHouseType string
 }
 
+// SyncCursor records a block number and hash for checkpoint persistence.
 type SyncCursor struct {
 	Number uint64 `json:"number"`
 	Hash   string `json:"hash"`
 }
 
+// SyncState is the persisted ingestion checkpoint: current head, finalized
+// block, and any rollback chain from fork recovery.
 type SyncState struct {
 	Current       SyncCursor
 	Finalized     *SyncCursor
 	RollbackChain []SyncCursor
 }
 
+// EnsureTablesOptions controls which optional tables are created during schema setup.
 type EnsureTablesOptions struct {
 	StoreBlocks bool
 	StoreLogs   bool
 }
 
+// NewClickHouse connects to ClickHouse via the native protocol, creates the
+// target database if it doesn't exist, and returns a Store.
 func NewClickHouse(ctx context.Context, host string, port int, user, password, db string) (*Store, error) {
 	conn, err := ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
@@ -74,6 +84,7 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 	return &Store{conn: conn, db: db}, nil
 }
 
+// DropClickHouseDatabase drops the named database (used by --restart).
 func DropClickHouseDatabase(ctx context.Context, host string, port int, user, password, db string) error {
 	conn, err := ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
@@ -195,6 +206,7 @@ func rewriteSQLDatabase(sql, sourceDB, targetDB string) string {
 	return strings.ReplaceAll(sql, quoteIdent(sourceDB), quoteIdent(targetDB))
 }
 
+// Inserter batches block-level rows (blocks + raw logs) for native-protocol insertion.
 type Inserter struct {
 	store *Store
 
@@ -402,6 +414,7 @@ func (s *Store) NewTypedInserter(table TypedEventTable) *TypedInserter {
 	return in
 }
 
+// TypedInserter batches rows for a single typed event table (one per ABI event).
 type TypedInserter struct {
 	store *Store
 	table TypedEventTable

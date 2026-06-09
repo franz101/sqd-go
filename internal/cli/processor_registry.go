@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 
@@ -15,21 +14,18 @@ var processorFactories sync.Map
 var protoMode bool // V2: global proto mode flag
 var v3Mode bool    // V3: global v3 mode flag
 
-// SetProtoMode sets the global proto mode flag (called from CLI)
+// SetProtoMode sets the global proto mode flag (called from CLI).
 func SetProtoMode(enabled bool) {
-	fmt.Printf("[REGISTRY DEBUG] SetProtoMode called with enabled=%v\n", enabled)
 	protoMode = enabled
-	fmt.Printf("[REGISTRY DEBUG] protoMode is now set to %v\n", protoMode)
 }
 
-// GetProtoMode returns the current proto mode flag
+// GetProtoMode returns the current proto mode flag.
 func GetProtoMode() bool {
 	return protoMode
 }
 
-// SetV3Mode sets the global v3 mode flag (called from CLI)
+// SetV3Mode sets the global v3 mode flag (called from CLI).
 func SetV3Mode(enabled bool) {
-	fmt.Printf("[REGISTRY DEBUG] SetV3Mode called with enabled=%v\n", enabled)
 	v3Mode = enabled
 }
 
@@ -38,6 +34,7 @@ func GetV3Mode() bool {
 	return v3Mode
 }
 
+// RegisterProcessor registers a v1 processor factory for the given project name.
 func RegisterProcessor(projectName string, factory func() (ingestion.Processor, error)) {
 	name := strings.TrimSpace(strings.ToLower(projectName))
 	if name == "" || factory == nil {
@@ -65,18 +62,10 @@ func processorForProject(projectName string) (ingestion.Processor, error) {
 		return nil, nil
 	}
 
-	// DEBUG: Log registry state
-	fmt.Printf("[REGISTRY DEBUG] protoMode=%v, looking for factory for %s\n", protoMode, name)
-
-	// Try V2 factory first (with proto mode support)
 	if factoryV2, ok := value.(processorFactoryV2); ok {
-		fmt.Printf("[REGISTRY DEBUG] Using V2 factory with protoMode=%v\n", protoMode)
 		return factoryV2(protoMode)
 	}
-
-	// Fall back to V1 factory (no proto mode support)
 	if factory, ok := value.(processorFactory); ok {
-		fmt.Printf("[REGISTRY DEBUG] Using V1 factory (no proto mode support)\n")
 		return factory()
 	}
 

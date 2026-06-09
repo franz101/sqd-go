@@ -17,7 +17,10 @@ import (
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-func runDev(path string, restart, noResume, protoMode, v3Mode, coldCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
+// runDev loads the project, runs codegen, starts docker compose, then runs the
+// ingestion pipeline. On exit it tears down docker compose. Use this for local
+// development where ClickHouse is managed by compose.
+func runDev(path string, restart, protoMode, coldCache, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
@@ -53,10 +56,13 @@ func runDev(path string, restart, noResume, protoMode, v3Mode, coldCache bool, s
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, coldCache, outPath, cpuprofile, pageSizeStr)
+	return runStartPipelineInternal(project, path, restart, protoMode, coldCache, noColdCache, outPath, cpuprofile, pageSizeStr)
 }
 
-func runStartPipeline(path string, restart, noResume, protoMode, v3Mode, coldCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
+// runStartPipeline loads the project, runs codegen, then starts ingestion.
+// Unlike runDev it does not manage docker compose — the user is responsible for
+// running ClickHouse externally.
+func runStartPipeline(path string, restart, protoMode, coldCache, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -71,7 +77,7 @@ func runStartPipeline(path string, restart, noResume, protoMode, v3Mode, coldCac
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, noResume, protoMode, v3Mode, coldCache, outPath, cpuprofile, pageSizeStr)
+	return runStartPipelineInternal(project, path, restart, protoMode, coldCache, noColdCache, outPath, cpuprofile, pageSizeStr)
 }
 
 func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
@@ -105,15 +111,20 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 	}
 }
 
-func runStartPipelineInternal(project *config.Project, path string, restart, noResume, protoMode, v3Mode, coldCache bool, outPath, cpuprofile string, pageSizeStr string) int {
+// runStartPipelineInternal is the shared core of runDev and runStartPipeline.
+// It configures the ingestion options (ClickHouse connection, page size, cold
+// cache), resolves the custom processor, and calls ingestion.Run.
+//
+// V1 (parsed mode) is still accessible via --no-proto. When proto mode is off,
+// the pipeline falls back to the legacy JSON-decoded path with struct-based
+// event processing. This is useful for debugging or when proto support has not
+// been validated for a new contract.
+func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, coldCache, noColdCache bool, outPath, cpuprofile string, pageSizeStr string) int {
 	if protoMode {
 		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
 	}
-	if v3Mode {
-		log.Printf("V3 DISCOVERY MODE ENABLED: auto-prefetch key discovery")
-	}
 	SetProtoMode(protoMode)
-	SetV3Mode(v3Mode)
+	SetV3Mode(false)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -152,11 +163,10 @@ func runStartPipelineInternal(project *config.Project, path string, restart, noR
 		ClickHousePassword: envOrDefault("CLICKHOUSE_PASSWORD", "sqd-clickhouse"),
 		ClickHouseDatabase: envOrDefault("CLICKHOUSE_DATABASE", project.Config.Name),
 		Restart:            restart,
-		NoResume:           noResume,
 		GeneratedSQLDir:    filepath.Dir(outPath),
 		CursorMode:         true,
 		PageSize:           pageSize,
-		ColdCache:          coldCache || (project.Config.ColdCache != nil && *project.Config.ColdCache),
+		ColdCache: resolveColdCache(coldCache, noColdCache, project.Config.ColdCache),
 	}
 	if opts.ColdCache {
 		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")
@@ -267,6 +277,23 @@ func runInitContractImport(p *parsedArgs) int {
 	}
 	fmt.Printf("initialized %s (%d events)\n", configPath, len(events))
 	return 0
+}
+
+// resolveColdCache determines whether the cold cache should be enabled. The
+// cold cache is ON by default. It is disabled when --no-cold-cache is passed or
+// when the config explicitly sets cold_cache: false. The --cold-cache flag
+// force-enables it (overriding config).
+func resolveColdCache(flagOn, flagOff bool, configVal *bool) bool {
+	if flagOff {
+		return false
+	}
+	if flagOn {
+		return true
+	}
+	if configVal != nil {
+		return *configVal
+	}
+	return true
 }
 
 func findComposeFile(root string) string {

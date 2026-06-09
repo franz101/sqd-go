@@ -63,8 +63,8 @@ func TestParseArgsStartNoResume(t *testing.T) {
 	if p.command != "start" || p.project != "examples/sample_project" {
 		t.Fatalf("command/project = %q/%q", p.command, p.project)
 	}
-	if !p.noResume {
-		t.Fatal("noResume = false, want true")
+	if !p.restart {
+		t.Fatal("restart = false, want true (--no-resume maps to --restart)")
 	}
 	if p.cpuprofile != "cpu.pprof" {
 		t.Fatalf("cpuprofile = %q, want cpu.pprof", p.cpuprofile)

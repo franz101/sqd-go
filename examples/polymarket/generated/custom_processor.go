@@ -15,10 +15,61 @@ import (
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-// CustomProcessFn is the callback registered by the custom processor.
+// CustomProcessFn is the callback you register from your project package to
+// run custom business logic on each block. Assign it in an init() function:
+//
+//	func init() {
+//	    generated.CustomProcessFn = myProcess
+//	}
+//
+//	func myProcess(state *generated.State, block *generated.ParsedBlock) error {
+//	    // --- Access events by type (each slice is pre-decoded for this block) ---
+//	    //
+//	    // for _, ev := range block.MyContractTransfers {
+//	    //     from  := ev.From           // common.Address
+//	    //     to    := ev.To             // common.Address
+//	    //     value := ev.Value          // uint256.Int
+//	    //     block := ev.BlockNumber    // uint64 (from embedded EventMeta)
+//	    // }
+//	    //
+//	    // --- Or iterate ALL events in log-index order (mixed types) ---
+//	    //
+//	    // for ev := range block.EventsIter() {
+//	    //     switch e := ev.(type) {
+//	    //     case *generated.MyContractTransfer:
+//	    //         // handle transfer
+//	    //     case *generated.MyContractApproval:
+//	    //         // handle approval
+//	    //     }
+//	    // }
+//	    //
+//	    // --- Read state (lazy-loaded from ClickHouse on cache miss) ---
+//	    //
+//	    // val, ok := state.MyEntity.Get(keyField1, keyField2)
+//	    // if ok {
+//	    //     fmt.Println(val.SomeField)
+//	    // }
+//	    //
+//	    // --- Write state (persisted to ClickHouse on commit) ---
+//	    //
+//	    // state.MyEntity.Save(&generated.MyEntity{
+//	    //     KeyField: ev.SomeAddress,
+//	    //     Balance:  newBalance,
+//	    // }, ev.EventMeta)
+//	    //
+//	    return nil
+//	}
 var CustomProcessFn func(state *State, block *ParsedBlock) error
 
-// CustomProcessProtoFn is the proto callback registered by the custom processor.
+// CustomProcessProtoFn is the proto-mode equivalent of CustomProcessFn.
+// Proto mode uses columnar storage (~50x less memory) with accessor methods
+// instead of struct fields:
+//
+//	block.QueryMyContractTransfer().Map(func(ev generated.MyContractTransferProtoView) {
+//	    from := ev.From()   // accessor method, not a struct field
+//	    to   := ev.To()
+//	    _ = from; _ = to
+//	})
 var CustomProcessProtoFn func(state *State, block *ProtoEventBlock) error
 
 // CustomProcessing wraps the block-based processing

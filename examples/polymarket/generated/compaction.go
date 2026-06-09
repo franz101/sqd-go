@@ -11,6 +11,11 @@ import (
 	"github.com/ClickHouse/ch-go"
 )
 
+// CompactionPruneState removes superseded rows from hot-state tables. For each
+// table with a primary key, it deletes rows whose block_number is below a
+// rolling threshold (blockNumber - 1000) and that are not the latest version of
+// their primary-key group. This keeps ClickHouse tables bounded during long
+// backfill runs while preserving the most recent state for each entity.
 func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) error {
 	if store == nil || store.Conn() == nil {
 		return nil

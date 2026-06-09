@@ -21,6 +21,8 @@ import (
 	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
 
+// Options configures the ingestion pipeline: ClickHouse connection, page
+// sizing, restart behaviour, cold cache tier, and the custom processor.
 type Options struct {
 	ClickHouseHost     string
 	ClickHousePort     int
@@ -31,7 +33,6 @@ type Options struct {
 	StartBlock         uint64
 	BlockCount         uint64
 	Restart            bool
-	NoResume           bool
 	GeneratedSQLDir    string
 	CursorMode         bool
 	ForkMode           config.ForkMode
@@ -58,6 +59,7 @@ const (
 	maxAdaptivePageSize = 100000
 )
 
+// CustomLog is a decoded EVM log passed to legacy CustomProcessor callbacks.
 type CustomLog struct {
 	ChainID          uint64
 	BlockNumber      uint64
@@ -71,8 +73,14 @@ type CustomLog struct {
 	Data             string
 }
 
+// CustomProcessor is the legacy callback signature for processing decoded logs.
+// New code should implement the Processor interface instead.
 type CustomProcessor func(ctx context.Context, store *database.Store, logs []CustomLog) error
 
+// Run is the top-level ingestion entry point. It connects to ClickHouse, applies
+// generated schemas, and processes each configured chain sequentially. The
+// context controls graceful shutdown; a cancelled context drains in-flight work
+// and returns ctx.Err().
 func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	// Resolve effective processor: use Processor interface if set, otherwise fall back to callbacks
 	proc := opts.Processor
@@ -92,7 +100,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 			LoadFromDBFn:     opts.StateLoader,
 		}
 	}
-	resetStore := opts.Restart || opts.NoResume
+	resetStore := opts.Restart
 	if resetStore {
 		if err := database.DropClickHouseDatabase(ctx, opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseUser, opts.ClickHousePassword, opts.ClickHouseDatabase); err != nil {
 			return fmt.Errorf("drop clickhouse database: %w", err)
@@ -141,7 +149,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.NoResume || opts.Restart, proc, opts.ColdCache, coldDir); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -149,7 +157,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, noResume bool, proc Processor, coldCache bool, coldDir string) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -170,8 +178,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	}
 	state := NewForkTracker(forkMode)
 	if cursorMode {
-		if noResume {
-			log.Printf("Chain %d: resume disabled; starting from configured block %d", chain.ID, currentBlock)
+		if restart {
+			log.Printf("Chain %d: restart mode; starting from configured block %d", chain.ID, currentBlock)
 		} else {
 			saved, hasSaved, err := store.LastSyncState(ctx, chain.ID)
 			if err != nil {
@@ -207,7 +215,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 			}
 		}
-	} else if !noResume {
+	} else if !restart {
 		last, hasLast, err := store.LastBlock(ctx, chain.ID)
 		if err != nil {
 			return fmt.Errorf("read last block: %w", err)
