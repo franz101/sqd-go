@@ -686,44 +686,6 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString("\treturn firstErr\n}\n\n")
 	}
 
-	// EnableColdNegativeFilter / ColdFilterSkips: the V3 cold-tier negative
-	// Bloom filter. EnableColdCache alone gives V2 behaviour (every hot+cold
-	// miss probes Pebble); additionally calling EnableColdNegativeFilter makes a
-	// provably-new key skip the Pebble probe entirely.
-	if len(coldSpecs) == 0 {
-		b.WriteString("func (s *HotState) EnableColdNegativeFilter(bits uint64) {}\n\n")
-		b.WriteString("func (s *HotState) ColdFilterSkips() uint64 { return 0 }\n\n")
-	} else {
-		b.WriteString("// EnableColdNegativeFilter attaches an in-memory negative-lookup Bloom filter\n")
-		b.WriteString("// to every cold tier (the V3 optimization): a hot+cold miss for a provably-new\n")
-		b.WriteString("// key skips the Pebble probe (and, when authoritative, the ClickHouse SELECT)\n")
-		b.WriteString("// entirely. Call once, after EnableColdCache.\n")
-		b.WriteString("func (s *HotState) EnableColdNegativeFilter(bits uint64) {\n")
-		b.WriteString("\tif s == nil {\n\t\treturn\n\t}\n")
-		for _, spec := range coldSpecs {
-			b.WriteString("\tif s.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".cold != nil {\n\t\ts.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".cold.EnableNegativeFilter(bits)\n\t}\n")
-		}
-		b.WriteString("}\n\n")
-
-		b.WriteString("// ColdFilterSkips reports how many cold-tier Pebble Gets the V3 negative\n")
-		b.WriteString("// filter avoided across all cold caches.\n")
-		b.WriteString("func (s *HotState) ColdFilterSkips() uint64 {\n")
-		b.WriteString("\tif s == nil {\n\t\treturn 0\n\t}\n")
-		b.WriteString("\tvar n uint64\n")
-		for _, spec := range coldSpecs {
-			b.WriteString("\tif s.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".cold != nil {\n\t\tn += s.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".cold.FilterSkips()\n\t}\n")
-		}
-		b.WriteString("\treturn n\n}\n\n")
-	}
-
 	b.WriteString("func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {\n")
 	for _, spec := range specs {
 		if spec.table.IsEvent {

@@ -21,6 +21,8 @@ import (
 	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
 
+// Options configures the ingestion pipeline: ClickHouse connection, page
+// sizing, restart behaviour, cold cache tier, and the custom processor.
 type Options struct {
 	ClickHouseHost     string
 	ClickHousePort     int
@@ -31,7 +33,6 @@ type Options struct {
 	StartBlock         uint64
 	BlockCount         uint64
 	Restart            bool
-	NoResume           bool
 	GeneratedSQLDir    string
 	CursorMode         bool
 	ForkMode           config.ForkMode
@@ -45,16 +46,7 @@ type Options struct {
 	// provably new so ClickHouse is skipped entirely. Default off.
 	ColdCache    bool
 	ColdCacheDir string // base directory for cold-tier files (default os.TempDir()/sqd-coldcache)
-	// ColdNegativeFilter adds the V3 in-RAM negative-lookup Bloom filter on top of
-	// the cold tier: a hot+cold miss for a provably-new key skips even the Pebble
-	// probe. Requires ColdCache. Default off (V2 behaviour).
-	ColdNegativeFilter bool
 }
-
-// coldNegativeFilterBits is the default bit budget for the V3 negative filter
-// (blocked Bloom, ~64 MiB per cold cache). Bounded and fixed at startup; sized to
-// keep the false-positive rate low into the tens-of-millions-of-keys range.
-const coldNegativeFilterBits uint64 = 1 << 29
 
 const (
 	cursorPollInterval = 5 * time.Second
@@ -67,6 +59,7 @@ const (
 	maxAdaptivePageSize = 100000
 )
 
+// CustomLog is a decoded EVM log passed to legacy CustomProcessor callbacks.
 type CustomLog struct {
 	ChainID          uint64
 	BlockNumber      uint64
@@ -80,8 +73,14 @@ type CustomLog struct {
 	Data             string
 }
 
+// CustomProcessor is the legacy callback signature for processing decoded logs.
+// New code should implement the Processor interface instead.
 type CustomProcessor func(ctx context.Context, store *database.Store, logs []CustomLog) error
 
+// Run is the top-level ingestion entry point. It connects to ClickHouse, applies
+// generated schemas, and processes each configured chain sequentially. The
+// context controls graceful shutdown; a cancelled context drains in-flight work
+// and returns ctx.Err().
 func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	// Resolve effective processor: use Processor interface if set, otherwise fall back to callbacks
 	proc := opts.Processor
@@ -101,7 +100,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 			LoadFromDBFn:     opts.StateLoader,
 		}
 	}
-	resetStore := opts.Restart || opts.NoResume
+	resetStore := opts.Restart
 	if resetStore {
 		if err := database.DropClickHouseDatabase(ctx, opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseUser, opts.ClickHousePassword, opts.ClickHouseDatabase); err != nil {
 			return fmt.Errorf("drop clickhouse database: %w", err)
@@ -150,7 +149,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.NoResume || opts.Restart, proc, opts.ColdCache, opts.ColdNegativeFilter, coldDir); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -158,7 +157,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, noResume bool, proc Processor, coldCache, coldNegFilter bool, coldDir string) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -179,8 +178,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	}
 	state := NewForkTracker(forkMode)
 	if cursorMode {
-		if noResume {
-			log.Printf("Chain %d: resume disabled; starting from configured block %d", chain.ID, currentBlock)
+		if restart {
+			log.Printf("Chain %d: restart mode; starting from configured block %d", chain.ID, currentBlock)
 		} else {
 			saved, hasSaved, err := store.LastSyncState(ctx, chain.ID)
 			if err != nil {
@@ -216,7 +215,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 			}
 		}
-	} else if !noResume {
+	} else if !restart {
 		last, hasLast, err := store.LastBlock(ctx, chain.ID)
 		if err != nil {
 			return fmt.Errorf("read last block: %w", err)
@@ -292,16 +291,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			}
 			defer func() { _ = cc.CloseColdCache() }()
 			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
-			// V3: layer the in-RAM negative-lookup filter over the cold tier so a
-			// provably-new key skips even the Pebble probe.
-			if coldNegFilter {
-				if nf, ok := cc.(ColdNegativeFilterProcessor); ok {
-					nf.EnableColdNegativeFilter(coldNegativeFilterBits)
-					log.Printf("Chain %d: V3 cold negative-lookup filter enabled (%d bits/cache)", chain.ID, coldNegativeFilterBits)
-				} else {
-					log.Printf("Chain %d: V3 negative filter requested but processor does not implement ColdNegativeFilterProcessor", chain.ID)
-				}
-			}
 		} else {
 			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
 		}

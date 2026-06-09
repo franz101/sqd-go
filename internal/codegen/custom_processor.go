@@ -227,8 +227,30 @@ package generated
 	"context"
 )
 
-// CustomProcessing is called during block processing to run custom business logic.
-// You have access to the db store, and the entities containing decoded event logs.
+// CustomProcessing is called once per block during ingestion.
+//
+// The entities parameter contains decoded event logs for the current block,
+// grouped by event type. Each event struct embeds EventMeta with block context.
+//
+// Example — iterate over decoded events and access their fields:
+//
+//	for _, ev := range entities.MyContractTransfer {
+//	    from := ev.From           // common.Address
+//	    to   := ev.To             // common.Address
+//	    value := ev.Value          // uint256.Int
+//	    block := ev.BlockNumber    // uint64 (from embedded EventMeta)
+//	    _ = from; _ = to; _ = value; _ = block
+//	}
+//
+// Example — filter events into a new slice:
+//
+//	var large []MyContractTransfer
+//	threshold := new(uint256.Int).SetUint64(1_000_000)
+//	for _, ev := range entities.MyContractTransfer {
+//	    if ev.Value.Gt(threshold) {
+//	        large = append(large, ev)
+//	    }
+//	}
 func CustomProcessing(ctx context.Context, store Store, entities *Entities) error {
 	if entities == nil {
 		return nil
@@ -252,10 +274,61 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"github.com/franz101/sqd-go/internal/ingestion"
 )
 
-// CustomProcessFn is the callback registered by the custom processor.
+// CustomProcessFn is the callback you register from your project package to
+// run custom business logic on each block. Assign it in an init() function:
+//
+//	func init() {
+//	    generated.CustomProcessFn = myProcess
+//	}
+//
+//	func myProcess(state *generated.State, block *generated.ParsedBlock) error {
+//	    // --- Access events by type (each slice is pre-decoded for this block) ---
+//	    //
+//	    // for _, ev := range block.MyContractTransfers {
+//	    //     from  := ev.From           // common.Address
+//	    //     to    := ev.To             // common.Address
+//	    //     value := ev.Value          // uint256.Int
+//	    //     block := ev.BlockNumber    // uint64 (from embedded EventMeta)
+//	    // }
+//	    //
+//	    // --- Or iterate ALL events in log-index order (mixed types) ---
+//	    //
+//	    // for ev := range block.EventsIter() {
+//	    //     switch e := ev.(type) {
+//	    //     case *generated.MyContractTransfer:
+//	    //         // handle transfer
+//	    //     case *generated.MyContractApproval:
+//	    //         // handle approval
+//	    //     }
+//	    // }
+//	    //
+//	    // --- Read state (lazy-loaded from ClickHouse on cache miss) ---
+//	    //
+//	    // val, ok := state.MyEntity.Get(keyField1, keyField2)
+//	    // if ok {
+//	    //     fmt.Println(val.SomeField)
+//	    // }
+//	    //
+//	    // --- Write state (persisted to ClickHouse on commit) ---
+//	    //
+//	    // state.MyEntity.Save(&generated.MyEntity{
+//	    //     KeyField: ev.SomeAddress,
+//	    //     Balance:  newBalance,
+//	    // }, ev.EventMeta)
+//	    //
+//	    return nil
+//	}
 var CustomProcessFn func(state *State, block *ParsedBlock) error
 
-// CustomProcessProtoFn is the proto callback registered by the custom processor.
+// CustomProcessProtoFn is the proto-mode equivalent of CustomProcessFn.
+// Proto mode uses columnar storage (~50x less memory) with accessor methods
+// instead of struct fields:
+//
+//	block.QueryMyContractTransfer().Map(func(ev generated.MyContractTransferProtoView) {
+//	    from := ev.From()   // accessor method, not a struct field
+//	    to   := ev.To()
+//	    _ = from; _ = to
+//	})
 var CustomProcessProtoFn func(state *State, block *ProtoEventBlock) error
 
 // CustomProcessing wraps the block-based processing
@@ -644,16 +717,6 @@ func (p *Processor) EnableColdCache(dir string, authoritative bool) error {
 		return nil
 	}
 	return p.State.HotState.EnableColdCache(dir, authoritative, 0, 0)
-}
-
-// EnableColdNegativeFilter turns on the V3 in-RAM negative-lookup Bloom filter
-// over the cold tier: a hot+cold miss for a provably-new key skips even the Pebble
-// probe. No-op if state is nil or the cold tier isn't enabled.
-func (p *Processor) EnableColdNegativeFilter(bits uint64) {
-	if p == nil || p.State == nil || p.State.HotState == nil {
-		return
-	}
-	p.State.HotState.EnableColdNegativeFilter(bits)
 }
 
 // CloseColdCache releases the cold tier (and its off-heap Pebble buffers). Called

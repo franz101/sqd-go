@@ -17,6 +17,7 @@ import (
 	"github.com/franz101/sqd-go/internal/config"
 )
 
+// Manifest is the JSON manifest written to .sqd/generated/ for the runtime.
 type Manifest struct {
 	Name       string          `json:"name"`
 	Ecosystem  string          `json:"ecosystem,omitempty"`
@@ -25,6 +26,7 @@ type Manifest struct {
 	Chains     []ManifestChain `json:"chains"`
 }
 
+// ManifestChain is one chain entry in the manifest.
 type ManifestChain struct {
 	ID         uint64             `json:"id"`
 	StartBlock uint64             `json:"start_block"`
@@ -32,12 +34,15 @@ type ManifestChain struct {
 	Contracts  []ManifestContract `json:"contracts"`
 }
 
+// ManifestContract is one contract entry in the manifest.
 type ManifestContract struct {
 	Name    string   `json:"name"`
 	Events  []string `json:"events"`
 	Address any      `json:"address,omitempty"`
 }
 
+// GenerateProject runs the full codegen pipeline: validates config, generates
+// the JSON manifest, Go event types, parsers, inserters, and hot-state code.
 func GenerateProject(project *config.Project) (string, error) {
 	if err := config.Validate(project.Config); err != nil {
 		return "", err
@@ -295,6 +300,7 @@ func buildManifest(project *config.Project) Manifest {
 	return manifest
 }
 
+// Generate is a convenience wrapper: loads a project from path and runs GenerateProject.
 func Generate(path string) (string, error) {
 	project, err := config.LoadProject(path)
 	if err != nil {
