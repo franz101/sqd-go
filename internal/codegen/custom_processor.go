@@ -272,6 +272,7 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
 
 // CustomProcessFn is the callback you register from your project package to
@@ -542,15 +543,15 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 			meta := EventMeta{
 				BlockNumber:      lg.BlockNumber,
 				BlockTimestamp:   lg.BlockTimestamp,
-				BlockHash:        common.HexToHash(lg.BlockHash),
-				ContractAddress:  common.HexToAddress(lg.ContractAddress),
-				TransactionHash:  common.HexToHash(lg.TransactionHash),
+				BlockHash:        abiunpack.DecodeTopicHash(lg.BlockHash),
+				ContractAddress:  abiunpack.AddressFromHex(lg.ContractAddress),
+				TransactionHash:  abiunpack.DecodeTopicHash(lg.TransactionHash),
 				TransactionIndex: lg.TransactionIndex,
 				LogIndex:         lg.LogIndex,
 			}
 			topics := make([]common.Hash, len(lg.Topics))
 			for i, t := range lg.Topics {
-				topics[i] = common.HexToHash(t)
+				topics[i] = abiunpack.DecodeTopicHash(t)
 			}
 			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, common.FromHex(lg.Data), meta)
 		}
@@ -589,9 +590,9 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 		meta := EventMeta{
 			BlockNumber:      lg.BlockNumber,
 			BlockTimestamp:   lg.BlockTimestamp,
-			BlockHash:        common.HexToHash(lg.BlockHash),
-			ContractAddress:  common.HexToAddress(lg.ContractAddress),
-			TransactionHash:  common.HexToHash(lg.TransactionHash),
+			BlockHash:        abiunpack.DecodeTopicHash(lg.BlockHash),
+			ContractAddress:  abiunpack.AddressFromHex(lg.ContractAddress),
+			TransactionHash:  abiunpack.DecodeTopicHash(lg.TransactionHash),
 			TransactionIndex: lg.TransactionIndex,
 			LogIndex:         lg.LogIndex,
 		}

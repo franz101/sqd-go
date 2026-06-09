@@ -697,9 +697,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 		return false
 	}
 	topic0 := topics[0]
-	if topic0 == common.HexToHash("0xab3760c3bd2bb38b5bcf54dc79802ed67338b4cf29f3054ded67ed24661e4177") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x4d97dcd97ec945f40cf65f87097ace5ea0476045" {
+	if topic0 == _aflTopic0_0 {
+		if address == _aflAddr_0_0_0 {
 			// ConditionalTokensConditionPreparation
 			var ev ConditionalTokensConditionPreparation
 			ev.EventMeta = meta
@@ -718,9 +717,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0xb44d84d3289691f71497564b85d4233648d9dbae8cbdbb4329f301c3a0185894") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x4d97dcd97ec945f40cf65f87097ace5ea0476045" {
+	if topic0 == _aflTopic0_1 {
+		if address == _aflAddr_1_0_0 {
 			// ConditionalTokensConditionResolution
 			var ev ConditionalTokensConditionResolution
 			ev.EventMeta = meta
@@ -742,9 +740,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0x2e6bb91f8cbcda0c93623c54d0403a43514fabc40084ec96b6d5379a74786298") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x4d97dcd97ec945f40cf65f87097ace5ea0476045" {
+	if topic0 == _aflTopic0_2 {
+		if address == _aflAddr_2_0_0 {
 			// ConditionalTokensPositionSplit
 			var ev ConditionalTokensPositionSplit
 			ev.EventMeta = meta
@@ -770,9 +767,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x4d97dcd97ec945f40cf65f87097ace5ea0476045" {
+	if topic0 == _aflTopic0_3 {
+		if address == _aflAddr_3_0_0 {
 			// ConditionalTokensPositionsMerge
 			var ev ConditionalTokensPositionsMerge
 			ev.EventMeta = meta
@@ -798,9 +794,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x4d97dcd97ec945f40cf65f87097ace5ea0476045" {
+	if topic0 == _aflTopic0_4 {
+		if address == _aflAddr_4_0_0 {
 			// ConditionalTokensPayoutRedemption
 			var ev ConditionalTokensPayoutRedemption
 			ev.EventMeta = meta
@@ -826,9 +821,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e" {
+	if topic0 == _aflTopic0_5 {
+		if address == _aflAddr_5_0_0 {
 			// ExchangeOrderFilled
 			var ev ExchangeOrderFilled
 			ev.EventMeta = meta
@@ -861,7 +855,7 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			b.AppendExchangeOrderFilled(meta, &ev)
 			return true
 		}
-		if addressLower == "0xc5d563a36ae78145c45a50134d48a1215220f80a" {
+		if address == _aflAddr_5_1_0 {
 			// NegRiskExchangeOrderFilled
 			var ev NegRiskExchangeOrderFilled
 			ev.EventMeta = meta
@@ -895,9 +889,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0xf059ab16d1ca60e123eab60e3c02b68faf060347c701a5d14885a8e1def7b3a8") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296" {
+	if topic0 == _aflTopic0_6 {
+		if address == _aflAddr_6_0_0 {
 			// NegRiskAdapterMarketPrepared
 			var ev NegRiskAdapterMarketPrepared
 			ev.EventMeta = meta
@@ -918,9 +911,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0xaac410f87d423a922a7b226ac68f0c2eaf5bf6d15e644ac0758c7f96e2c253f7") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296" {
+	if topic0 == _aflTopic0_7 {
+		if address == _aflAddr_7_0_0 {
 			// NegRiskAdapterQuestionPrepared
 			var ev NegRiskAdapterQuestionPrepared
 			ev.EventMeta = meta
@@ -941,9 +933,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0xbbed930dbfb7907ae2d60ddf78345610214f26419a0128df39b6cc3d9e5df9b0") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296" {
+	if topic0 == _aflTopic0_8 {
+		if address == _aflAddr_8_0_0 {
 			// NegRiskAdapterPositionSplit
 			var ev NegRiskAdapterPositionSplit
 			ev.EventMeta = meta
@@ -961,9 +952,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0xba33ac50d8894676597e6e35dc09cff59854708b642cd069d21eb9c7ca072a04") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296" {
+	if topic0 == _aflTopic0_9 {
+		if address == _aflAddr_9_0_0 {
 			// NegRiskAdapterPositionsMerge
 			var ev NegRiskAdapterPositionsMerge
 			ev.EventMeta = meta
@@ -981,9 +971,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0xb03d19dddbc72a87e735ff0ea3b57bef133ebe44e1894284916a84044deb367e") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296" {
+	if topic0 == _aflTopic0_10 {
+		if address == _aflAddr_10_0_0 {
 			// NegRiskAdapterPositionsConverted
 			var ev NegRiskAdapterPositionsConverted
 			ev.EventMeta = meta
@@ -1002,9 +991,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0x9140a6a270ef945260c03894b3c6b3b2695e9d5101feef0ff24fec960cfd3224") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296" {
+	if topic0 == _aflTopic0_11 {
+		if address == _aflAddr_11_0_0 {
 			// NegRiskAdapterPayoutRedemption
 			var ev NegRiskAdapterPayoutRedemption
 			ev.EventMeta = meta
@@ -1025,9 +1013,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0x92e0912d3d7f3192cad5c7ae3b47fb97f9c465c1dd12a5c24fd901ddb3905f43") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x8b9805a2f595b6705e74f7310829f2d299d21522" {
+	if topic0 == _aflTopic0_12 {
+		if address == _aflAddr_12_0_0 {
 			// FixedProductMarketMakerFactoryFixedProductMarketMakerCreation
 			var ev FixedProductMarketMakerFactoryFixedProductMarketMakerCreation
 			ev.EventMeta = meta
@@ -1053,7 +1040,7 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 			return true
 		}
 	}
-	if topic0 == common.HexToHash("0x4f62630f51608fc8a7603a9391a5101e58bd7c276139366fc107dc3b67c3dcf8") {
+	if topic0 == _aflTopic0_13 {
 		// FixedProductMarketMakerFPMMBuy
 		var ev FixedProductMarketMakerFPMMBuy
 		ev.EventMeta = meta
@@ -1078,7 +1065,7 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 		b.AppendFixedProductMarketMakerFPMMBuy(meta, &ev)
 		return true
 	}
-	if topic0 == common.HexToHash("0xadcf2a240ed9300d681d9a3f5382b6c1beed1b7e46643e0c7b42cbe6e2d766b4") {
+	if topic0 == _aflTopic0_14 {
 		// FixedProductMarketMakerFPMMSell
 		var ev FixedProductMarketMakerFPMMSell
 		ev.EventMeta = meta
@@ -1103,7 +1090,7 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 		b.AppendFixedProductMarketMakerFPMMSell(meta, &ev)
 		return true
 	}
-	if topic0 == common.HexToHash("0xec2dc3e5a3bb9aa0a1deb905d2bd23640d07f107e6ceb484024501aad964a951") {
+	if topic0 == _aflTopic0_15 {
 		// FixedProductMarketMakerFPMMFundingAdded
 		var ev FixedProductMarketMakerFPMMFundingAdded
 		ev.EventMeta = meta
@@ -1122,7 +1109,7 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 		b.AppendFixedProductMarketMakerFPMMFundingAdded(meta, &ev)
 		return true
 	}
-	if topic0 == common.HexToHash("0x8b4b2c8ebd04c47fc8bce136a85df9b93fcb1f47c8aa296457d4391519d190e7") {
+	if topic0 == _aflTopic0_16 {
 		// FixedProductMarketMakerFPMMFundingRemoved
 		var ev FixedProductMarketMakerFPMMFundingRemoved
 		ev.EventMeta = meta
@@ -1147,6 +1134,38 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 	}
 	return false
 }
+
+var _aflTopic0_0 = common.HexToHash("0xab3760c3bd2bb38b5bcf54dc79802ed67338b4cf29f3054ded67ed24661e4177")
+var _aflAddr_0_0_0 = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+var _aflTopic0_1 = common.HexToHash("0xb44d84d3289691f71497564b85d4233648d9dbae8cbdbb4329f301c3a0185894")
+var _aflAddr_1_0_0 = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+var _aflTopic0_2 = common.HexToHash("0x2e6bb91f8cbcda0c93623c54d0403a43514fabc40084ec96b6d5379a74786298")
+var _aflAddr_2_0_0 = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+var _aflTopic0_3 = common.HexToHash("0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca")
+var _aflAddr_3_0_0 = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+var _aflTopic0_4 = common.HexToHash("0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d")
+var _aflAddr_4_0_0 = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+var _aflTopic0_5 = common.HexToHash("0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6")
+var _aflAddr_5_0_0 = common.HexToAddress("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+var _aflAddr_5_1_0 = common.HexToAddress("0xC5d563A36AE78145C45a50134d48A1215220f80a")
+var _aflTopic0_6 = common.HexToHash("0xf059ab16d1ca60e123eab60e3c02b68faf060347c701a5d14885a8e1def7b3a8")
+var _aflAddr_6_0_0 = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+var _aflTopic0_7 = common.HexToHash("0xaac410f87d423a922a7b226ac68f0c2eaf5bf6d15e644ac0758c7f96e2c253f7")
+var _aflAddr_7_0_0 = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+var _aflTopic0_8 = common.HexToHash("0xbbed930dbfb7907ae2d60ddf78345610214f26419a0128df39b6cc3d9e5df9b0")
+var _aflAddr_8_0_0 = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+var _aflTopic0_9 = common.HexToHash("0xba33ac50d8894676597e6e35dc09cff59854708b642cd069d21eb9c7ca072a04")
+var _aflAddr_9_0_0 = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+var _aflTopic0_10 = common.HexToHash("0xb03d19dddbc72a87e735ff0ea3b57bef133ebe44e1894284916a84044deb367e")
+var _aflAddr_10_0_0 = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+var _aflTopic0_11 = common.HexToHash("0x9140a6a270ef945260c03894b3c6b3b2695e9d5101feef0ff24fec960cfd3224")
+var _aflAddr_11_0_0 = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+var _aflTopic0_12 = common.HexToHash("0x92e0912d3d7f3192cad5c7ae3b47fb97f9c465c1dd12a5c24fd901ddb3905f43")
+var _aflAddr_12_0_0 = common.HexToAddress("0x8B9805A2f595B6705e74F7310829f2d299D21522")
+var _aflTopic0_13 = common.HexToHash("0x4f62630f51608fc8a7603a9391a5101e58bd7c276139366fc107dc3b67c3dcf8")
+var _aflTopic0_14 = common.HexToHash("0xadcf2a240ed9300d681d9a3f5382b6c1beed1b7e46643e0c7b42cbe6e2d766b4")
+var _aflTopic0_15 = common.HexToHash("0xec2dc3e5a3bb9aa0a1deb905d2bd23640d07f107e6ceb484024501aad964a951")
+var _aflTopic0_16 = common.HexToHash("0x8b4b2c8ebd04c47fc8bce136a85df9b93fcb1f47c8aa296457d4391519d190e7")
 
 // ConditionalTokensConditionPreparationProtoView is a zero-copy view into ConditionalTokensConditionPreparation proto columns.
 // It provides ECS-style access without allocation.
