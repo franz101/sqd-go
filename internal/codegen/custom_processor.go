@@ -529,6 +529,11 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 	if p.ProtoMode {
 		var curProtoBlock *ProtoEventBlock
 		var curBlockNum uint64
+		// Reused across logs within this Process call: AppendFromLog copies every
+		// topic/data word into the proto columns and retains neither slice, so one
+		// scratch each avoids a per-log []common.Hash and []byte (FromHex) alloc.
+		var topicsScratch []common.Hash
+		var dataScratch []byte
 
 		for _, lg := range logs {
 			if curProtoBlock == nil || curBlockNum != lg.BlockNumber {
@@ -549,11 +554,15 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 				TransactionIndex: lg.TransactionIndex,
 				LogIndex:         lg.LogIndex,
 			}
-			topics := make([]common.Hash, len(lg.Topics))
+			if cap(topicsScratch) < len(lg.Topics) {
+				topicsScratch = make([]common.Hash, len(lg.Topics))
+			}
+			topics := topicsScratch[:len(lg.Topics)]
 			for i, t := range lg.Topics {
 				topics[i] = abiunpack.DecodeTopicHash(t)
 			}
-			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, common.FromHex(lg.Data), meta)
+			dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
+			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, dataScratch, meta)
 		}
 		if curProtoBlock != nil {
 			return p.processProtoBlocks(ctx, stateStore, []*ProtoEventBlock{curProtoBlock})
