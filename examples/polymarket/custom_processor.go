@@ -546,6 +546,52 @@ func handleNegRiskOrderFilled(state *generated.State, ev *generated.NegRiskExcha
 }
 
 func handleOrderFilledValues(state *generated.State, maker common.Address, makerAssetID, takerAssetID, makerAmountFilled, takerAmountFilled uint256.Int, meta generated.EventMeta) {
+	// Native protomath fast path: order fills are the dominant event type, and
+	// the shopspring round-trip (uint256 -> big.Int -> decimal -> Decimal256)
+	// costs ~10x the arithmetic itself (see protomath_roundtrip_bench_test.go).
+	makerFilled, okM := usdcRawToDec18(&makerAmountFilled)
+	takerFilled, okT := usdcRawToDec18(&takerAmountFilled)
+	if !okM || !okT {
+		handleOrderFilledValuesShop(state, maker, makerAssetID, takerAssetID, makerAmountFilled, takerAmountFilled, meta)
+		return
+	}
+
+	var tokenID uint256.Int
+	var baseAmount, quoteAmount protomath.Decimal256
+	var isBuy bool
+	if makerAssetID.IsZero() { // BUY
+		isBuy = true
+		tokenID = takerAssetID
+		baseAmount = takerFilled
+		quoteAmount = makerFilled
+	} else { // SELL
+		isBuy = false
+		tokenID = makerAssetID
+		baseAmount = makerFilled
+		quoteAmount = takerFilled
+	}
+
+	// Price = quote / base (both in stake units now, quote in USDC, base in stake units)
+	var price protomath.Decimal256
+	if !baseAmount.IsZero() {
+		var ok bool
+		if price, ok = quoteAmount.Div(baseAmount, protomath.Decimal256Scale18); !ok {
+			handleOrderFilledValuesShop(state, maker, makerAssetID, takerAssetID, makerAmountFilled, takerAmountFilled, meta)
+			return
+		}
+	}
+
+	if isBuy {
+		updateUserPositionWithBuyD256(state, maker, tokenID, price, baseAmount, protomath.Decimal256{}, meta)
+	} else {
+		updateUserPositionWithSellD256(state, maker, tokenID, price, baseAmount, meta)
+	}
+}
+
+// handleOrderFilledValuesShop is the legacy shopspring implementation, kept as
+// the fallback for amounts too large for the native scale-18 conversion
+// (raw > ~1.16e65, unreachable for real fills).
+func handleOrderFilledValuesShop(state *generated.State, maker common.Address, makerAssetID, takerAssetID, makerAmountFilled, takerAmountFilled uint256.Int, meta generated.EventMeta) {
 	var tokenID uint256.Int
 	var baseAmount, quoteAmount decimal.Decimal
 	var isBuy bool
@@ -1049,6 +1095,122 @@ func uint256FromAddress(addr common.Address) uint256.Int {
 	var out uint256.Int
 	out.SetBytes(buf[:])
 	return out
+}
+
+// debugFillWallet gates the [DEBUG BUY]/[DEBUG SELL] traces. Compared as an
+// address, not via user.Hex(): Hex() computes an EIP-55 checksum (a keccak256
+// per call), which profiling showed at ~14% of handler CPU.
+var debugFillWallet = common.HexToAddress("0xf05B670C0F91F8171984db945A28D2Ad0F170cC4")
+
+var oneE12U256 = uint256.NewInt(1_000_000_000_000)
+
+// usdcRawToDec18 converts a 1e6-scaled on-chain amount (USDC / outcome tokens)
+// to a scale-18 Decimal256: coefficient = raw * 1e12. Equivalent to the legacy
+// Uint256ToDecimal(v).Div(1e6) without any big.Int or shopspring allocation.
+func usdcRawToDec18(v *uint256.Int) (protomath.Decimal256, bool) {
+	var scaled uint256.Int
+	if _, overflow := scaled.MulOverflow(v, oneE12U256); overflow {
+		return protomath.Decimal256{}, false
+	}
+	return protomath.FromUInt256AsDecimal256(protomath.FromHoliman(scaled))
+}
+
+// updateUserPositionWithBuyD256 is the native-Decimal256 equivalent of
+// updateUserPositionWithBuy: identical math, no shopspring round-trip. On
+// (unreachable) overflow an individual field update is skipped rather than
+// saturated; magnitudes near 10^59 are far outside real position sizes.
+func updateUserPositionWithBuyD256(state *generated.State, user common.Address, tokenID uint256.Int, price, amount, pnlAdj protomath.Decimal256, meta generated.EventMeta) {
+	if amount.IsZero() {
+		return
+	}
+	if user == debugFillWallet {
+		fmt.Printf("[DEBUG BUY] block=%d token=%s amount=%s price=%s pnlAdj=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), toDecimal(amount).String(), toDecimal(price).String(), toDecimal(pnlAdj).String())
+	}
+	up := getUserPosition(state, user, tokenID)
+	if up == nil {
+		up = &generated.Position{
+			User:    user,
+			TokenID: tokenIDHash(tokenID),
+		}
+	}
+
+	if !pnlAdj.IsZero() {
+		if v, ok := up.RealizedPnL.Add(pnlAdj); ok {
+			up.RealizedPnL = v
+		}
+	}
+	// avg' = (avg*amt + price*amount) / (amt + amount), computed before the
+	// amount update — mirrors updateAvgPriceDecimal.
+	scale := protomath.Decimal256Scale18
+	if denom, ok := up.Amount.Add(amount); ok && !denom.IsZero() {
+		numerA, okA := up.AvgPrice.Mul(up.Amount, scale)
+		numerB, okB := price.Mul(amount, scale)
+		if okA && okB {
+			if numer, okN := numerA.Add(numerB); okN {
+				if avg, okD := numer.Div(denom, scale); okD {
+					up.AvgPrice = avg
+				}
+			}
+		}
+	}
+	if v, ok := up.Amount.Add(amount); ok {
+		up.Amount = v
+	}
+	if v, ok := up.TotalBought.Add(amount); ok {
+		up.TotalBought = v
+	}
+	state.Position.Save(up, meta)
+}
+
+// updateUserPositionWithSellD256 is the native-Decimal256 equivalent of
+// updateUserPositionWithSell.
+func updateUserPositionWithSellD256(state *generated.State, user common.Address, tokenID uint256.Int, price, amount protomath.Decimal256, meta generated.EventMeta) {
+	isTargetUser := user == debugFillWallet
+	if isTargetUser {
+		fmt.Printf("[DEBUG SELL START] block=%d token=%s amount=%s price=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), toDecimal(amount).String(), toDecimal(price).String())
+	}
+	up := getUserPosition(state, user, tokenID)
+	if up == nil {
+		if isTargetUser {
+			fmt.Printf("[DEBUG SELL] position not found\n")
+		}
+		return
+	}
+
+	if isTargetUser {
+		fmt.Printf("[DEBUG SELL BEFORE] up.Amount=%s up.AvgPrice=%s up.RealizedPnL=%s\n",
+			toDecimal(up.Amount).String(), toDecimal(up.AvgPrice).String(), toDecimal(up.RealizedPnL).String())
+	}
+
+	adjAmt := amount
+	if adjAmt.Gt(up.Amount) {
+		adjAmt = up.Amount
+	}
+	if adjAmt.IsZero() {
+		if isTargetUser {
+			fmt.Printf("[DEBUG SELL] adjAmt is zero\n")
+		}
+		return
+	}
+	// PnL = amount * (price - avgPrice)
+	scale := protomath.Decimal256Scale18
+	if spread, ok := price.Sub(up.AvgPrice); ok {
+		if pnl, ok := adjAmt.Mul(spread, scale); ok {
+			if v, ok := up.RealizedPnL.Add(pnl); ok {
+				up.RealizedPnL = v
+			}
+		}
+	}
+	if v, ok := up.Amount.Sub(adjAmt); ok {
+		up.Amount = v
+	}
+
+	if isTargetUser {
+		fmt.Printf("[DEBUG SELL AFTER] up.Amount=%s up.RealizedPnL=%s (scaledBig=%s)\n",
+			toDecimal(up.Amount).String(), toDecimal(up.RealizedPnL).String(), up.RealizedPnL.ScaledBig().String())
+	}
+
+	state.Position.Save(up, meta)
 }
 
 func updateUserPositionWithBuy(state *generated.State, user common.Address, tokenID uint256.Int, price, amount, pnlAdj decimal.Decimal, meta generated.EventMeta) {
