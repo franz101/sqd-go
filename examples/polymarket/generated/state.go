@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 type Condition = MemoryCondition
@@ -319,6 +320,12 @@ type State struct {
 	// lastCommitWallNanos is the unix-nanos of the last hot-state commit, used
 	// by the hybrid block/time commit cadence. 0 means "not yet committed".
 	lastCommitWallNanos int64
+	// commitMaxBlocks / commitMaxInterval cache the hybrid commit cadence
+	// (SQD_COMMIT_INTERVAL, SQD_COMMIT_MAX_INTERVAL). Read once per State:
+	// commitCustomProcessing runs on every block, and an os.Getenv + parse
+	// per block is measurable overhead at backfill rates.
+	commitMaxBlocks   uint64
+	commitMaxInterval time.Duration
 	// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only
 	// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized
 	// head); during finalized backfill they are pure GC/memory churn, so the
@@ -348,6 +355,18 @@ func NewState() *State {
 	s.FixedProductMarketMaker = FixedProductMarketMakerState{state: s}
 	s.Position = PositionState{state: s}
 	s.ConditionPreparation = ConditionPreparationState{state: s}
+	s.commitMaxBlocks = 20000
+	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
+		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
+			s.commitMaxBlocks = parsed
+		}
+	}
+	s.commitMaxInterval = 3 * time.Second
+	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
+		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
+			s.commitMaxInterval = parsed
+		}
+	}
 	return s
 }
 

@@ -296,8 +296,9 @@ func assertA79UnderLoad(t *testing.T, ctx context.Context, store *database.Store
 	if err := fresh.HotState.UserPositions.Recover(ctx, store.Conn(), store.DB()); err != nil {
 		t.Fatalf("recover positions: %v", err)
 	}
+	// Positions store human units (stake / USDC) since the unit migration —
+	// realized PnL and amounts are read back directly, no 1e6 rescale.
 	wal := common.HexToAddress("0xa79af3bab636f41f1f7bd1c568857dbdf4650beb")
-	million := decimal.NewFromInt(1_000_000)
 	realized := decimal.Zero
 	openValueHalf := decimal.Zero
 	var n int
@@ -312,8 +313,8 @@ func assertA79UnderLoad(t *testing.T, ctx context.Context, store *database.Store
 		}
 		return true
 	})
-	pnl := realized.Div(million)
-	openVal := openValueHalf.Div(million)
+	pnl := realized
+	openVal := openValueHalf
 	t.Logf("[LOAD][%s][A79] positions=%d realized=$%s open=$%s", tag, n, pnl.StringFixed(4), openVal.StringFixed(4))
 	if n == 0 {
 		t.Fatalf("[%s] no A79 positions persisted under load", tag)

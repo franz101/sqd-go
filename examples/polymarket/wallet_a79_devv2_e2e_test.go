@@ -94,8 +94,9 @@ func runWalletA79V2Pipeline(t *testing.T, parseDecodeV2 bool) (pnl, openVal deci
 		t.Fatalf("recover positions: %v", err)
 	}
 
+	// Positions store human units (stake / USDC) since the unit migration —
+	// realized PnL and amounts are read back directly, no 1e6 rescale.
 	wallet := common.HexToAddress("0xa79af3bab636f41f1f7bd1c568857dbdf4650beb")
-	million := decimal.NewFromInt(1_000_000)
 	realized := decimal.Zero
 	openValueHalf := decimal.Zero
 	var n, nonzero int
@@ -112,7 +113,7 @@ func runWalletA79V2Pipeline(t *testing.T, parseDecodeV2 bool) (pnl, openVal deci
 		return true
 	})
 
-	return realized.Div(million), openValueHalf.Div(million), n
+	return realized, openValueHalf, n
 }
 
 // TestWalletA79DevV2EndToEnd runs the full V2 proto pipeline (proto Process path,

@@ -388,18 +388,9 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 	//     why raising maxBlocks does not loosen the live durability guarantee.
 	// This replaces the single magic block interval: the checkpoint never leads the
 	// durable horizon, and the gap is bounded in both blocks and wall-clock time.
-	maxBlocks := uint64(20000)
-	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
-		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
-			maxBlocks = parsed
-		}
-	}
-	maxInterval := 3 * time.Second
-	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
-		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
-			maxInterval = parsed
-		}
-	}
+	// Both bounds are cached on State at construction (this runs per block).
+	maxBlocks := state.commitMaxBlocks
+	maxInterval := state.commitMaxInterval
 
 	nowNanos := time.Now().UnixNano()
 	if state.lastCommitWallNanos == 0 {
@@ -486,6 +477,48 @@ func NewProcessor(protoMode bool) (*Processor, error) {
 		State:     NewState(),
 		ProtoMode: protoMode,
 	}, nil
+}
+
+// ProcessJSONL implements ingestion.FastJSONLProcessor: raw portal JSONL is
+// parsed once, directly into the preallocated ring-buffer slots (Reset keeps
+// column/slice capacity, so steady-state appends allocate nothing regardless
+// of the adaptive page size), and the custom processor runs per block. This
+// replaces the legacy CustomLog path end to end: no per-log string clones in
+// the producer, no hex re-decode here, no per-event map[string]any.
+func (p *Processor) ProcessJSONL(ctx context.Context, store *database.Store, data []byte) (uint64, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+			if err != nil {
+				return 0, err
+			}
+			p.protoRing = ring
+		}
+		return ParseJSONLProto(data, nil, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	}
+	if p.ring == nil {
+		ring, err := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, err
+		}
+		p.ring = ring
+	}
+	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
+		return CustomProcessing(ctx, stateStore, p.State, block)
+	})
 }
 
 func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {

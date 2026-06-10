@@ -163,8 +163,9 @@ func TestWalletA79DevV1EndToEnd(t *testing.T) {
 		t.Fatalf("recover positions: %v", err)
 	}
 
+	// Positions store human units (stake / USDC) since the unit migration —
+	// realized PnL and amounts are read back directly, no 1e6 rescale.
 	wallet := common.HexToAddress("0xa79af3bab636f41f1f7bd1c568857dbdf4650beb")
-	million := decimal.NewFromInt(1_000_000)
 	realized := decimal.Zero
 	openValueHalf := decimal.Zero
 	var n, nonzero int
@@ -181,8 +182,8 @@ func TestWalletA79DevV1EndToEnd(t *testing.T) {
 		return true
 	})
 
-	pnl := realized.Div(million)
-	openVal := openValueHalf.Div(million)
+	pnl := realized
+	openVal := openValueHalf
 	t.Logf("[dev-v1 e2e] positions=%d nonzero=%d realized=$%s open=$%s",
 		n, nonzero, pnl.StringFixed(4), openVal.StringFixed(4))
 
