@@ -47,7 +47,7 @@ type Options struct {
 
 const (
 	cursorPollInterval = 5 * time.Second
-	statsInterval      = 10 * time.Second
+	statsInterval      = 5 * time.Second
 
 	// Adaptive page sizing: when pageSize=0, grow page size based on performance
 	// Target ~20k blocks/second processing rate
@@ -574,7 +574,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 
 				batchStartBlock := pBlock
-				var lastBlockNumber uint64
 				for idx, db := range decodedBlocks {
 					// Backpressure check: wait if producer is too far ahead of consumer
 					for {
@@ -595,7 +594,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 					isLastInBatch := (idx == len(decodedBlocks)-1)
 					replayBuf.Write(chain.ID, db.number, db.hash, db.timestamp, db.events, db.logs, db.typedEvents, response.Head.Finalized, isLastInBatch, rangeLabel, batchStartBlock, db.raw)
-					lastBlockNumber = db.number
 					pHash = db.hash
 				}
 
@@ -606,7 +604,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				if len(decodedBlocks) > 0 {
 					select {
 					case next := <-advance:
-						log.Printf("[CURSOR DEBUG] pBlock: %d -> lastBlockNumber: %d -> consumer next: %d (blocks in batch: %d)", pBlock, lastBlockNumber, next.nextBlock, len(decodedBlocks))
 						pBlock = next.nextBlock
 						pHash = next.parentHash
 					case <-pCtx.Done():
@@ -873,12 +870,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						}
 					}
 				}
-
-				scanned := entry.number - entry.requestStartBlock + 1
-				elapsed := time.Now().Sub(startTime)
-				rate := float64(atomic.LoadUint64(&totalBlocks)) / elapsed.Seconds()
-				log.Printf("Chain %d: %s scanned %d blocks, event blocks: %d, events: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
-					chain.ID, entry.rangeLabel, scanned, batchEventBlocks, batchEventsCount, entry.number, atomic.LoadUint64(&totalBlocks), atomic.LoadUint64(&totalEvents), rate)
 
 				lastCheckpoint = entry.number
 				resetBatch()
