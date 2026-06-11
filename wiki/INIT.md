@@ -44,9 +44,11 @@ sqd-go init contract-import local [path] \
   [--start-block 0]
 ```
 
-If `[path]` (project directory) is omitted, it's derived from the contract name: lowercase, non-alphanumeric chars replaced with dashes. E.g. `--name MyToken` → `my-token/`.
+If `[path]` (project directory) is omitted, it's derived from the contract name: lowercased, with runs of non-alphanumeric characters replaced by a single dash (camelCase is not split). E.g. `--name MyToken` → `mytoken/`, `--name UniswapV2Factory` → `uniswapv2factory/`, `--name my token` → `my-token/`.
 
 The ABI is read, all `"type": "event"` entries are extracted into Solidity event signatures like `Transfer(address indexed from, address indexed to, uint256 value)`, and these are written as the contract's event list in `config.yaml`.
+
+If the ABI defines no events, the command fails with `no events found in ABI`. This is common with router and library contracts (e.g. the Uniswap V2 Router02), which emit no events themselves — pass the ABI of the contract that actually emits the events you want to index (for Uniswap V2: the Factory's `PairCreated`, or a Pair's `Swap`/`Sync`/`Mint`/`Burn`).
 
 ## Template (`sqd-go init template [erc20] [path]`)
 
@@ -78,7 +80,13 @@ import (
 
 func Process(state *generated.State, block *generated.ParsedBlock) error {
     // add code here
-    // handleEventX()
+    // for ev := range block.EventsIter() {
+    //     switch e := ev.(type) {
+    //     case *generated.MyEvent:
+    //         // handle event
+    //     }
+    // }
+    //
     // state.UserPosition.Save(entity, meta)
     return nil
 }
@@ -86,7 +94,7 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 func init() {
     generated.CustomProcessFn = Process
     cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-        return generated.NewProcessor()
+        return generated.NewProcessor(cli.GetProtoMode())
     })
 }
 ```

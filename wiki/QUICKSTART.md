@@ -25,16 +25,18 @@ go build -o sqd-go .
 
 ### From an ABI
 
-Download the [Uniswap V2 Router ABI](https://etherscan.io/address/0x7a250d5630b4cf539739df2c5dacb4c659f2488d#code) or use any contract ABI JSON:
+Download the [Uniswap V2 Factory ABI](https://etherscan.io/address/0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f#code) or use any contract ABI JSON:
 
 ```bash
 sqd-go init contract-import local \
-  --abi uniswap_v2_router.json \
-  --name UniswapV2Router \
+  --abi uniswap_v2_factory.json \
+  --name UniswapV2Factory \
   --blockchain ethereum \
   --start-block 10000835 \
-  --address 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+  --address 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f
 ```
+
+> **The ABI must define at least one event.** `contract-import` extracts `"type": "event"` entries from the ABI; if there are none it fails with `no events found in ABI`. Router and library contracts (e.g. the Uniswap V2 Router02) emit no events of their own — index the contract that actually emits them instead (for Uniswap V2: the Factory emits `PairCreated`, each Pair emits `Swap`/`Sync`/`Mint`/`Burn`).
 
 ### From the ERC20 Template
 
@@ -51,7 +53,7 @@ sqd-go
 All three produce the same structure:
 
 ```
-uniswap-v2-router/
+uniswapv2factory/
   config.yaml       # event definitions, chain, start block
   .env              # ClickHouse connection
   compose.yml       # local ClickHouse via Docker
@@ -63,7 +65,7 @@ uniswap-v2-router/
 ### Dev mode (manages Docker for you)
 
 ```bash
-sqd-go dev my-token/
+sqd-go dev uniswapv2factory/
 ```
 
 This runs `docker compose up`, starts indexing, and tears down on exit.
@@ -71,8 +73,8 @@ This runs `docker compose up`, starts indexing, and tears down on exit.
 ### Start mode (bring your own ClickHouse)
 
 ```bash
-docker compose -f my-token/compose.yml up -d
-sqd-go start my-token/
+docker compose -f uniswapv2factory/compose.yml up -d
+sqd-go start uniswapv2factory/
 ```
 
 Press `Ctrl+C` to stop. The indexer saves a cursor and resumes from where it left off.
@@ -80,7 +82,7 @@ Press `Ctrl+C` to stop. The indexer saves a cursor and resumes from where it lef
 ### Re-index from scratch
 
 ```bash
-sqd-go start my-token/ --restart
+sqd-go start uniswapv2factory/ --restart
 ```
 
 ## 4. Query ClickHouse
@@ -88,17 +90,17 @@ sqd-go start my-token/ --restart
 ```bash
 docker exec -it clickhouse clickhouse-client \
   --password sqd-clickhouse \
-  --query "SELECT * FROM my_token.my_token_transfers LIMIT 10"
+  --query "SELECT * FROM UniswapV2Factory.uniswap_v2_factory_pair_created_events LIMIT 10"
 ```
 
-Every event gets its own typed table. A `Transfer(address indexed from, address indexed to, uint256 value)` event on contract `MyToken` produces `my_token.my_token_transfers` with columns `from`, `to`, `value`, plus metadata columns (`block_number`, `transaction_index`, `log_index`, `block_timestamp`).
+The database is named after the config `name` (here `UniswapV2Factory`, override with `CLICKHOUSE_DATABASE`). Every event gets its own typed table named `<contract>_<event>_events`. The `PairCreated(address indexed token0, address indexed token1, address pair, uint256)` event on contract `UniswapV2Factory` produces `uniswap_v2_factory_pair_created_events` with columns `token0`, `token1`, `pair`, plus metadata columns (`block_number`, `transaction_index`, `log_index`, `block_timestamp`). A `Transfer(address indexed from, address indexed to, uint256 value)` event on contract `MyToken` would produce `my_token_transfer_events`.
 
 ## 5. Add Custom Logic
 
 Once basic indexing works, add derived state (balances, PnL, aggregations):
 
 ```bash
-sqd-go init my-token/
+sqd-go init uniswapv2factory/
 ```
 
 This scaffolds two files:
@@ -109,7 +111,7 @@ This scaffolds two files:
 Then re-run:
 
 ```bash
-sqd-go start my-token/ --restart
+sqd-go start uniswapv2factory/ --restart
 ```
 
 See [Custom Schema](CUSTOM_SCHEMA.md) and [Custom Processor](CUSTOM_PROCESSOR.md) for the full guide.

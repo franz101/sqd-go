@@ -245,7 +245,7 @@ func runInitContractImport(p *parsedArgs) int {
 		return 1
 	}
 	if len(events) == 0 {
-		fmt.Fprintln(os.Stderr, "no events found in ABI")
+		fmt.Fprintf(os.Stderr, "no events found in %s: the ABI has no \"type\":\"event\" entries; router/library contracts emit no events — use the ABI of the contract that emits them (e.g. for Uniswap V2, the Factory or a Pair, not the Router)\n", p.initABI)
 		return 1
 	}
 	eventConfigs := make([]config.EventConfig, len(events))

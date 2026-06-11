@@ -82,7 +82,7 @@ func InitContractImport(opts ContractImportOptions) (string, error) {
 		return "", err
 	}
 	if len(events) == 0 {
-		return "", fmt.Errorf("no events found in %s", opts.ABIFile)
+		return "", fmt.Errorf("no events found in %s: the ABI has no \"type\":\"event\" entries; router/library contracts emit no events — use the ABI of the contract that emits them (e.g. for Uniswap V2, the Factory or a Pair, not the Router)", opts.ABIFile)
 	}
 
 	cfg := config.Config{

@@ -189,7 +189,7 @@ func initializeFromRequest(req *interactiveInitRequest) (string, int, error) {
 			return "", 0, fmt.Errorf("parse abi: %w", err)
 		}
 		if len(events) == 0 {
-			return "", 0, fmt.Errorf("no events found in ABI")
+			return "", 0, fmt.Errorf("no events found in ABI: the ABI has no \"type\":\"event\" entries; router/library contracts emit no events — use the ABI of the contract that emits them (e.g. for Uniswap V2, the Factory or a Pair, not the Router)")
 		}
 		eventConfigs := make([]config.EventConfig, len(events))
 		for i, event := range events {

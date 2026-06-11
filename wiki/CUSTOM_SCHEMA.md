@@ -23,9 +23,16 @@ Create `custom_schema.go` next to your `config.yaml`. Struct naming convention:
 
 ### Struct Comments: Primary Key
 
-Use a `pk:` comment to declare the primary key:
+Use a `pk:` comment to declare the primary key. A complete `custom_schema.go` looks like this (the package name must match your project package):
 
 ```go
+package myproject
+
+import (
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/holiman/uint256"
+)
+
 // pk: ID
 type MemoryConditionSchema struct {
     ID               common.Hash
@@ -193,6 +200,14 @@ This allows placing the schema either next to config.yaml or in the project root
 ## Real-World Example: Polymarket
 
 ```go
+package polymarket
+
+import (
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/franz101/sqd-go/drafts/protomath"
+    "github.com/holiman/uint256"
+)
+
 // pk: ID
 type MemoryConditionSchema struct {
     ID               common.Hash

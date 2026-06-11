@@ -25,6 +25,10 @@ Two types of custom processor exist, selected by codegen based on whether custom
 Simplest path. Generated `custom_processor.go` provides:
 
 ```go
+package generated
+
+import "context"
+
 func CustomProcessing(ctx context.Context, store Store, entities *Entities) error {
     // entities has typed slices: entities.Transfer, entities.Approval, etc.
     return nil
@@ -57,9 +61,9 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
     for ev := range block.EventsIter() {
         switch e := ev.(type) {
         case *generated.ERC20Transfer:
-            // handle Transfer event
+            _ = e // handle Transfer event: e.From, e.To, e.Value
         case *generated.ERC20Approval:
-            // handle Approval event
+            _ = e // handle Approval event: e.Owner, e.Spender, e.Value
         }
     }
     return nil
@@ -69,7 +73,7 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 func init() {
     generated.CustomProcessFn = Process
     cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-        return generated.NewProcessor()
+        return generated.NewProcessor(cli.GetProtoMode())
     })
 }
 ```
@@ -142,7 +146,7 @@ if !ok {
 **Writing state:**
 
 ```go
-pos.Balance = new(big.Int).Add(&pos.Balance, &amount)
+pos.Balance.Add(&pos.Balance, &amount) // uint256.Int mutates in place
 state.UserPositions.Save(pos, eventMeta)
 ```
 
@@ -178,6 +182,13 @@ Settings: `async_insert=1`, `wait_for_async_insert=0` for maximum throughput.
 ## Real-World Example: Uniswap PnL Transfer Tracker
 
 ```go
+package uniswap
+
+import (
+    "github.com/ethereum/go-ethereum/common"
+    generated "github.com/franz101/sqd-go/examples/uniswap/generated"
+)
+
 func Process(state *generated.State, block *generated.ParsedBlock) error {
     for ev := range block.EventsIter() {
         switch e := ev.(type) {
@@ -224,12 +235,16 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 If you don't need persistent state, fork recovery, or snapshots, you can use the simpler path. The generated `CustomProcessing` function receives `entities *Entities` with all decoded events pre-grouped:
 
 ```go
+package generated
+
+import "context"
+
 func CustomProcessing(ctx context.Context, store Store, entities *Entities) error {
     for _, ev := range entities.ERC20Transfer {
-        // process Transfer events
+        _ = ev // process Transfer events
     }
     for _, ev := range entities.ERC20Approval {
-        // process Approval events
+        _ = ev // process Approval events
     }
     return nil
 }

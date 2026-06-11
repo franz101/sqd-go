@@ -1,6 +1,6 @@
 # PnL Example: ERC20 Token Balance Tracker
 
-End-to-end example of tracking token balances and computing per-wallet profit/loss from `Transfer` events. Uses the `examples/uniswap_pnl/` project as reference.
+End-to-end example of tracking token balances and computing per-wallet profit/loss from `Transfer` events. Uses the `examples/uniswap/` project as reference.
 
 ## What It Does
 
@@ -33,7 +33,7 @@ One contract, one event, one chain. The `name` field becomes the ClickHouse data
 
 ```go
 // custom_schema.go
-package uniswap_pnl
+package uniswap
 
 import (
     "time"
@@ -64,11 +64,11 @@ The `// pk: Address` comment tells codegen that `Address` is the primary key. Co
 
 ```go
 // custom_processor.go
-package uniswap_pnl
+package uniswap
 
 import (
     "github.com/ethereum/go-ethereum/common"
-    generated "github.com/franz101/sqd-go/examples/uniswap_pnl/generated"
+    generated "github.com/franz101/sqd-go/examples/uniswap/generated"
     "github.com/franz101/sqd-go/internal/cli"
     "github.com/franz101/sqd-go/internal/ingestion"
 )
@@ -112,7 +112,7 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 func init() {
     generated.CustomProcessFn = Process
     cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-        return generated.NewProcessor()
+        return generated.NewProcessor(cli.GetProtoMode())
     })
 }
 ```
@@ -132,7 +132,7 @@ func init() {
 ```bash
 # Build and start
 go build -o tmp/main .
-CLICKHOUSE_DATABASE=case_1_lbtc_event_only tmp/main start examples/uniswap_pnl --restart
+CLICKHOUSE_DATABASE=case_1_lbtc_event_only tmp/main start examples/uniswap --restart
 ```
 
 Or via the Makefile:
@@ -205,6 +205,15 @@ SQD HTTP → zstd JSONL → Parse → Decode Transfer events
 For real PnL (realized profit/loss with average cost tracking), add `AvgPrice`, `RealizedPnL`, and `TotalBought` fields to the schema and implement weighted-average cost basis:
 
 ```go
+package uniswap
+
+import (
+    "time"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/franz101/sqd-go/drafts/protomath"
+)
+
 // pk: User, TokenID
 type MemoryUserPositionSchema struct {
     User           common.Address
@@ -221,6 +230,8 @@ type MemoryUserPositionSchema struct {
 Buy logic (weighted average):
 
 ```go
+import "github.com/shopspring/decimal"
+
 func updateAvgPrice(currentAvg, currentAmt, newPrice, newAmt decimal.Decimal) decimal.Decimal {
     denom := currentAmt.Add(newAmt)
     if denom.IsZero() {
