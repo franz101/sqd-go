@@ -347,8 +347,22 @@ type memorySnapshot struct {
 
 const maxSnapshots = 128
 
+// hotCacheCapacity returns the per-entity hot clock-cache capacity.
+// SQD_HOTCACHE_CAP overrides the default (entries per cache, preallocated
+// flat rings — memory is capacity * entry size * number of entities, fixed at
+// startup). Raise it when the live-entity working set exceeds the default and
+// misses fall through to the cold tier's synchronous disk reads.
+func hotCacheCapacity() uint64 {
+	if envVal := os.Getenv("SQD_HOTCACHE_CAP"); envVal != "" {
+		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return DefaultClockCacheCapacity
+}
+
 func NewState() *State {
-	s := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}
+	s := &State{HotState: NewHotState(hotCacheCapacity()), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}
 	s.Condition = ConditionState{state: s}
 	s.UserPosition = UserPositionState{state: s}
 	s.Market = MarketState{state: s}
@@ -534,7 +548,7 @@ func (s *State) RestoreToBlock(blockNumber uint64) (uint64, error) {
 	// blocks > the restore point and must not survive a reorg. Post-restore reads
 	// fall back to ClickHouse (rolled back to the safe block) — correct.
 	_ = s.HotState.CloseColdCache()
-	s.HotState = NewHotState(DefaultClockCacheCapacity)
+	s.HotState = NewHotState(hotCacheCapacity())
 	for _, val := range best.conditions {
 		s.HotState.Conditions.Set(val)
 	}

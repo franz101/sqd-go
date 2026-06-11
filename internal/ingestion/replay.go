@@ -27,6 +27,15 @@ type blockEntry struct {
 	rangeLabel        string
 	requestStartBlock uint64
 	raw               []byte
+
+	// Producer-parse handoff (FastBatchParseProcessor): proto is the parsed
+	// columnar block (slot of the processor's preallocated ring; valid until
+	// the ring recycles it, which the producer backpressure keeps strictly
+	// behind the consumer). batchFlush/batchEvents ride on the batch's last
+	// entry: the flush inserts the batch's captured event rows.
+	proto       any
+	batchFlush  func(context.Context) error
+	batchEvents uint64
 }
 
 // ReplayBuffer is a circular buffer of recent blocks that enables fork recovery
@@ -108,6 +117,51 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 	}
 	rb.index[blockNumber] = idx
 	rb.latestBlock.Store(blockNumber)
+
+	rb.writePos++
+	if rb.count < rb.capacity {
+		rb.count++
+	}
+
+	select {
+	case rb.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+// WriteParsed stores a producer-parsed block. Same slot lifecycle as Write;
+// the mutex pair (this lock, GetBlock's lock) is also the happens-before edge
+// that publishes the parsed ring slot's contents to the consumer.
+func (rb *ReplayBuffer) WriteParsed(chainID uint64, b BatchParsedBlock, finalized *client.BlockRef, isLastInBatch bool, rangeLabel string, requestStartBlock uint64, batchFlush func(context.Context) error, batchEvents uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	idx := rb.writePos % rb.capacity
+	if rb.count == rb.capacity {
+		delete(rb.index, rb.slots[idx].number)
+	}
+
+	rb.slots[idx] = blockEntry{
+		number:            b.Number,
+		hash:              b.Hash,
+		timestamp:         b.Timestamp,
+		finalized:         finalized,
+		isLastInBatch:     isLastInBatch,
+		rangeLabel:        rangeLabel,
+		requestStartBlock: requestStartBlock,
+		blockRow: database.BlockRow{
+			ChainID:        chainID,
+			BlockNumber:    b.Number,
+			BlockTimestamp: b.Timestamp,
+			BlockHash:      b.Hash,
+		},
+		raw:         b.RawLine,
+		proto:       b.Block,
+		batchFlush:  batchFlush,
+		batchEvents: batchEvents,
+	}
+	rb.index[b.Number] = idx
+	rb.latestBlock.Store(b.Number)
 
 	rb.writePos++
 	if rb.count < rb.capacity {
@@ -339,7 +393,6 @@ func (rb *ReplayBuffer) rebuildIndexLocked() {
 		rb.index[entry.number] = pos
 	}
 }
-
 
 // ReplayFromBuffer replays blocks from the buffer through the full ingestion
 // pipeline: ClickHouse insert + custom processor. Called during fork recovery

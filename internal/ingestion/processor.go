@@ -2,6 +2,7 @@ package ingestion
 
 import (
 	"context"
+	"time"
 
 	"github.com/franz101/sqd-go/internal/database"
 )
@@ -43,6 +44,44 @@ type FastJSONLProcessor interface {
 type FastJSONLInsertProcessor interface {
 	FastJSONLProcessor
 	ProcessJSONLWithInserts(ctx context.Context, store *database.Store, data []byte) (uint64, func(context.Context) error, error)
+}
+
+// BatchParsedBlock carries one parsed block from the producer's parse stage to
+// the consumer. Block is the generated columnar block (type-erased; nil when
+// the line had no logs key). The replay buffer's mutex is the happens-before
+// edge that publishes the producer's writes to the consumer, so no further
+// synchronization is needed despite the shared preallocated ring slots.
+type BatchParsedBlock struct {
+	Number    uint64
+	Hash      string
+	Timestamp time.Time
+	RawLine   []byte
+	Block     any
+}
+
+// FastBatchParseProcessor moves the single parse onto the PRODUCER goroutine:
+// ParseBatchForInserts parses a whole fetch response once — filling the
+// preallocated block ring and a pooled insert batch — and streams one
+// BatchParsedBlock per line (in order) through onParsed. The consumer then
+// runs only ProcessParsedBlock (state math) per block, plus the returned
+// batch flush, which must be invoked serially after all the batch's blocks.
+//
+// Concurrency contract: ParseBatchForInserts is called by exactly one
+// goroutine at a time; ProcessParsedBlock by exactly one other; a parsed
+// block is handed to ProcessParsedBlock only after an intervening
+// happens-before edge (the replay buffer handoff). Taking a pooled insert
+// batch blocks when all are in flight, so producer lead stays bounded.
+type FastBatchParseProcessor interface {
+	FastJSONLInsertProcessor
+	// SupportsBatchParse reports whether the processor's mode allows the
+	// producer-side parse (generated processors support it in proto mode).
+	SupportsBatchParse() bool
+	ParseBatchForInserts(store *database.Store, data []byte, endBlock uint64, onParsed func(BatchParsedBlock) error) (uint64, func(context.Context) error, error)
+	ProcessParsedBlock(ctx context.Context, store *database.Store, block any) error
+	// ReclaimParseBatches refills the insert-batch pool after fork recovery
+	// discards replay-buffer entries whose batch flush was never invoked.
+	// Only call when no parse and no flush is in flight.
+	ReclaimParseBatches()
 }
 
 // CommitHorizonReporter is optionally implemented by processors that durably

@@ -56,14 +56,14 @@ package generated
 
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
-		`"context"`:                                            "",
-		`"fmt"`:                                                "",
-		`"strings"`:                                            "",
-		`"sync"`:                                               "",
-		`"sync/atomic"`:                                        "",
-		`"github.com/ClickHouse/ch-go"`:                        "",
-		`"github.com/ClickHouse/ch-go/proto"`:                  "",
-		`"github.com/franz101/sqd-go/internal/coldcache"`:      "",
+		`"context"`:                           "",
+		`"fmt"`:                               "",
+		`"strings"`:                           "",
+		`"sync"`:                              "",
+		`"sync/atomic"`:                       "",
+		`"github.com/ClickHouse/ch-go"`:       "",
+		`"github.com/ClickHouse/ch-go/proto"`: "",
+		`"github.com/franz101/sqd-go/internal/coldcache"`: "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""
@@ -836,37 +836,37 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	b.WriteString("\t}\n")
 	b.WriteString("\treturn nil\n}\n")
 
-		// Generate Restore methods for journal rollback
-		for _, spec := range specs {
-			if spec.table.IsEvent {
-				continue
-			}
-			b.WriteString("func (s *HotState) Restore")
-			b.WriteString(spec.table.GoTypeName)
-			b.WriteString("(key ")
-			b.WriteString(spec.keyType)
-			b.WriteString(", value ")
-			b.WriteString(spec.table.GoTypeName)
-			b.WriteString(", had bool) {\n")
-			b.WriteString("\ts.mu.Lock()\n")
-			b.WriteString("\tdefer s.mu.Unlock()\n")
-			b.WriteString("\tif had {\n")
-			b.WriteString("\t\ts.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".SetByKey(key, value)\n")
-			b.WriteString("\t\ts.dirty")
-			b.WriteString(spec.baseName)
-			b.WriteString("[key] = struct{}{}\n")
-			b.WriteString("\t\treturn\n")
-			b.WriteString("\t}\n")
-			b.WriteString("\ts.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".Delete(key)\n")
-			b.WriteString("\tdelete(s.dirty")
-			b.WriteString(spec.baseName)
-			b.WriteString(", key)\n")
-			b.WriteString("}\n\n")
+	// Generate Restore methods for journal rollback
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
 		}
+		b.WriteString("func (s *HotState) Restore")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString("(key ")
+		b.WriteString(spec.keyType)
+		b.WriteString(", value ")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString(", had bool) {\n")
+		b.WriteString("\ts.mu.Lock()\n")
+		b.WriteString("\tdefer s.mu.Unlock()\n")
+		b.WriteString("\tif had {\n")
+		b.WriteString("\t\ts.")
+		b.WriteString(spec.baseName)
+		b.WriteString(".SetByKey(key, value)\n")
+		b.WriteString("\t\ts.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString("[key] = struct{}{}\n")
+		b.WriteString("\t\treturn\n")
+		b.WriteString("\t}\n")
+		b.WriteString("\ts.")
+		b.WriteString(spec.baseName)
+		b.WriteString(".Delete(key)\n")
+		b.WriteString("\tdelete(s.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString(", key)\n")
+		b.WriteString("}\n\n")
+	}
 }
 
 func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {

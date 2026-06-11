@@ -267,9 +267,11 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/ClickHouse/ch-go"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/ingestion"
@@ -465,7 +467,14 @@ type Processor struct {
 	// so steady-state insert capture allocates nothing.
 	insertBatches  [2]*InsertBatches
 	insertBatchIdx int
+
+	// batchFree is the producer-parse insert-batch pool (ParseBatchForInserts).
+	// Taking blocks when every batch is in flight, which bounds how far the
+	// producer's parse can run ahead of the consumer's flushes.
+	batchFree chan *InsertBatches
 }
+
+const insertBatchPoolSize = 4
 
 func NewProcessor(protoMode bool) (*Processor, error) {
 	var ring *OrderedHistoricRingBuffer
@@ -600,6 +609,112 @@ func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *database
 		return batches.Insert(fctx, conn, db)
 	}
 	return n, flush, nil
+}
+
+// SupportsBatchParse implements ingestion.FastBatchParseProcessor: the
+// producer-side parse hands the consumer preallocated columnar ring slots,
+// which only the proto ring provides.
+func (p *Processor) SupportsBatchParse() bool {
+	return p != nil && p.ProtoMode
+}
+
+// ParseBatchForInserts implements ingestion.FastBatchParseProcessor. It runs
+// on the PRODUCER goroutine: one parse of the whole fetch response fills the
+// preallocated proto ring and a pooled insert batch, streaming one
+// BatchParsedBlock per line through onParsed (which may block for downstream
+// backpressure). The consumer later runs ProcessParsedBlock per block and the
+// returned flush once per batch; the replay-buffer handoff between the two
+// goroutines provides the happens-before for the shared preallocated memory.
+func (p *Processor) ParseBatchForInserts(store *database.Store, data []byte, endBlock uint64, onParsed func(ingestion.BatchParsedBlock) error) (uint64, func(context.Context) error, error) {
+	if p == nil || !p.ProtoMode || len(data) == 0 {
+		return 0, nil, nil
+	}
+	if p.protoRing == nil {
+		ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, nil, err
+		}
+		p.protoRing = ring
+	}
+	if p.batchFree == nil {
+		// Cap is 2x the pool so a stray late return can never block a flush
+		// goroutine on the channel send.
+		p.batchFree = make(chan *InsertBatches, 2*insertBatchPoolSize)
+		for i := 0; i < insertBatchPoolSize; i++ {
+			p.batchFree <- NewInsertBatches()
+		}
+	}
+	logProtoModeOnce.Do(func() {
+		log.Printf("processor: producer-parse fast path (proto ring + pooled insert batches)")
+	})
+	batches := <-p.batchFree
+	n, err := ParseJSONLProtoStream(data, batches, p.protoRing, endBlock, func(proto *ProtoEventBlock, number, timestamp uint64, hash string, line []byte) error {
+		if onParsed == nil {
+			return nil
+		}
+		return onParsed(ingestion.BatchParsedBlock{
+			Number:    number,
+			Hash:      strings.Clone(hash),
+			Timestamp: time.Unix(int64(timestamp), 0).UTC(),
+			RawLine:   line,
+			Block:     proto,
+		})
+	})
+	if err != nil {
+		batches.Reset()
+		p.batchFree <- batches
+		return n, nil, err
+	}
+	var conn *ch.Client
+	var db string
+	if store != nil {
+		conn = store.InsertConn()
+		db = store.DB()
+	}
+	flush := func(fctx context.Context) error {
+		defer func() {
+			batches.Reset()
+			p.batchFree <- batches
+		}()
+		if conn == nil {
+			return nil
+		}
+		return batches.Insert(fctx, conn, db)
+	}
+	return n, flush, nil
+}
+
+// ReclaimParseBatches implements ingestion.FastBatchParseProcessor: refills
+// the pool after fork recovery dropped entries whose flush never ran. Callers
+// guarantee no parse/flush is in flight, so pool content + losses = pool size.
+func (p *Processor) ReclaimParseBatches() {
+	if p == nil || p.batchFree == nil {
+		return
+	}
+	for len(p.batchFree) < insertBatchPoolSize {
+		p.batchFree <- NewInsertBatches()
+	}
+}
+
+// ProcessParsedBlock implements ingestion.FastBatchParseProcessor: runs the
+// custom processor on one producer-parsed block (consumer goroutine only).
+func (p *Processor) ProcessParsedBlock(ctx context.Context, store *database.Store, block any) error {
+	if p == nil || block == nil {
+		return nil
+	}
+	pb, ok := block.(*ProtoEventBlock)
+	if !ok || pb == nil {
+		return nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	return CustomProcessingProto(ctx, stateStore, p.State, pb)
 }
 
 func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {

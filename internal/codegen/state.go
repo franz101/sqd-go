@@ -75,8 +75,23 @@ package generated
 	b.WriteString("}\n\n")
 	b.WriteString("const maxSnapshots = 128\n\n")
 
+	b.WriteString(`// hotCacheCapacity returns the per-entity hot clock-cache capacity.
+// SQD_HOTCACHE_CAP overrides the default (entries per cache, preallocated
+// flat rings — memory is capacity * entry size * number of entities, fixed at
+// startup). Raise it when the live-entity working set exceeds the default and
+// misses fall through to the cold tier's synchronous disk reads.
+func hotCacheCapacity() uint64 {
+	if envVal := os.Getenv("SQD_HOTCACHE_CAP"); envVal != "" {
+		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return DefaultClockCacheCapacity
+}
+
+`)
 	b.WriteString("func NewState() *State {\n")
-	b.WriteString("\ts := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}\n")
+	b.WriteString("\ts := &State{HotState: NewHotState(hotCacheCapacity()), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}\n")
 	for _, handle := range handles {
 		b.WriteString("\ts.")
 		b.WriteString(handle.name)
@@ -261,7 +276,7 @@ func (s *State) RestoreToBlock(blockNumber uint64) (uint64, error) {
 	// blocks > the restore point and must not survive a reorg. Post-restore reads
 	// fall back to ClickHouse (rolled back to the safe block) — correct.
 	_ = s.HotState.CloseColdCache()
-	s.HotState = NewHotState(DefaultClockCacheCapacity)
+	s.HotState = NewHotState(hotCacheCapacity())
 `)
 	for _, spec := range specs {
 		if spec.table.IsEvent {

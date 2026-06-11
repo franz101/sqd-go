@@ -41,14 +41,36 @@ func ParseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 }
 
 func ParseJSONLV2(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, onBlock func(*ParsedBlock) error) (uint64, error) {
-	return parseJSONL(data, batches, ring, nil, onBlock, nil)
+	return parseJSONL(data, batches, ring, nil, onBlock, nil, 0, nil)
 }
 
 func ParseJSONLProto(data []byte, batches *InsertBatches, ring *ProtoRingBuffer, onBlock func(*ProtoEventBlock) error) (uint64, error) {
-	return parseJSONL(data, batches, nil, ring, nil, onBlock)
+	return parseJSONL(data, batches, nil, ring, nil, onBlock, 0, nil)
 }
 
-func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, protoRing *ProtoRingBuffer, onBlock func(*ParsedBlock) error, onProtoBlock func(*ProtoEventBlock) error) (uint64, error) {
+// parsedLineMeta identifies one JSONL line to the streaming onLine callback.
+type parsedLineMeta struct {
+	number    uint64
+	timestamp uint64
+	hash      string
+	line      []byte
+}
+
+// ParseJSONLProtoStream is the producer-side single-parse entry point: blocks
+// beyond endBlock (0 = unbounded) are byte-skipped without claiming a ring
+// slot, and onLine fires once per parsed line — including lines without logs
+// (proto == nil) — so the caller can stream every block downstream in order.
+func ParseJSONLProtoStream(data []byte, batches *InsertBatches, ring *ProtoRingBuffer, endBlock uint64, onLine func(proto *ProtoEventBlock, number, timestamp uint64, hash string, line []byte) error) (uint64, error) {
+	var cb func(*ParsedBlock, *ProtoEventBlock, parsedLineMeta) error
+	if onLine != nil {
+		cb = func(_ *ParsedBlock, proto *ProtoEventBlock, m parsedLineMeta) error {
+			return onLine(proto, m.number, m.timestamp, m.hash, m.line)
+		}
+	}
+	return parseJSONL(data, batches, nil, ring, nil, nil, endBlock, cb)
+}
+
+func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, protoRing *ProtoRingBuffer, onBlock func(*ParsedBlock) error, onProtoBlock func(*ProtoEventBlock) error, endBlock uint64, onLine func(*ParsedBlock, *ProtoEventBlock, parsedLineMeta) error) (uint64, error) {
 	var topics [4]string
 	var dataHex string
 	var dataBytes []byte
@@ -76,6 +98,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		var blockHash string
 		var slot *ParsedBlock
 		var protoSlot *ProtoEventBlock
+		var lineSkipped bool
 
 		l.Delim('{')
 		for !l.IsDelim('}') {
@@ -101,6 +124,14 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				}
 				l.Delim('}')
 			case "logs":
+				if endBlock > 0 && blockNum > endBlock {
+					// Beyond the requested range: byte-skip the logs without
+					// claiming a ring slot (the line fires no callback).
+					lineSkipped = true
+					l.SkipRecursive()
+					l.WantComma()
+					continue
+				}
 				if ring != nil {
 					slot = ring.NextSlot(blockNum, blockHash)
 				}
@@ -239,6 +270,14 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		l.Delim('}')
 		if !l.Ok() {
 			return eventCount, l.Error()
+		}
+		if onLine != nil {
+			if !lineSkipped {
+				if err := onLine(slot, protoSlot, parsedLineMeta{number: blockNum, timestamp: blockTimestamp, hash: blockHash, line: line}); err != nil {
+					return eventCount, err
+				}
+			}
+			continue
 		}
 		if onBlock != nil && slot != nil {
 			if err := onBlock(slot); err != nil {

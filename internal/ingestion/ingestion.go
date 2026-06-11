@@ -331,7 +331,18 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	fastInsertProc, fastInsertOK := proc.(FastJSONLInsertProcessor)
 	singleParse := useParseDecodeV2 && fastInsertOK && !storeBlocks && !cfg.ShouldStoreRawLogs() &&
 		os.Getenv("SQD_SINGLE_PARSE") != "0"
-	if singleParse {
+	// Producer-parse mode: the single parse moves OFF the consumer onto the
+	// producer goroutine, which has idle backpressure headroom. The consumer
+	// receives ready-parsed columnar blocks through the replay buffer and runs
+	// only state math + commits — the critical path sheds the whole parse and
+	// the insert-column fill. SQD_PRODUCER_PARSE=0 falls back to consumer-parse.
+	batchProc, batchProcOK := proc.(FastBatchParseProcessor)
+	batchParse := singleParse && batchProcOK && batchProc.SupportsBatchParse() &&
+		os.Getenv("SQD_PRODUCER_PARSE") != "0"
+	switch {
+	case batchParse:
+		log.Printf("Chain %d: producer-parse pipeline enabled (one parse on the producer; consumer runs state math only)", chain.ID)
+	case singleParse:
 		log.Printf("Chain %d: single-parse pipeline enabled (producer decode skipped; event tables filled by the consumer parse)", chain.ID)
 	}
 	totalBlocks, totalEvents := uint64(0), uint64(0)
@@ -503,6 +514,73 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 
 				parseStart := time.Now()
+
+				if batchParse {
+					// One parse on this (producer) goroutine: fills the proto ring
+					// and a pooled insert batch, streaming each block straight into
+					// the replay buffer. The last block of the batch carries the
+					// flush + event count for the consumer. Backpressure runs
+					// per-line inside the callback so ring slots are never claimed
+					// more than (capacity - margin) ahead of the consumer.
+					var endBlockOr0 uint64
+					if effectiveEndBlock != nil {
+						endBlockOr0 = *effectiveEndBlock
+					}
+					batchStartBlock := pBlock
+					var pending BatchParsedBlock
+					var havePending bool
+					evCount, batchFlush, perr := batchProc.ParseBatchForInserts(store, raw, endBlockOr0, func(pb BatchParsedBlock) error {
+						for {
+							cBlock := currentConsumerBlock.Load()
+							if pb.Number >= cBlock && pb.Number-cBlock >= uint64(replayBuf.capacity)-100 {
+								waitStart := time.Now()
+								select {
+								case <-pCtx.Done():
+									profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+									return pCtx.Err()
+								case <-time.After(10 * time.Millisecond):
+								}
+								profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+								continue
+							}
+							break
+						}
+						if havePending {
+							replayBuf.WriteParsed(chain.ID, pending, response.Head.Finalized, false, rangeLabel, batchStartBlock, nil, 0)
+							pHash = pending.Hash
+						}
+						pending = pb
+						havePending = true
+						return nil
+					})
+					if perr != nil {
+						if pCtx.Err() != nil {
+							return
+						}
+						sendSignal(producerSignal{err: perr})
+						return
+					}
+					profParseNanos.Add(int64(time.Since(parseStart)))
+					profIters.Add(1)
+					if havePending {
+						replayBuf.WriteParsed(chain.ID, pending, response.Head.Finalized, true, rangeLabel, batchStartBlock, batchFlush, evCount)
+						pHash = pending.Hash
+						select {
+						case next := <-advance:
+							pBlock = next.nextBlock
+							pHash = next.parentHash
+						case <-pCtx.Done():
+							return
+						}
+					} else {
+						if batchFlush != nil {
+							_ = batchFlush(pCtx) // zero rows: only returns the pooled batch
+						}
+						pBlock++
+					}
+					continue
+				}
+
 				var decodeDur time.Duration
 				var decodedBlocks []decodedBlock
 				var dataScratch []byte
@@ -746,6 +824,72 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		pendingInsert = nil
 		return err
 	}
+	// kickPendingInsert starts the (single) in-flight flush for a batch's
+	// captured event rows after the previous one has drained.
+	kickPendingInsert := func(flush func(context.Context) error) {
+		if flush == nil {
+			return
+		}
+		pendingInsert = make(chan error, 1)
+		go func(f func(context.Context) error, done chan<- error) {
+			t0 := time.Now()
+			err := f(ctx)
+			profInsertNanos.Add(int64(time.Since(t0)))
+			done <- err
+		}(flush, pendingInsert)
+	}
+	// finishBatchTail advances the fork cursor / durable checkpoint after a
+	// batch completes in the single-parse and producer-parse modes. Cursor and
+	// checkpoint advances drain the in-flight flush first: durable state must
+	// never lead durable event rows.
+	finishBatchTail := func(entry blockEntry) error {
+		if cursorMode {
+			if err := drainPendingInsert(); err != nil {
+				return err
+			}
+			current := state.Current()
+			if current != nil {
+				if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
+					return fmt.Errorf("update sync state %d: %w", entry.number, err)
+				}
+				if entry.number%10 == 0 {
+					if err := store.TruncateSyncState(ctx, chain.ID, current.Number); err != nil {
+						log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+					}
+				}
+			}
+			return nil
+		}
+		checkpointBlock := entry.number
+		if committedReporter != nil {
+			if c := committedReporter.CommittedBlock(); c < checkpointBlock {
+				checkpointBlock = c
+			}
+		}
+		if entry.finalized != nil && entry.finalized.Number < checkpointBlock {
+			checkpointBlock = entry.finalized.Number
+		}
+		if checkpointBlock > durableCheckpoint {
+			// This batch's rows may cover blocks <= checkpointBlock, so its
+			// in-flight flush must land before the checkpoint advances.
+			if err := drainPendingInsert(); err != nil {
+				return err
+			}
+			if err := store.FlushAsyncInserts(ctx); err != nil {
+				return fmt.Errorf("flush async inserts before checkpoint %d: %w", checkpointBlock, err)
+			}
+			if err := store.UpdateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+				return fmt.Errorf("update sync state %d: %w", checkpointBlock, err)
+			}
+			durableCheckpoint = checkpointBlock
+			if checkpointBlock%10 == 0 {
+				if err := store.TruncateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+					log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+				}
+			}
+		}
+		return nil
+	}
 
 	for {
 		if entry, ok := replayBuf.GetBlock(currentConsumerBlockVal); ok {
@@ -759,7 +903,19 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			for tableName, events := range entry.typedEvents {
 				batchTypedEvents[tableName] = append(batchTypedEvents[tableName], events...)
 			}
-			if useParseDecodeV2 {
+			if batchParse {
+				// Producer-parse mode: state math runs here, per block, on the
+				// ready-parsed columnar slot — no raw-bytes accumulation, no
+				// re-parse. The replay buffer handoff published the slot.
+				if entry.proto != nil {
+					procStart := time.Now()
+					if err := batchProc.ProcessParsedBlock(ctx, store, entry.proto); err != nil {
+						_ = drainPendingInsert()
+						return fmt.Errorf("custom processor v2 error at block %d: %w", entry.number, err)
+					}
+					profCustomNanos.Add(int64(time.Since(procStart)))
+				}
+			} else if useParseDecodeV2 {
 				if len(entry.raw) > 0 {
 					batchRawJSONL = append(batchRawJSONL, entry.raw...)
 					batchRawJSONL = append(batchRawJSONL, '\n')
@@ -798,7 +954,26 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			atomic.AddUint64(&totalBlocks, 1)
 			pendingBatchBlocks++
 
-			if entry.isLastInBatch && singleParse {
+			if entry.isLastInBatch && batchParse {
+				// Producer-parse mode: this batch's blocks were already processed
+				// per entry above (the producer parsed them). Here only the batch
+				// bookkeeping remains: advance the producer, account events, and
+				// pipeline the batch's event-row flush against the next batch.
+				if err := sendProducerAdvance(entry.number+1, entry.hash); err != nil {
+					_ = drainPendingInsert()
+					return err
+				}
+				atomic.AddUint64(&totalEvents, entry.batchEvents)
+				if err := drainPendingInsert(); err != nil {
+					return err
+				}
+				kickPendingInsert(entry.batchFlush)
+				if err := finishBatchTail(entry); err != nil {
+					return err
+				}
+				lastCheckpoint = entry.number
+				resetBatch()
+			} else if entry.isLastInBatch && singleParse {
 				// Single-parse mode: one parse runs the custom processor AND fills
 				// the event-table columns. The flush of THIS batch then overlaps the
 				// parse of the NEXT batch (ping-pong buffers), instead of overlapping
@@ -825,64 +1000,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				if err := drainPendingInsert(); err != nil {
 					return err
 				}
-				if batchFlush != nil {
-					pendingInsert = make(chan error, 1)
-					go func(flush func(context.Context) error, done chan<- error) {
-						t0 := time.Now()
-						err := flush(ctx)
-						profInsertNanos.Add(int64(time.Since(t0)))
-						done <- err
-					}(batchFlush, pendingInsert)
+				kickPendingInsert(batchFlush)
+				if err := finishBatchTail(entry); err != nil {
+					return err
 				}
-
-				if cursorMode {
-					// The fork cursor must never lead durable event rows: a crash
-					// resumes from it and only re-fetches blocks beyond it.
-					if err := drainPendingInsert(); err != nil {
-						return err
-					}
-					current := state.Current()
-					if current != nil {
-						if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
-							return fmt.Errorf("update sync state %d: %w", entry.number, err)
-						}
-						if entry.number%10 == 0 {
-							if err := store.TruncateSyncState(ctx, chain.ID, current.Number); err != nil {
-								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
-							}
-						}
-					}
-				} else {
-					checkpointBlock := entry.number
-					if committedReporter != nil {
-						if c := committedReporter.CommittedBlock(); c < checkpointBlock {
-							checkpointBlock = c
-						}
-					}
-					if entry.finalized != nil && entry.finalized.Number < checkpointBlock {
-						checkpointBlock = entry.finalized.Number
-					}
-					if checkpointBlock > durableCheckpoint {
-						// This batch's rows may cover blocks <= checkpointBlock, so its
-						// in-flight flush must land before the checkpoint advances.
-						if err := drainPendingInsert(); err != nil {
-							return err
-						}
-						if err := store.FlushAsyncInserts(ctx); err != nil {
-							return fmt.Errorf("flush async inserts before checkpoint %d: %w", checkpointBlock, err)
-						}
-						if err := store.UpdateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
-							return fmt.Errorf("update sync state %d: %w", checkpointBlock, err)
-						}
-						durableCheckpoint = checkpointBlock
-						if checkpointBlock%10 == 0 {
-							if err := store.TruncateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
-								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
-							}
-						}
-					}
-				}
-
 				lastCheckpoint = entry.number
 				resetBatch()
 			} else if entry.isLastInBatch {
@@ -1100,6 +1221,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 
 				replayBuf.PruneAfter(safe.Number)
+				if batchParse {
+					// Pruned entries may have carried never-invoked batch flushes;
+					// refill the pool (no parse/flush is in flight here: the old
+					// producer exited and pendingInsert was drained above).
+					batchProc.ReclaimParseBatches()
+				}
 				if pendingBatchBlocks > 0 {
 					log.Printf("[ROLLBACK] Discarding %d uncommitted batch block(s) after fork rollback", pendingBatchBlocks)
 					resetBatch()
