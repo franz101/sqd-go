@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/mailru/easyjson/jlexer"
 	"github.com/valyala/fastjson"
 )
 
@@ -50,6 +51,63 @@ func (p *FastJSONLParser) Parse(data []byte, onBlock func(*Block) error) error {
 	return p.ParseWithLine(data, func(block *Block, _ []byte) error {
 		return onBlock(block)
 	})
+}
+
+// ScanHeadersWithLine extracts only the block header (number, hash, timestamp)
+// from each JSONL line, byte-skipping everything else including the logs array.
+// This is the single-parse-mode producer scan: the consumer's one real parse
+// decodes the logs, so a full DOM parse here would be pure waste. The hash
+// aliases the line's bytes — callers that retain it must strings.Clone it.
+func (p *FastJSONLParser) ScanHeadersWithLine(data []byte, onBlock func(number, timestamp uint64, hash string, line []byte) error) error {
+	for len(data) > 0 {
+		lineData := data
+		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+			lineData = data[:idx]
+			data = data[idx+1:]
+		} else {
+			data = nil
+		}
+		if len(lineData) == 0 {
+			continue
+		}
+		var number, timestamp uint64
+		var hash string
+		l := &jlexer.Lexer{Data: lineData}
+		l.Delim('{')
+		for !l.IsDelim('}') {
+			key := l.UnsafeFieldName(false)
+			l.WantColon()
+			if key == "header" {
+				l.Delim('{')
+				for !l.IsDelim('}') {
+					hkey := l.UnsafeFieldName(false)
+					l.WantColon()
+					switch hkey {
+					case "number":
+						number = l.Uint64()
+					case "timestamp":
+						timestamp = l.Uint64()
+					case "hash":
+						hash = l.UnsafeString()
+					default:
+						l.SkipRecursive()
+					}
+					l.WantComma()
+				}
+				l.Delim('}')
+			} else {
+				l.SkipRecursive()
+			}
+			l.WantComma()
+		}
+		if err := l.Error(); err != nil {
+			return fmt.Errorf("scan header: %w", err)
+		}
+		if err := onBlock(number, timestamp, hash, lineData); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *FastJSONLParser) ParseWithLine(data []byte, onBlock func(*Block, []byte) error) error {

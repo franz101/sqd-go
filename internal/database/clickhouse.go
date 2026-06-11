@@ -28,6 +28,9 @@ type Store struct {
 	// concurrent paths must own separate connections.
 	insertConn *ch.Client
 	db         string
+	// dialOpts are kept so maintenance work (e.g. background state pruning) can
+	// open its own short-lived connection instead of racing conn/insertConn.
+	dialOpts ch.Options
 }
 
 // BlockRow is a single row in the blocks table, used during fork tracking.
@@ -91,17 +94,26 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 	// Dedicated connection for the base-event insert goroutine so it never shares
 	// a ch.Client with the concurrent commit/query path on conn. Same options as
 	// conn (queries are db-qualified, so the "default" database is fine).
-	insertConn, err := ch.Dial(ctx, ch.Options{
+	dialOpts := ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
 		Database: "default",
 		User:     user,
 		Password: password,
-	})
+	}
+	insertConn, err := ch.Dial(ctx, dialOpts)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("connect clickhouse (insert conn): %w", err)
 	}
-	return &Store{conn: conn, insertConn: insertConn, db: db}, nil
+	return &Store{conn: conn, insertConn: insertConn, db: db, dialOpts: dialOpts}, nil
+}
+
+// DialMaintenanceConn opens a NEW dedicated connection for background
+// maintenance work (state pruning, OPTIMIZE). A ch.Client is not safe for
+// concurrent Do, so maintenance running alongside the processor/commit path
+// must own its own connection. The caller closes it when done.
+func (s *Store) DialMaintenanceConn(ctx context.Context) (*ch.Client, error) {
+	return ch.Dial(ctx, s.dialOpts)
 }
 
 // DropClickHouseDatabase drops the named database (used by --restart).
@@ -124,6 +136,13 @@ func (s *Store) Close() error {
 		_ = s.insertConn.Close()
 	}
 	return s.conn.Close()
+}
+
+// InsertConn returns the dedicated base-event insert connection. It must only
+// be used by one goroutine at a time, and never concurrently with the
+// Inserter/TypedInserter methods (which share it).
+func (s *Store) InsertConn() *ch.Client {
+	return s.insertConn
 }
 
 func (s *Store) Conn() *ch.Client {

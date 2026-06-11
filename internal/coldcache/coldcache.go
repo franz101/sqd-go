@@ -23,14 +23,18 @@ package coldcache
 
 import (
 	"os"
+	"strconv"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 )
 
 // Default off-heap budgets. Both are hard caps; steady-state RSS ≈ Cache +
 // MemTableSize + small bookkeeping (validated by the ./disk spike at ~88 MiB).
+// SQD_COLDCACHE_MB overrides the block-cache cap (still a hard cap; dense
+// ranges with a large live-entity working set benefit from 256-512).
 const (
-	DefaultCacheBytes   int64  = 64 << 20
+	DefaultCacheBytes   int64  = 256 << 20
 	DefaultMemTableSize uint64 = 16 << 20
 )
 
@@ -46,6 +50,9 @@ type Store struct {
 func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 	if cacheBytes <= 0 {
 		cacheBytes = DefaultCacheBytes
+		if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
+			cacheBytes = mb << 20
+		}
 	}
 	if memTableBytes == 0 {
 		memTableBytes = DefaultMemTableSize
@@ -66,6 +73,15 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 		MemTableStopWritesThreshold: 4,
 		DisableWAL:                  true, // ephemeral: CH is the durable truth
 	}
+	// Per-sstable bloom filters: a Get for an absent key (the common case while
+	// new entities stream in) is answered by an in-memory filter probe instead
+	// of data-block reads across every level — point misses were ~16% of pipeline
+	// CPU in raw pread syscalls without this. ~10 bits/key, counted against the
+	// block cache budget, so memory stays capped.
+	opts.EnsureDefaults()
+	for i := range opts.Levels {
+		opts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+	}
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		cache.Unref()
@@ -82,6 +98,26 @@ func (s *Store) Put(key, value []byte) error {
 		return nil
 	}
 	return s.db.Set(key, value, pebble.NoSync)
+}
+
+// GetInto copies the value stored under key into dst (up to len(dst) bytes)
+// and reports whether it was found. Unlike Get it allocates nothing: callers
+// with a fixed-size destination (the pointer-free hot-state entities) pass
+// their stack struct's bytes directly.
+func (s *Store) GetInto(dst []byte, key []byte) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, nil
+	}
+	v, closer, err := s.db.Get(key)
+	if err == pebble.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	copy(dst, v)
+	closer.Close()
+	return true, nil
 }
 
 // Get returns a COPY of the value stored under key (so it stays valid after the

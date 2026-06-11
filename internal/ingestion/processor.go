@@ -33,6 +33,18 @@ type FastJSONLProcessor interface {
 	ProcessJSONL(ctx context.Context, store *database.Store, data []byte) (uint64, error)
 }
 
+// FastJSONLInsertProcessor is an optional extension of FastJSONLProcessor: the
+// single parse that runs the custom processor also captures the event-table
+// rows into preallocated native columns, removing the producer-side generic
+// ABI decode entirely. The returned flush inserts the captured rows on the
+// store's dedicated insert connection; it may run concurrently with the NEXT
+// ProcessJSONLWithInserts call (the processor double-buffers), but flushes
+// must be invoked one at a time. A nil flush means there is nothing to insert.
+type FastJSONLInsertProcessor interface {
+	FastJSONLProcessor
+	ProcessJSONLWithInserts(ctx context.Context, store *database.Store, data []byte) (uint64, func(context.Context) error, error)
+}
+
 // CommitHorizonReporter is optionally implemented by processors that durably
 // commit derived state at intervals. When implemented, the ingestion checkpoint
 // is gated so it never leads this horizon: a crash resumes from durable state

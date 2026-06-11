@@ -7,3 +7,5 @@ import "context"
 func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) error {
 	return nil
 }
+
+func CompactionPruneStateAsync(ctx context.Context, store Store, blockNumber uint64) {}

@@ -191,9 +191,8 @@ func (c *UserPositionsClockCache) Get(key UserPositionsClockKey) (UserPosition, 
 		}
 	}
 	if c.cold != nil {
-		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
-			var v UserPosition
-			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+		var v UserPosition
+		if found, _ := c.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
 			c.SetByKey(key, v)
 			return v, true
 		}

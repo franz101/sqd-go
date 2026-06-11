@@ -166,12 +166,10 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 		}
 		if blockNumber >= state.LastPruneBlock+pruneInterval {
 			// Prune removes superseded state rows — an optimization, never a
-			// correctness requirement. A failure (e.g. ClickHouse hitting its
-			// memory limit mid-mutation) must not abort the chain; skip this
-			// window and retry pruneInterval blocks later.
-			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
-				log.Printf("WARN: prune ClickHouse state at block %d failed (retrying in %d blocks): %v", blockNumber, pruneInterval, err)
-			}
+			// correctness requirement. It runs in the background on a dedicated
+			// connection (a synchronous prune stalled ingestion ~30s per window);
+			// failures are logged inside and the next interval retries.
+			CompactionPruneStateAsync(ctx, store, blockNumber)
 			state.LastPruneBlock = blockNumber
 		}
 
@@ -200,6 +198,14 @@ type Processor struct {
 	protoRing *ProtoRingBuffer
 	State     *State
 	ProtoMode bool
+
+	// insertBatches double-buffers event-table inserts for
+	// ProcessJSONLWithInserts: the flush of batch N runs on the dedicated
+	// insert connection while batch N+1 is being parsed into the other
+	// buffer. Both are preallocated once and Reset keeps column capacity,
+	// so steady-state insert capture allocates nothing.
+	insertBatches  [2]*InsertBatches
+	insertBatchIdx int
 }
 
 func NewProcessor(protoMode bool) (*Processor, error) {
@@ -268,6 +274,73 @@ func (p *Processor) ProcessJSONL(ctx context.Context, store *database.Store, dat
 	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
 		return CustomProcessing(ctx, stateStore, p.State, block)
 	})
+}
+
+// ProcessJSONLWithInserts implements ingestion.FastJSONLInsertProcessor: the
+// same single parse that feeds the custom processor also fills a
+// processor-owned InsertBatches (native ch-go columns), so the pipeline needs
+// no second decode of the raw bytes anywhere. It returns the event count and
+// a flush func that inserts the captured rows on the store's dedicated insert
+// connection. The processor double-buffers: the returned flush may run
+// concurrently with the NEXT ProcessJSONLWithInserts call, but flushes must be
+// invoked one at a time (they share the insert connection).
+func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *database.Store, data []byte) (uint64, func(context.Context) error, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	logProtoModeOnce.Do(func() {
+		log.Printf("processor: ProcessJSONL fast parse path with inline event-table capture (protoMode=%v)", p.ProtoMode)
+	})
+	if p.insertBatches[0] == nil {
+		p.insertBatches[0] = NewInsertBatches()
+		p.insertBatches[1] = NewInsertBatches()
+	}
+	batches := p.insertBatches[p.insertBatchIdx]
+	p.insertBatchIdx = 1 - p.insertBatchIdx
+	var n uint64
+	var err error
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, rerr := NewProtoRingBuffer(defaultRingBufferSize)
+			if rerr != nil {
+				return 0, nil, rerr
+			}
+			p.protoRing = ring
+		}
+		n, err = ParseJSONLProto(data, batches, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	} else {
+		if p.ring == nil {
+			ring, rerr := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+			if rerr != nil {
+				return 0, nil, rerr
+			}
+			p.ring = ring
+		}
+		n, err = ParseJSONLV2(data, batches, p.ring, func(block *ParsedBlock) error {
+			return CustomProcessing(ctx, stateStore, p.State, block)
+		})
+	}
+	if err != nil || store == nil {
+		batches.Reset()
+		return n, nil, err
+	}
+	conn := store.InsertConn()
+	db := store.DB()
+	flush := func(fctx context.Context) error {
+		defer batches.Reset()
+		return batches.Insert(fctx, conn, db)
+	}
+	return n, flush, nil
 }
 
 func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {

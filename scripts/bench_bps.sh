@@ -63,7 +63,10 @@ SQD_PARSE_DECODE_V2=1 CLICKHOUSE_DATABASE="$CLICKHOUSE_DATABASE" tmp/sqd-go star
 	--blockchain polygon --start-block "$START_BLOCK" >"$PIPELINE_LOG" 2>&1 &
 PIPE_PID=$!
 
-for _ in $(seq 1 120); do
+# Startup can be slow on a resumed run: the cold-tier rebuild loads every
+# hot-state row from ClickHouse before the first stats line (~2min at 65M
+# blocks of history).
+for _ in $(seq 1 360); do
 	grep -q "stats periodic" "$PIPELINE_LOG" 2>/dev/null && break
 	if ! kill -0 "$PIPE_PID" 2>/dev/null; then
 		echo "error: pipeline exited during startup; last log lines:" >&2
@@ -73,7 +76,7 @@ for _ in $(seq 1 120); do
 	sleep 1
 done
 if ! grep -q "stats periodic" "$PIPELINE_LOG"; then
-	echo "error: pipeline produced no stats within 120s; see $PIPELINE_LOG" >&2
+	echo "error: pipeline produced no stats within 360s; see $PIPELINE_LOG" >&2
 	exit 1
 fi
 

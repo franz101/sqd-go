@@ -6,10 +6,54 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
 )
+
+// compactionPruneInFlight guards the background prune: at most one runs at a
+// time. The processor is a single goroutine, so a plain CAS is enough.
+var compactionPruneInFlight atomic.Bool
+
+// compactionMaintenanceDialer is implemented by *database.Store. Stores that
+// can hand out a dedicated connection get the prune in the background; plain
+// Conn()/DB() stubs (tests) keep the synchronous path, because a shared
+// ch.Client must never see concurrent Do calls.
+type compactionMaintenanceDialer interface {
+	DialMaintenanceConn(ctx context.Context) (*ch.Client, error)
+}
+
+// CompactionPruneStateAsync runs CompactionPruneState in the background on its
+// own connection so the multi-second DELETE/OPTIMIZE pass never stalls block
+// processing. If a previous prune is still running the call is a no-op (the
+// next interval retries). Prune is an optimization, never a correctness
+// requirement, so failures are logged and dropped.
+func CompactionPruneStateAsync(ctx context.Context, store Store, blockNumber uint64) {
+	dialer, ok := store.(compactionMaintenanceDialer)
+	if !ok {
+		if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
+			log.Printf("WARN: prune ClickHouse state at block %d failed: %v", blockNumber, err)
+		}
+		return
+	}
+	if !compactionPruneInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	db := store.DB()
+	go func() {
+		defer compactionPruneInFlight.Store(false)
+		conn, err := dialer.DialMaintenanceConn(ctx)
+		if err != nil {
+			log.Printf("WARN: prune ClickHouse state at block %d failed (dial): %v", blockNumber, err)
+			return
+		}
+		defer conn.Close()
+		if err := compactionPruneStateOn(ctx, conn, db, blockNumber); err != nil {
+			log.Printf("WARN: prune ClickHouse state at block %d failed: %v", blockNumber, err)
+		}
+	}()
+}
 
 // compactionBucketRanges splits a string-typed key column into 16 disjoint
 // byte-prefix ranges (first byte 0x00-0x0f, 0x10-0x1f, ...). Each prune DELETE
@@ -49,7 +93,13 @@ func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) 
 	if store == nil || store.Conn() == nil {
 		return nil
 	}
-	db := store.DB()
+	return compactionPruneStateOn(ctx, store.Conn(), store.DB(), blockNumber)
+}
+
+func compactionPruneStateOn(ctx context.Context, conn *ch.Client, db string, blockNumber uint64) error {
+	if conn == nil {
+		return nil
+	}
 
 	if blockNumber <= 1000 {
 		return nil
@@ -65,7 +115,7 @@ func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) 
 
 	start := time.Now()
 	for _, q := range queries {
-		if err := store.Conn().Do(ctx, ch.Query{Body: q}); err != nil {
+		if err := conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("compaction prune error executing query: %w", err)
 		}
 	}

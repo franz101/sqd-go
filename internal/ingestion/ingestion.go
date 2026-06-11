@@ -41,8 +41,8 @@ type Options struct {
 	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
 	StateLoader        func(blockNumber uint64) error // called on startup to load processor state from database
 	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
-	ColdCacheDir string // base directory for Pebble cold-tier files (default os.TempDir()/sqd-coldcache)
-	ColdCache    bool   // enable Pebble cold tier (default true via config; false disables)
+	ColdCacheDir       string                         // base directory for Pebble cold-tier files (default os.TempDir()/sqd-coldcache)
+	ColdCache          bool                           // enable Pebble cold tier (default true via config; false disables)
 }
 
 const (
@@ -320,6 +320,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	if useParseDecodeV2 {
 		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 enabled for custom processor", chain.ID)
 	}
+	// Single-parse mode: the consumer's ProcessJSONLWithInserts both runs the
+	// custom processor AND captures event-table rows into preallocated native
+	// columns, so the producer skips its per-log generic ABI decode entirely
+	// (it was ~25% of all CPU in mallocgc/GC pressure alone). Requires the
+	// generated processor extension and that nothing else needs producer-side
+	// decoded events: the blocks table and the generic raw-logs table both
+	// derive from them, so either one being enabled falls back to the
+	// double-parse path. SQD_SINGLE_PARSE=0 forces the fallback for debugging.
+	fastInsertProc, fastInsertOK := proc.(FastJSONLInsertProcessor)
+	singleParse := useParseDecodeV2 && fastInsertOK && !storeBlocks && !cfg.ShouldStoreRawLogs() &&
+		os.Getenv("SQD_SINGLE_PARSE") != "0"
+	if singleParse {
+		log.Printf("Chain %d: single-parse pipeline enabled (producer decode skipped; event tables filled by the consumer parse)", chain.ID)
+	}
 	totalBlocks, totalEvents := uint64(0), uint64(0)
 	startTime := time.Now()
 	var memBefore, memAfter runtime.MemStats
@@ -492,83 +506,102 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				var decodeDur time.Duration
 				var decodedBlocks []decodedBlock
 				var dataScratch []byte
-				err = jsonl.ParseWithLine(raw, func(block *parser.Block, rawLine []byte) error {
-					if effectiveEndBlock != nil && block.Header.Number > *effectiveEndBlock {
+				if singleParse {
+					// The consumer's single parse decodes events and fills the
+					// event-table columns; the producer only scans block headers
+					// (replay-buffer identity + fork tracking) and carries the raw
+					// line — no DOM parse, no per-log decode.
+					err = jsonl.ScanHeadersWithLine(raw, func(number, timestamp uint64, hash string, rawLine []byte) error {
+						if effectiveEndBlock != nil && number > *effectiveEndBlock {
+							return nil
+						}
+						decodedBlocks = append(decodedBlocks, decodedBlock{
+							number:    number,
+							hash:      strings.Clone(hash),
+							timestamp: time.Unix(int64(timestamp), 0).UTC(),
+							raw:       rawLine,
+						})
 						return nil
-					}
-					blockHash := strings.Clone(block.Header.Hash)
-					blockTS := time.Unix(int64(block.Header.Timestamp), 0).UTC()
-
-					var blockEvents []parser.DecodedEvent
-					var blockCustomLogs []CustomLog
-					blockTypedEvents := make(map[string][]parser.DecodedEvent)
-
-					for _, lg := range block.Logs {
-						if len(lg.Topics) == 0 {
-							continue
-						}
-						d0 := time.Now()
-						topic0 := abiunpack.DecodeTopicHash(lg.Topics[0])
-						def, ok := decoders[topic0]
-						if !ok {
-							decodeDur += time.Since(d0)
-							continue
-						}
-						if !def.MatchesAddress(lg.Address) {
-							decodeDur += time.Since(d0)
-							continue
-						}
-						dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
-						ev, err := def.Decode(lg.Address, lg.Topics, dataScratch)
-						decodeDur += time.Since(d0)
-						if err != nil {
-							continue
-						}
-						ev.ChainID = chain.ID
-						ev.BlockNumber = block.Header.Number
-						ev.BlockTimestamp = blockTS
-						ev.BlockHash = blockHash
-						ev.TxHash = strings.Clone(lg.TransactionHash)
-						ev.TxIndex = lg.TransactionIndex
-						ev.LogIndex = lg.LogIndex
-						ev.Address = strings.Clone(lg.Address)
-						blockEvents = append(blockEvents, *ev)
-
-						if !useParseDecodeV2 {
-							blockCustomLogs = append(blockCustomLogs, CustomLog{
-								ChainID:          chain.ID,
-								BlockNumber:      block.Header.Number,
-								BlockTimestamp:   blockTS,
-								BlockHash:        blockHash,
-								ContractAddress:  strings.Clone(lg.Address),
-								TransactionHash:  strings.Clone(lg.TransactionHash),
-								TransactionIndex: lg.TransactionIndex,
-								LogIndex:         lg.LogIndex,
-								Topics:           cloneStrings(lg.Topics),
-								Data:             strings.Clone(lg.Data),
-							})
-						}
-
-						if table, ok := typedTables.lookup(ev.Address, ev.EventName); ok {
-							blockTypedEvents[table.Name] = append(blockTypedEvents[table.Name], *ev)
-						}
-					}
-
-					var blockRaw []byte
-					if useParseDecodeV2 {
-						blockRaw = rawLine
-					}
-					decodedBlocks = append(decodedBlocks, decodedBlock{
-						number:      block.Header.Number,
-						hash:        blockHash,
-						timestamp:   blockTS,
-						events:      blockEvents,
-						logs:        blockCustomLogs,
-						typedEvents: blockTypedEvents,
-						raw:         blockRaw,
 					})
-					return nil
-				})
+				} else {
+					err = jsonl.ParseWithLine(raw, func(block *parser.Block, rawLine []byte) error {
+						if effectiveEndBlock != nil && block.Header.Number > *effectiveEndBlock {
+							return nil
+						}
+						blockHash := strings.Clone(block.Header.Hash)
+						blockTS := time.Unix(int64(block.Header.Timestamp), 0).UTC()
+
+						var blockEvents []parser.DecodedEvent
+						var blockCustomLogs []CustomLog
+						blockTypedEvents := make(map[string][]parser.DecodedEvent)
+
+						for _, lg := range block.Logs {
+							if len(lg.Topics) == 0 {
+								continue
+							}
+							d0 := time.Now()
+							topic0 := abiunpack.DecodeTopicHash(lg.Topics[0])
+							def, ok := decoders[topic0]
+							if !ok {
+								decodeDur += time.Since(d0)
+								continue
+							}
+							if !def.MatchesAddress(lg.Address) {
+								decodeDur += time.Since(d0)
+								continue
+							}
+							dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
+							ev, err := def.Decode(lg.Address, lg.Topics, dataScratch)
+							decodeDur += time.Since(d0)
+							if err != nil {
+								continue
+							}
+							ev.ChainID = chain.ID
+							ev.BlockNumber = block.Header.Number
+							ev.BlockTimestamp = blockTS
+							ev.BlockHash = blockHash
+							ev.TxHash = strings.Clone(lg.TransactionHash)
+							ev.TxIndex = lg.TransactionIndex
+							ev.LogIndex = lg.LogIndex
+							ev.Address = strings.Clone(lg.Address)
+							blockEvents = append(blockEvents, *ev)
+
+							if !useParseDecodeV2 {
+								blockCustomLogs = append(blockCustomLogs, CustomLog{
+									ChainID:          chain.ID,
+									BlockNumber:      block.Header.Number,
+									BlockTimestamp:   blockTS,
+									BlockHash:        blockHash,
+									ContractAddress:  strings.Clone(lg.Address),
+									TransactionHash:  strings.Clone(lg.TransactionHash),
+									TransactionIndex: lg.TransactionIndex,
+									LogIndex:         lg.LogIndex,
+									Topics:           cloneStrings(lg.Topics),
+									Data:             strings.Clone(lg.Data),
+								})
+							}
+
+							if table, ok := typedTables.lookup(ev.Address, ev.EventName); ok {
+								blockTypedEvents[table.Name] = append(blockTypedEvents[table.Name], *ev)
+							}
+						}
+
+						var blockRaw []byte
+						if useParseDecodeV2 {
+							blockRaw = rawLine
+						}
+						decodedBlocks = append(decodedBlocks, decodedBlock{
+							number:      block.Header.Number,
+							hash:        blockHash,
+							timestamp:   blockTS,
+							events:      blockEvents,
+							logs:        blockCustomLogs,
+							typedEvents: blockTypedEvents,
+							raw:         blockRaw,
+						})
+						return nil
+					})
+				}
 				if err != nil {
 					sendSignal(producerSignal{err: err})
 					return
@@ -699,6 +732,21 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		}
 	}
 
+	// pendingInsert tracks the single in-flight event-table flush in single-parse
+	// mode: batch N's columns insert on the dedicated connection while batch N+1
+	// parses. At most one is in flight (the processor double-buffers exactly two
+	// batch buffers), and every consumer exit path drains it — both to bound
+	// memory and so a flush can never race ClickHouse rollback or store.Close.
+	var pendingInsert chan error
+	drainPendingInsert := func() error {
+		if pendingInsert == nil {
+			return nil
+		}
+		err := <-pendingInsert
+		pendingInsert = nil
+		return err
+	}
+
 	for {
 		if entry, ok := replayBuf.GetBlock(currentConsumerBlockVal); ok {
 			// Accumulate data for batch insertion
@@ -750,7 +798,94 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			atomic.AddUint64(&totalBlocks, 1)
 			pendingBatchBlocks++
 
-			if entry.isLastInBatch {
+			if entry.isLastInBatch && singleParse {
+				// Single-parse mode: one parse runs the custom processor AND fills
+				// the event-table columns. The flush of THIS batch then overlaps the
+				// parse of the NEXT batch (ping-pong buffers), instead of overlapping
+				// insert and custom processing within one batch.
+				if err := sendProducerAdvance(entry.number+1, entry.hash); err != nil {
+					_ = drainPendingInsert()
+					return err
+				}
+				var batchFlush func(context.Context) error
+				if len(batchRawJSONL) > 0 {
+					procStart := time.Now()
+					evCount, flush, err := fastInsertProc.ProcessJSONLWithInserts(ctx, store, batchRawJSONL)
+					if err != nil {
+						_ = drainPendingInsert()
+						return fmt.Errorf("custom processor v2 error: %w", err)
+					}
+					profCustomNanos.Add(int64(time.Since(procStart)))
+					atomic.AddUint64(&totalEvents, evCount)
+					batchFlush = flush
+				}
+				// The previous batch's flush must finish before this one starts:
+				// they share the insert connection, and one-in-flight bounds memory
+				// to the two preallocated batch buffers.
+				if err := drainPendingInsert(); err != nil {
+					return err
+				}
+				if batchFlush != nil {
+					pendingInsert = make(chan error, 1)
+					go func(flush func(context.Context) error, done chan<- error) {
+						t0 := time.Now()
+						err := flush(ctx)
+						profInsertNanos.Add(int64(time.Since(t0)))
+						done <- err
+					}(batchFlush, pendingInsert)
+				}
+
+				if cursorMode {
+					// The fork cursor must never lead durable event rows: a crash
+					// resumes from it and only re-fetches blocks beyond it.
+					if err := drainPendingInsert(); err != nil {
+						return err
+					}
+					current := state.Current()
+					if current != nil {
+						if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
+							return fmt.Errorf("update sync state %d: %w", entry.number, err)
+						}
+						if entry.number%10 == 0 {
+							if err := store.TruncateSyncState(ctx, chain.ID, current.Number); err != nil {
+								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+							}
+						}
+					}
+				} else {
+					checkpointBlock := entry.number
+					if committedReporter != nil {
+						if c := committedReporter.CommittedBlock(); c < checkpointBlock {
+							checkpointBlock = c
+						}
+					}
+					if entry.finalized != nil && entry.finalized.Number < checkpointBlock {
+						checkpointBlock = entry.finalized.Number
+					}
+					if checkpointBlock > durableCheckpoint {
+						// This batch's rows may cover blocks <= checkpointBlock, so its
+						// in-flight flush must land before the checkpoint advances.
+						if err := drainPendingInsert(); err != nil {
+							return err
+						}
+						if err := store.FlushAsyncInserts(ctx); err != nil {
+							return fmt.Errorf("flush async inserts before checkpoint %d: %w", checkpointBlock, err)
+						}
+						if err := store.UpdateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+							return fmt.Errorf("update sync state %d: %w", checkpointBlock, err)
+						}
+						durableCheckpoint = checkpointBlock
+						if checkpointBlock%10 == 0 {
+							if err := store.TruncateSyncState(ctx, chain.ID, checkpointBlock); err != nil {
+								log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+							}
+						}
+					}
+				}
+
+				lastCheckpoint = entry.number
+				resetBatch()
+			} else if entry.isLastInBatch {
 				// CH inserts run in a background goroutine (I/O-bound, writes to
 				// ClickHouse async-insert buffers) while the custom processor runs
 				// here (CPU-bound, updates in-memory hot state). The two share no
@@ -901,6 +1036,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		case <-ctx.Done():
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			log.Printf("Chain %d: interrupted at block %d", chain.ID, currentConsumerBlockVal)
+			_ = drainPendingInsert() // flush errors don't matter on shutdown; resume re-fetches
 			return ctx.Err()
 
 		case sig := <-errChan:
@@ -908,6 +1044,13 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			if sig.forkErr != nil {
 				forkErr := sig.forkErr
 				log.Printf("[FORK DETECTED] Chain %d: fork detected! Previous blocks sent by portal: %v", chain.ID, forkErr.PreviousBlocks)
+				// An in-flight event flush must land (or fail) before the rollback
+				// truncates tables, or its rows could resurrect after the truncate.
+				// A failed flush means rows the replay path assumes durable are
+				// missing, so abort and resume from the checkpoint instead.
+				if err := drainPendingInsert(); err != nil {
+					return fmt.Errorf("drain event insert before fork rollback: %w", err)
+				}
 				safe, ok := state.HandleFork(forkErr.PreviousBlocks)
 				if !ok {
 					return fmt.Errorf("process fork: unable to find common fork cursor")
@@ -956,7 +1099,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					}
 				}
 
-
 				replayBuf.PruneAfter(safe.Number)
 				if pendingBatchBlocks > 0 {
 					log.Printf("[ROLLBACK] Discarding %d uncommitted batch block(s) after fork rollback", pendingBatchBlocks)
@@ -969,6 +1111,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				continue
 			}
 			if sig.err != nil {
+				_ = drainPendingInsert()
 				return fmt.Errorf("producer error: %w", sig.err)
 			}
 
@@ -998,6 +1141,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			logStats("periodic")
 		}
+	}
+
+	// The last batch's event flush must be durable before the final checkpoint
+	// advance below can cover its blocks.
+	if err := drainPendingInsert(); err != nil {
+		return fmt.Errorf("final event insert: %w", err)
 	}
 
 	// Clean completion (backfill): force a durable commit of the tail (the blocks

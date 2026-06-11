@@ -6,52 +6,140 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
 )
+
+// compactionPruneInFlight guards the background prune: at most one runs at a
+// time. The processor is a single goroutine, so a plain CAS is enough.
+var compactionPruneInFlight atomic.Bool
+
+// compactionMaintenanceDialer is implemented by *database.Store. Stores that
+// can hand out a dedicated connection get the prune in the background; plain
+// Conn()/DB() stubs (tests) keep the synchronous path, because a shared
+// ch.Client must never see concurrent Do calls.
+type compactionMaintenanceDialer interface {
+	DialMaintenanceConn(ctx context.Context) (*ch.Client, error)
+}
+
+// CompactionPruneStateAsync runs CompactionPruneState in the background on its
+// own connection so the multi-second DELETE/OPTIMIZE pass never stalls block
+// processing. If a previous prune is still running the call is a no-op (the
+// next interval retries). Prune is an optimization, never a correctness
+// requirement, so failures are logged and dropped.
+func CompactionPruneStateAsync(ctx context.Context, store Store, blockNumber uint64) {
+	dialer, ok := store.(compactionMaintenanceDialer)
+	if !ok {
+		if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
+			log.Printf("WARN: prune ClickHouse state at block %d failed: %v", blockNumber, err)
+		}
+		return
+	}
+	if !compactionPruneInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	db := store.DB()
+	go func() {
+		defer compactionPruneInFlight.Store(false)
+		conn, err := dialer.DialMaintenanceConn(ctx)
+		if err != nil {
+			log.Printf("WARN: prune ClickHouse state at block %d failed (dial): %v", blockNumber, err)
+			return
+		}
+		defer conn.Close()
+		if err := compactionPruneStateOn(ctx, conn, db, blockNumber); err != nil {
+			log.Printf("WARN: prune ClickHouse state at block %d failed: %v", blockNumber, err)
+		}
+	}()
+}
+
+// compactionBucketRanges splits a string-typed key column into 16 disjoint
+// byte-prefix ranges (first byte 0x00-0x0f, 0x10-0x1f, ...). Each prune DELETE
+// then aggregates only its slice of the table: the range predicate is a prefix
+// of the primary key, so ClickHouse prunes granules on both the outer scan and
+// the NOT IN subquery instead of hash-aggregating the whole table. On 1.26M
+// rows this drops peak mutation memory from 1.3 GiB (unbatched 3-way argMax)
+// to ~43 MiB per bucket. Keys that are not uniformly distributed over the
+// first byte (e.g. ASCII hex with a constant prefix) degenerate to one
+// non-empty bucket — still correct, just unbatched.
+func compactionBucketRanges(col string) []string {
+	out := make([]string, 0, 16)
+	for i := 0; i < 16; i++ {
+		switch i {
+		case 0:
+			out = append(out, fmt.Sprintf("%s < unhex('10')", col))
+		case 15:
+			out = append(out, fmt.Sprintf("%s >= unhex('f0')", col))
+		default:
+			out = append(out, fmt.Sprintf("%s >= unhex('%02x') AND %s < unhex('%02x')", col, i*16, col, (i+1)*16))
+		}
+	}
+	return out
+}
 
 // CompactionPruneState removes superseded rows from hot-state tables. For each
 // table with a primary key, it deletes rows whose block_number is below a
 // rolling threshold (blockNumber - 1000) and that are not the latest version of
 // their primary-key group. This keeps ClickHouse tables bounded during long
 // backfill runs while preserving the most recent state for each entity.
+//
+// The "latest version" subquery compares one max((block_number,
+// transaction_index, log_index)) tuple per group instead of three argMax
+// states, and string-keyed tables are pruned in 16 byte-prefix buckets so no
+// single mutation aggregates the whole table (see compactionBucketRanges).
 func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) error {
 	if store == nil || store.Conn() == nil {
 		return nil
 	}
-	db := store.DB()
+	return compactionPruneStateOn(ctx, store.Conn(), store.DB(), blockNumber)
+}
+
+func compactionPruneStateOn(ctx context.Context, conn *ch.Client, db string, blockNumber uint64) error {
+	if conn == nil {
+		return nil
+	}
 
 	if blockNumber <= 1000 {
 		return nil
 	}
 	pruneThreshold := blockNumber - 1000
 
-	queries := []string{
-		// memory_conditions (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_conditions\x60 WHERE block_number < %[2]d AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_conditions\x60 GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_conditions\x60 FINAL", db),
-
-		// memory_user_positions (pk: user, token_id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_user_positions\x60 WHERE block_number < %[2]d AND (user, token_id, block_number, transaction_index, log_index) NOT IN (SELECT user, token_id, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_user_positions\x60 GROUP BY user, token_id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_user_positions\x60 FINAL", db),
-
-		// memory_markets (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_markets\x60 WHERE block_number < %[2]d AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_markets\x60 GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_markets\x60 FINAL", db),
-
-		// memory_neg_risk_events (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_neg_risk_events\x60 WHERE block_number < %[2]d AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_neg_risk_events\x60 GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_neg_risk_events\x60 FINAL", db),
-
-		// memory_fixed_product_market_makers (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers\x60 WHERE block_number < %[2]d AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers\x60 GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_fixed_product_market_makers\x60 FINAL", db),
+	var queries []string
+	// memory_conditions (pk: id; bucketed on id)
+	for _, rng := range compactionBucketRanges("id") {
+		queries = append(queries, fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_conditions\x60 WHERE %[3]s AND block_number < %[2]d AND (id, (block_number, transaction_index, log_index)) NOT IN (SELECT id, max((block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_conditions\x60 WHERE %[3]s GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold, rng))
 	}
+	queries = append(queries, fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_conditions\x60 FINAL", db))
+
+	// memory_user_positions (pk: user, token_id; bucketed on user)
+	for _, rng := range compactionBucketRanges("user") {
+		queries = append(queries, fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_user_positions\x60 WHERE %[3]s AND block_number < %[2]d AND (user, token_id, (block_number, transaction_index, log_index)) NOT IN (SELECT user, token_id, max((block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_user_positions\x60 WHERE %[3]s GROUP BY user, token_id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold, rng))
+	}
+	queries = append(queries, fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_user_positions\x60 FINAL", db))
+
+	// memory_markets (pk: id; bucketed on id)
+	for _, rng := range compactionBucketRanges("id") {
+		queries = append(queries, fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_markets\x60 WHERE %[3]s AND block_number < %[2]d AND (id, (block_number, transaction_index, log_index)) NOT IN (SELECT id, max((block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_markets\x60 WHERE %[3]s GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold, rng))
+	}
+	queries = append(queries, fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_markets\x60 FINAL", db))
+
+	// memory_neg_risk_events (pk: id; bucketed on id)
+	for _, rng := range compactionBucketRanges("id") {
+		queries = append(queries, fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_neg_risk_events\x60 WHERE %[3]s AND block_number < %[2]d AND (id, (block_number, transaction_index, log_index)) NOT IN (SELECT id, max((block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_neg_risk_events\x60 WHERE %[3]s GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold, rng))
+	}
+	queries = append(queries, fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_neg_risk_events\x60 FINAL", db))
+
+	// memory_fixed_product_market_makers (pk: id; bucketed on id)
+	for _, rng := range compactionBucketRanges("id") {
+		queries = append(queries, fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers\x60 WHERE %[3]s AND block_number < %[2]d AND (id, (block_number, transaction_index, log_index)) NOT IN (SELECT id, max((block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers\x60 WHERE %[3]s GROUP BY id) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold, rng))
+	}
+	queries = append(queries, fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_fixed_product_market_makers\x60 FINAL", db))
 
 	start := time.Now()
 	for _, q := range queries {
-		if err := store.Conn().Do(ctx, ch.Query{Body: q}); err != nil {
+		if err := conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("compaction prune error executing query: %w", err)
 		}
 	}
