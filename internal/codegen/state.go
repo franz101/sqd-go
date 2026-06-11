@@ -162,13 +162,24 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	}
 	defer conn.Close()
 
-	// A reorg-time reload rebuilds hot state from rolled-back ClickHouse. Any cold
-	// tier attached now holds entries for blocks > the rollback point, which would
-	// be stale; detach it so post-reload misses fall back to ClickHouse (correct).
-	// At startup this is a no-op (cold is enabled after this call).
-	_ = s.HotState.CloseColdCache()
+	// Rebuilding from (rolled-back) ClickHouse makes the cold tier authoritative
+	// again: re-open it fresh (Open wipes the dir, discarding entries past the
+	// rollback point), keep it ATTACHED during Recover so rows beyond the hot
+	// ring capacity spill to Pebble instead of being dropped, then mark it
+	// authoritative — hot∪cold now provably covers every state row ≤ blockNumber
+	// and a steady-state miss never needs a ClickHouse point-SELECT. Without a
+	// configured cold tier this is the old behavior (plain hot reload, lazy
+	// per-miss resolution).
+	coldAttached, err := s.HotState.ReopenColdCacheFresh()
+	if err != nil {
+		return fmt.Errorf("load state: reopen cold tier: %w", err)
+	}
 	if err := s.HotState.Recover(ctx, conn, db); err != nil {
 		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
+	}
+	if coldAttached {
+		s.HotState.coldAuthoritative = true
+		log.Printf("[LOAD STATE] cold tier rebuilt and authoritative at block %d: steady-state misses skip ClickHouse", blockNumber)
 	}
 
 	s.LastSyncBlock = blockNumber
@@ -352,6 +363,7 @@ func renderStateImports(b *bytes.Buffer, handles []stateHandleSpec) {
 	imports := map[string]struct{}{
 		`"context"`:                     {},
 		`"fmt"`:                         {},
+		`"log"`:                         {},
 		`"os"`:                          {},
 		`"strconv"`:                     {},
 		`"sync"`:                        {},

@@ -1182,11 +1182,6 @@ func uint256FromAddress(addr common.Address) uint256.Int {
 	return out
 }
 
-// debugFillWallet gates the [DEBUG BUY]/[DEBUG SELL] traces. Compared as an
-// address, not via user.Hex(): Hex() computes an EIP-55 checksum (a keccak256
-// per call), which profiling showed at ~14% of handler CPU.
-var debugFillWallet = common.HexToAddress("0xf05B670C0F91F8171984db945A28D2Ad0F170cC4")
-
 var oneE12U256 = uint256.NewInt(1_000_000_000_000)
 
 // usdcRawToDec18 converts a 1e6-scaled on-chain amount (USDC / outcome tokens)
@@ -1207,9 +1202,6 @@ func usdcRawToDec18(v *uint256.Int) (protomath.Decimal256, bool) {
 func updateUserPositionWithBuyD256(state *generated.State, user common.Address, tokenID uint256.Int, price, amount, pnlAdj protomath.Decimal256, meta generated.EventMeta) {
 	if amount.IsZero() {
 		return
-	}
-	if user == debugFillWallet {
-		fmt.Printf("[DEBUG BUY] block=%d token=%s amount=%s price=%s pnlAdj=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), toDecimal(amount).String(), toDecimal(price).String(), toDecimal(pnlAdj).String())
 	}
 	up := getUserPosition(state, user, tokenID)
 	if up == nil {
@@ -1250,21 +1242,9 @@ func updateUserPositionWithBuyD256(state *generated.State, user common.Address, 
 // updateUserPositionWithSellD256 is the native-Decimal256 equivalent of
 // updateUserPositionWithSell.
 func updateUserPositionWithSellD256(state *generated.State, user common.Address, tokenID uint256.Int, price, amount protomath.Decimal256, meta generated.EventMeta) {
-	isTargetUser := user == debugFillWallet
-	if isTargetUser {
-		fmt.Printf("[DEBUG SELL START] block=%d token=%s amount=%s price=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), toDecimal(amount).String(), toDecimal(price).String())
-	}
 	up := getUserPosition(state, user, tokenID)
 	if up == nil {
-		if isTargetUser {
-			fmt.Printf("[DEBUG SELL] position not found\n")
-		}
 		return
-	}
-
-	if isTargetUser {
-		fmt.Printf("[DEBUG SELL BEFORE] up.Amount=%s up.AvgPrice=%s up.RealizedPnL=%s\n",
-			toDecimal(up.Amount).String(), toDecimal(up.AvgPrice).String(), toDecimal(up.RealizedPnL).String())
 	}
 
 	adjAmt := amount
@@ -1272,9 +1252,6 @@ func updateUserPositionWithSellD256(state *generated.State, user common.Address,
 		adjAmt = up.Amount
 	}
 	if adjAmt.IsZero() {
-		if isTargetUser {
-			fmt.Printf("[DEBUG SELL] adjAmt is zero\n")
-		}
 		return
 	}
 	// PnL = amount * (price - avgPrice)
@@ -1290,20 +1267,12 @@ func updateUserPositionWithSellD256(state *generated.State, user common.Address,
 		up.Amount = v
 	}
 
-	if isTargetUser {
-		fmt.Printf("[DEBUG SELL AFTER] up.Amount=%s up.RealizedPnL=%s (scaledBig=%s)\n",
-			toDecimal(up.Amount).String(), toDecimal(up.RealizedPnL).String(), up.RealizedPnL.ScaledBig().String())
-	}
-
 	state.Position.Save(up, meta)
 }
 
 func updateUserPositionWithBuy(state *generated.State, user common.Address, tokenID uint256.Int, price, amount, pnlAdj decimal.Decimal, meta generated.EventMeta) {
 	if amount.IsZero() {
 		return
-	}
-	if user.Hex() == "0xf05B670C0F91F8171984db945A28D2Ad0F170cC4" || user.Hex() == "0xf05b670c0f91f8171984db945a28d2ad0f170cc4" {
-		fmt.Printf("[DEBUG BUY] block=%d token=%s amount=%s price=%s pnlAdj=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), amount.String(), price.String(), pnlAdj.String())
 	}
 	up := getUserPosition(state, user, tokenID)
 	if up == nil {
@@ -1333,21 +1302,9 @@ func updateUserPositionWithBuy(state *generated.State, user common.Address, toke
 }
 
 func updateUserPositionWithSell(state *generated.State, user common.Address, tokenID uint256.Int, price, amount decimal.Decimal, meta generated.EventMeta) {
-	isTargetUser := user.Hex() == "0xf05B670C0F91F8171984db945A28D2Ad0F170cC4" || user.Hex() == "0xf05b670c0f91f8171984db945a28d2ad0f170cc4"
-	if isTargetUser {
-		fmt.Printf("[DEBUG SELL START] block=%d token=%s amount=%s price=%s\n", meta.BlockNumber, tokenIDHash(tokenID).Hex(), amount.String(), price.String())
-	}
 	up := getUserPosition(state, user, tokenID)
 	if up == nil {
-		if isTargetUser {
-			fmt.Printf("[DEBUG SELL] position not found\n")
-		}
 		return
-	}
-
-	if isTargetUser {
-		fmt.Printf("[DEBUG SELL BEFORE] up.Amount=%s up.AvgPrice=%s up.RealizedPnL=%s\n",
-			toDecimal(up.Amount).String(), toDecimal(up.AvgPrice).String(), toDecimal(up.RealizedPnL).String())
 	}
 
 	adjAmt := amount
@@ -1355,22 +1312,13 @@ func updateUserPositionWithSell(state *generated.State, user common.Address, tok
 		adjAmt = toDecimal(up.Amount)
 	}
 	if adjAmt.IsZero() {
-		if isTargetUser {
-			fmt.Printf("[DEBUG SELL] adjAmt is zero\n")
-		}
 		return
 	}
 	// PnL = amount * (price - avgPrice)
 	// toDecimal handles the 1e18 scaling, so prices are in correct USDC range
 	pnl := adjAmt.Mul(price.Sub(toDecimal(up.AvgPrice)))
-	newRealizedPnL := toDecimal(up.RealizedPnL).Add(pnl)
-	up.RealizedPnL = fromDecimal(newRealizedPnL)
+	up.RealizedPnL = fromDecimal(toDecimal(up.RealizedPnL).Add(pnl))
 	up.Amount = fromDecimal(toDecimal(up.Amount).Sub(adjAmt))
-
-	if isTargetUser {
-		fmt.Printf("[DEBUG SELL AFTER] pnl=%s newRealizedPnL=%s up.Amount=%s up.RealizedPnL=%s (scaledBig=%s)\n",
-			pnl.String(), newRealizedPnL.String(), toDecimal(up.Amount).String(), toDecimal(up.RealizedPnL).String(), up.RealizedPnL.ScaledBig().String())
-	}
 
 	state.Position.Save(up, meta)
 }

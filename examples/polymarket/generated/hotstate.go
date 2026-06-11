@@ -2696,10 +2696,18 @@ type HotState struct {
 	ConditionPreparations            *ConditionPreparationsClockCache
 	ConditionPreparationsResolver    *ConditionalTokensConditionPreparationBatchResolver
 	mu                               sync.Mutex
-	// coldAuthoritative is set when the cold tier was opened against an empty
-	// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,
-	// so the lazy state Get skips the ClickHouse point-SELECT entirely.
+	// coldAuthoritative is set when hot∪cold provably covers every persisted
+	// state row: either the cold tier was opened against an empty ClickHouse
+	// (from-genesis backfill), or a full rebuild-from-ClickHouse just streamed
+	// every state table through the caches with the cold tier attached. A
+	// hot+cold miss is then provably new, so the lazy state Get skips the
+	// ClickHouse point-SELECT entirely.
 	coldAuthoritative bool
+	// coldDir / coldCacheBytes / coldMemTableBytes remember the EnableColdCache
+	// configuration so the tier can be re-opened fresh on a rebuild.
+	coldDir           string
+	coldCacheBytes    int64
+	coldMemTableBytes uint64
 }
 
 func NewHotState(capacity uint64) *HotState {
@@ -2747,7 +2755,26 @@ func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes in
 		return err
 	}
 	s.coldAuthoritative = authoritative
+	s.coldDir = dir
+	s.coldCacheBytes = cacheBytes
+	s.coldMemTableBytes = memTableBytes
 	return nil
+}
+
+// ReopenColdCacheFresh closes and re-opens the cold tier at its configured
+// directory (coldcache.Open wipes the dir, so any entries from before a
+// rollback are discarded). Authoritative stays false until the caller proves
+// coverage. Reports whether a cold tier is configured; no-op without one.
+func (s *HotState) ReopenColdCacheFresh() (bool, error) {
+	if s == nil || s.coldDir == "" {
+		return false, nil
+	}
+	dir, cacheBytes, memTableBytes := s.coldDir, s.coldCacheBytes, s.coldMemTableBytes
+	_ = s.CloseColdCache()
+	if err := s.EnableColdCache(dir, false, cacheBytes, memTableBytes); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *HotState) CloseColdCache() error {

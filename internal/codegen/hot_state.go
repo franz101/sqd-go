@@ -624,10 +624,18 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		}
 	}
 	b.WriteString("\tmu sync.Mutex\n")
-	b.WriteString("\t// coldAuthoritative is set when the cold tier was opened against an empty\n")
-	b.WriteString("\t// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,\n")
-	b.WriteString("\t// so the lazy state Get skips the ClickHouse point-SELECT entirely.\n")
+	b.WriteString("\t// coldAuthoritative is set when hot∪cold provably covers every persisted\n")
+	b.WriteString("\t// state row: either the cold tier was opened against an empty ClickHouse\n")
+	b.WriteString("\t// (from-genesis backfill), or a full rebuild-from-ClickHouse just streamed\n")
+	b.WriteString("\t// every state table through the caches with the cold tier attached. A\n")
+	b.WriteString("\t// hot+cold miss is then provably new, so the lazy state Get skips the\n")
+	b.WriteString("\t// ClickHouse point-SELECT entirely.\n")
 	b.WriteString("\tcoldAuthoritative bool\n")
+	b.WriteString("\t// coldDir / coldCacheBytes / coldMemTableBytes remember the EnableColdCache\n")
+	b.WriteString("\t// configuration so the tier can be re-opened fresh on a rebuild.\n")
+	b.WriteString("\tcoldDir           string\n")
+	b.WriteString("\tcoldCacheBytes    int64\n")
+	b.WriteString("\tcoldMemTableBytes uint64\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -675,6 +683,7 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	b.WriteString("func (s *HotState) ColdAuthoritative() bool {\n\treturn s != nil && s.coldAuthoritative\n}\n\n")
 	if len(coldSpecs) == 0 {
 		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n\treturn nil\n}\n\n")
+		b.WriteString("func (s *HotState) ReopenColdCacheFresh() (bool, error) {\n\treturn false, nil\n}\n\n")
 		b.WriteString("func (s *HotState) CloseColdCache() error {\n\treturn nil\n}\n\n")
 	} else {
 		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n")
@@ -688,7 +697,21 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 			b.WriteString("), cacheBytes, memTableBytes); err != nil {\n\t\treturn err\n\t}\n")
 		}
 		b.WriteString("\ts.coldAuthoritative = authoritative\n")
+		b.WriteString("\ts.coldDir = dir\n")
+		b.WriteString("\ts.coldCacheBytes = cacheBytes\n")
+		b.WriteString("\ts.coldMemTableBytes = memTableBytes\n")
 		b.WriteString("\treturn nil\n}\n\n")
+
+		b.WriteString("// ReopenColdCacheFresh closes and re-opens the cold tier at its configured\n")
+		b.WriteString("// directory (coldcache.Open wipes the dir, so any entries from before a\n")
+		b.WriteString("// rollback are discarded). Authoritative stays false until the caller proves\n")
+		b.WriteString("// coverage. Reports whether a cold tier is configured; no-op without one.\n")
+		b.WriteString("func (s *HotState) ReopenColdCacheFresh() (bool, error) {\n")
+		b.WriteString("\tif s == nil || s.coldDir == \"\" {\n\t\treturn false, nil\n\t}\n")
+		b.WriteString("\tdir, cacheBytes, memTableBytes := s.coldDir, s.coldCacheBytes, s.coldMemTableBytes\n")
+		b.WriteString("\t_ = s.CloseColdCache()\n")
+		b.WriteString("\tif err := s.EnableColdCache(dir, false, cacheBytes, memTableBytes); err != nil {\n\t\treturn false, err\n\t}\n")
+		b.WriteString("\treturn true, nil\n}\n\n")
 
 		b.WriteString("func (s *HotState) CloseColdCache() error {\n")
 		b.WriteString("\tif s == nil {\n\t\treturn nil\n\t}\n")

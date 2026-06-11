@@ -65,13 +65,22 @@ func TestBenchHeadRange(t *testing.T) {
 		}
 	}
 
-	// Resume conditions: cold tier present but NOT authoritative, hot state empty.
+	// Real resume flow: enable the cold tier first, then rebuild state from
+	// ClickHouse. LoadFromDatabase re-opens the tier fresh, runs Recover with it
+	// attached (rows past the hot ring capacity spill to Pebble), and marks it
+	// authoritative — steady state then never point-SELECTs ClickHouse.
 	coldDir := filepath.Join(t.TempDir(), "cold")
 	if err := proc.EnableColdCache(coldDir, false); err != nil {
 		t.Fatalf("enable cold cache: %v", err)
 	}
 	defer func() { _ = proc.CloseColdCache() }()
 	proc.State.SetSnapshotsEnabled(false)
+	loadStart := time.Now()
+	if err := proc.LoadFromDatabase(60444591); err != nil {
+		t.Fatalf("load state from clickhouse: %v", err)
+	}
+	t.Logf("state rebuild from ClickHouse (recovery path): %s, authoritative=%v",
+		time.Since(loadStart).Round(time.Millisecond), proc.State.HotState.ColdAuthoritative())
 
 	started := time.Now()
 	stats, err := processDataFiles(ctx, t, proc, store, dataDir)

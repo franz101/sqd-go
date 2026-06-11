@@ -173,6 +173,32 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	if flagStartBlock > 0 {
 		currentBlock = flagStartBlock
 	}
+	// Cold tier (Pebble): an evicted hot entry is served from local disk instead
+	// of a ClickHouse point-SELECT. Enabled BEFORE state recovery so the
+	// rebuild-from-ClickHouse below runs with the tier attached: rows past the
+	// hot ring capacity spill to Pebble instead of being dropped, after which
+	// hot∪cold provably covers all persisted state and the tier is marked
+	// authoritative (a miss never needs a ClickHouse point-SELECT — ClickHouse
+	// is only read here, on recovery). Fresh runs (no rows for this chain) are
+	// authoritative immediately. Reorg-safe: RestoreToBlock detaches the tier,
+	// so post-reorg reads fall back to the rolled-back ClickHouse.
+	if coldCache {
+		if cc, ok := proc.(ColdCacheProcessor); ok {
+			_, hasAny, err := store.LastBlock(ctx, chain.ID)
+			if err != nil {
+				return fmt.Errorf("cold cache: probe last block: %w", err)
+			}
+			authoritative := !hasAny
+			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
+			if err := cc.EnableColdCache(dir, authoritative); err != nil {
+				return fmt.Errorf("enable cold cache: %w", err)
+			}
+			defer func() { _ = cc.CloseColdCache() }()
+			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
+		} else {
+			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
+		}
+	}
 	state := NewForkTracker(forkMode)
 	if cursorMode {
 		if restart {
@@ -271,31 +297,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	if sc, ok := proc.(SnapshotController); ok {
 		snapshotController = sc
 		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
-	}
-	// Cold tier (Pebble): an evicted hot entry is served from local disk instead of
-	// a ClickHouse point-SELECT. Authoritative iff ClickHouse holds no rows for this
-	// chain at start (fresh / --restart): a hot+cold miss is then provably new and
-	// the per-miss SELECT is skipped entirely. On resume-with-data it stays
-	// non-authoritative — still serving re-referenced evictions from disk, but never
-	// skipping a needed lookup. Reorg-safe: any state recovery (RestoreToBlock /
-	// LoadFromDatabase) detaches the cold tier, so post-reorg reads fall back to the
-	// rolled-back ClickHouse.
-	if coldCache {
-		if cc, ok := proc.(ColdCacheProcessor); ok {
-			_, hasAny, err := store.LastBlock(ctx, chain.ID)
-			if err != nil {
-				return fmt.Errorf("cold cache: probe last block: %w", err)
-			}
-			authoritative := !hasAny
-			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
-			if err := cc.EnableColdCache(dir, authoritative); err != nil {
-				return fmt.Errorf("enable cold cache: %w", err)
-			}
-			defer func() { _ = cc.CloseColdCache() }()
-			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
-		} else {
-			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
-		}
 	}
 	// Backfill GC tuning: double GOGC to halve GC frequency while snapshots
 	// are off. The snapshotless phase generates large but short-lived batches;
