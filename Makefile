@@ -6,7 +6,7 @@ include .env
 export
 endif
 
-.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-fast dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all pnl-venv
+.PHONY: dev dev-build build test vet benchmark bench-bps codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-fast dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all pnl-venv
 
 # Python venv for PnL scripts (auto-created with required deps)
 VENV := .venv
@@ -37,6 +37,15 @@ vet:
 
 benchmark:
 	scripts/profile_make_targets.sh dev dev-v1 dev-v2
+
+# blocks-per-second benchmark: full V2 pipeline vs fetch-only ceiling, same
+# range and duration. Resumes from the DB checkpoint, so stop any running
+# indexer first (make stop / Ctrl-C its tmux session). Override the window with
+# BENCH_DURATION (seconds); first stats line excludes startup/state-load.
+#   make bench-bps                 # 60s each phase
+#   make bench-bps BENCH_DURATION=120
+bench-bps: codegen-polymarket build
+	BENCH_DURATION=$(or $(BENCH_DURATION),60) CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) scripts/bench_bps.sh
 
 # Uniswap example
 UNISWAP_DIR := examples/uniswap

@@ -5,8 +5,13 @@ package generated
 import (
 	"context"
 	"fmt"
+	"github.com/ClickHouse/ch-go"
 	"github.com/ethereum/go-ethereum/common"
+	"log"
+	"os"
+	"strconv"
 	"sync"
+	"time"
 )
 
 type UserPositionState struct{ state *State }
@@ -17,7 +22,10 @@ func (h UserPositionState) Get(address common.Address) (*UserPosition, bool) {
 	}
 	val, ok := h.state.HotState.UserPositions.GetByFields(address)
 	if !ok {
-		if h.state.Store != nil {
+		if h.state.HotState != nil && h.state.HotState.coldAuthoritative {
+			return nil, false
+		}
+		if h.state.Store != nil && h.state.Store.Conn() != nil {
 			key := UserPositionsClockKey{Address: address}
 			h.state.HotState.UserPositionsResolver.Queue(key)
 			if err := h.state.HotState.UserPositionsResolver.Resolve(context.Background(), h.state.Store.Conn(), h.state.Store.DB()); err == nil {
@@ -42,7 +50,7 @@ func (h UserPositionState) Save(value *UserPosition, meta EventMeta) {
 		return
 	}
 	value.UpdatedAtBlock = meta.BlockNumber
-	value.UpdatedAt = meta.BlockTimestamp
+	value.UpdatedAt = meta.BlockTimestamp.UnixMilli()
 	value.BlockNumber = meta.BlockNumber
 	value.TxIndex = meta.TransactionIndex
 	value.LogIndex = meta.LogIndex
@@ -56,8 +64,22 @@ type State struct {
 	mu             sync.RWMutex
 	LastSyncBlock  uint64
 	LastPruneBlock uint64
-	snapshots      []memorySnapshot
-	snapshotIdx    int
+	// lastCommitWallNanos is the unix-nanos of the last hot-state commit, used
+	// by the hybrid block/time commit cadence. 0 means "not yet committed".
+	lastCommitWallNanos int64
+	// commitMaxBlocks / commitMaxInterval cache the hybrid commit cadence
+	// (SQD_COMMIT_INTERVAL, SQD_COMMIT_MAX_INTERVAL). Read once per State:
+	// commitCustomProcessing runs on every block, and an os.Getenv + parse
+	// per block is measurable overhead at backfill rates.
+	commitMaxBlocks   uint64
+	commitMaxInterval time.Duration
+	// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only
+	// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized
+	// head); during finalized backfill they are pure GC/memory churn, so the
+	// ingestion layer disables them there. Default true (safe).
+	snapshotsEnabled bool
+	snapshots        []memorySnapshot
+	snapshotIdx      int
 }
 
 type memorySnapshot struct {
@@ -68,8 +90,20 @@ type memorySnapshot struct {
 const maxSnapshots = 128
 
 func NewState() *State {
-	s := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots)}
+	s := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}
 	s.UserPosition = UserPositionState{state: s}
+	s.commitMaxBlocks = 20000
+	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
+		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
+			s.commitMaxBlocks = parsed
+		}
+	}
+	s.commitMaxInterval = 3 * time.Second
+	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
+		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
+			s.commitMaxInterval = parsed
+		}
+	}
 	return s
 }
 
@@ -80,28 +114,107 @@ func (s *State) Commit(ctx context.Context, store Store) error {
 	return s.HotState.Commit(ctx, store.Conn(), store.DB())
 }
 
-func (s *State) LoadFromClickHouse(ctx context.Context, httpPort int, blockNumber uint64) error {
-	if LoadStateFromClickHouseFn != nil {
-		return LoadStateFromClickHouseFn(s, ctx, httpPort, blockNumber)
-	}
+// LoadFromClickHouse rebuilds the in-memory hot state from the durable memory_*
+// tables at startup/recovery. It dials a native ClickHouse client from the
+// environment (the hot-state caches are not yet attached to a Store at this
+// point) and delegates the per-entity reload to the generated HotState.Recover,
+// which reads each entity's latest row back via the same columnar decoders the
+// commit path writes — guaranteeing a faithful round-trip.
+func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) error {
 	if s == nil {
 		return nil
 	}
+	// Test mode: don't touch a live database, just advance the cursor so a fresh
+	// process starts at the checkpoint.
+	if os.Getenv("TEST_MODE") == "1" || os.Getenv("CI") == "1" {
+		s.LastSyncBlock = blockNumber
+		s.LastPruneBlock = blockNumber
+		s.SaveSnapshot(blockNumber)
+		return nil
+	}
+	if s.HotState == nil {
+		s.LastSyncBlock = blockNumber
+		s.LastPruneBlock = blockNumber
+		s.SaveSnapshot(blockNumber)
+		return nil
+	}
+
+	host := os.Getenv("CLICKHOUSE_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := 9000
+	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			port = p
+		}
+	}
+	user := os.Getenv("CLICKHOUSE_USER")
+	if user == "" {
+		user = "default"
+	}
+	password := os.Getenv("CLICKHOUSE_PASSWORD")
+	db := os.Getenv("CLICKHOUSE_DATABASE")
+	if db == "" {
+		db = ProjectName
+	}
+
+	conn, err := ch.Dial(ctx, ch.Options{
+		Address:  fmt.Sprintf("%s:%d", host, port),
+		Database: "default",
+		User:     user,
+		Password: password,
+	})
+	if err != nil {
+		return fmt.Errorf("load state: dial clickhouse %s:%d: %w", host, port, err)
+	}
+	defer conn.Close()
+
+	// Rebuilding from (rolled-back) ClickHouse makes the cold tier authoritative
+	// again: re-open it fresh (Open wipes the dir, discarding entries past the
+	// rollback point), keep it ATTACHED during Recover so rows beyond the hot
+	// ring capacity spill to Pebble instead of being dropped, then mark it
+	// authoritative — hot∪cold now provably covers every state row ≤ blockNumber
+	// and a steady-state miss never needs a ClickHouse point-SELECT. Without a
+	// configured cold tier this is the old behavior (plain hot reload, lazy
+	// per-miss resolution).
+	coldAttached, err := s.HotState.ReopenColdCacheFresh()
+	if err != nil {
+		return fmt.Errorf("load state: reopen cold tier: %w", err)
+	}
+	if err := s.HotState.Recover(ctx, conn, db); err != nil {
+		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
+	}
+	if coldAttached {
+		s.HotState.coldAuthoritative = true
+		log.Printf("[LOAD STATE] cold tier rebuilt and authoritative at block %d: steady-state misses skip ClickHouse", blockNumber)
+	}
+
 	s.LastSyncBlock = blockNumber
 	s.LastPruneBlock = blockNumber
 	s.SaveSnapshot(blockNumber)
 	return nil
 }
 
-var LoadStateFromClickHouseFn func(state *State, ctx context.Context, httpPort int, blockNumber uint64) error
-
 func (s *State) SaveSnapshot(blockNumber uint64) {
-	if s == nil || s.HotState == nil || len(s.snapshots) == 0 {
+	if s == nil || s.HotState == nil || len(s.snapshots) == 0 || !s.snapshotsEnabled {
 		return
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.saveSnapshotLocked(blockNumber)
+}
+
+// SetSnapshotsEnabled toggles in-memory fork-recovery snapshots. The ingestion
+// layer disables them during finalized backfill (no reorgs) to remove the
+// dominant GC/memory cost; cursor mode keeps them for reorg recovery.
+func (s *State) SetSnapshotsEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.snapshotsEnabled = enabled
+	s.mu.Unlock()
 }
 
 func (s *State) saveSnapshotLocked(blockNumber uint64) {
@@ -115,9 +228,9 @@ func (s *State) saveSnapshotLocked(blockNumber uint64) {
 	s.snapshotIdx++
 }
 
-func (s *State) RestoreToBlock(blockNumber uint64) error {
+func (s *State) RestoreToBlock(blockNumber uint64) (uint64, error) {
 	if s == nil {
-		return nil
+		return blockNumber, nil
 	}
 	var best *memorySnapshot
 	bestIdx := -1
@@ -132,11 +245,15 @@ func (s *State) RestoreToBlock(blockNumber uint64) error {
 		}
 	}
 	if best == nil {
-		return fmt.Errorf("no snapshot found at or below block %d", blockNumber)
+		return 0, fmt.Errorf("no snapshot found at or below block %d", blockNumber)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Detach the cold tier before discarding the hot state: its entries reflect
+	// blocks > the restore point and must not survive a reorg. Post-restore reads
+	// fall back to ClickHouse (rolled back to the safe block) — correct.
+	_ = s.HotState.CloseColdCache()
 	s.HotState = NewHotState(DefaultClockCacheCapacity)
 	for _, val := range best.userPositions {
 		s.HotState.UserPositions.Set(val)
@@ -149,5 +266,5 @@ func (s *State) RestoreToBlock(blockNumber uint64) error {
 		}
 	}
 	s.snapshotIdx = bestIdx + 1
-	return nil
+	return best.blockNumber, nil
 }

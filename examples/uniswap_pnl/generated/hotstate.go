@@ -8,11 +8,14 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/franz101/sqd-go/internal/coldcache"
 	"github.com/holiman/uint256"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 const DefaultClockCacheCapacity uint64 = 100000
@@ -23,7 +26,7 @@ type UserPosition struct {
 	TotalIn        uint256.Int    `ch:"name=total_in;type=UInt256"`
 	TotalOut       uint256.Int    `ch:"name=total_out;type=UInt256"`
 	UpdatedAtBlock uint64         `ch:"name=updated_at_block;type=UInt64"`
-	UpdatedAt      time.Time      `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
+	UpdatedAt      int64          `ch:"name=updated_at;type=DateTime64(3, 'UTC')"`
 	BlockNumber    uint64         `ch:"name=block_number;type=UInt64"`
 	TxIndex        uint64         `ch:"name=transaction_index;type=UInt64"`
 	LogIndex       uint64         `ch:"name=log_index;type=UInt64"`
@@ -46,18 +49,88 @@ type UserPositionsClockEntry struct {
 }
 
 type UserPositionsClockCache struct {
-	items    sync.Map
+	buckets  []int32
+	next     []int32
 	ring     []UserPositionsClockEntry
+	mask     uint32
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
+	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
+	cold *coldcache.Store
+}
+
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *UserPositionsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
 }
 
 func NewUserPositionsClockCache(capacity uint64) *UserPositionsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
 	}
-	return &UserPositionsClockCache{ring: make([]UserPositionsClockEntry, capacity), capacity: capacity}
+	bucketCount := uint64(8)
+	for bucketCount < capacity*2 {
+		bucketCount <<= 1
+	}
+	c := &UserPositionsClockCache{
+		ring:     make([]UserPositionsClockEntry, capacity),
+		buckets:  make([]int32, bucketCount),
+		next:     make([]int32, capacity),
+		mask:     uint32(bucketCount - 1),
+		capacity: capacity,
+	}
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	for i := range c.next {
+		c.next[i] = -1
+	}
+	return c
+}
+
+func (c *UserPositionsClockCache) keyHash(key UserPositionsClockKey) uint32 {
+	h := uint64(1469598103934665603)
+	h = clockHash64(h, key.Address[:])
+	return uint32(h^(h>>32)) & c.mask
+}
+
+func (c *UserPositionsClockCache) idxLookup(key UserPositionsClockKey) (uint64, bool) {
+	for i := c.buckets[c.keyHash(key)]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			return uint64(i), true
+		}
+	}
+	return 0, false
+}
+
+func (c *UserPositionsClockCache) idxInsert(key UserPositionsClockKey, ringIdx uint32) {
+	h := c.keyHash(key)
+	c.next[ringIdx] = c.buckets[h]
+	c.buckets[h] = int32(ringIdx)
+}
+
+func (c *UserPositionsClockCache) idxUnlink(key UserPositionsClockKey) {
+	h := c.keyHash(key)
+	prev := int32(-1)
+	for i := c.buckets[h]; i >= 0; i = c.next[i] {
+		if c.ring[i].key == key {
+			if prev < 0 {
+				c.buckets[h] = c.next[i]
+			} else {
+				c.next[prev] = c.next[i]
+			}
+			c.next[i] = -1
+			return
+		}
+		prev = i
+	}
 }
 
 func (c *UserPositionsClockCache) Set(value UserPosition) {
@@ -65,8 +138,7 @@ func (c *UserPositionsClockCache) Set(value UserPosition) {
 }
 
 func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value UserPosition) {
-	if idxVal, ok := c.items.Load(key); ok {
-		idx := idxVal.(uint64)
+	if idx, ok := c.idxLookup(key); ok {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			e.value = value
@@ -84,11 +156,15 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value User
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-			c.items.Delete(e.key)
+			if c.cold != nil {
+				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))
+			}
+			atomic.AddUint64(&c.evictions, 1)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
-			c.items.Store(key, idx)
+			c.idxInsert(key, uint32(idx))
 			atomic.StoreUint32(&e.inUse, 1)
 			return
 		}
@@ -97,7 +173,7 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value User
 				e.key = key
 				e.value = value
 				atomic.StoreUint32(&e.referenced, 0)
-				c.items.Store(key, idx)
+				c.idxInsert(key, uint32(idx))
 				atomic.AddUint64(&c.size, 1)
 				atomic.StoreUint32(&e.inUse, 1)
 				return
@@ -107,15 +183,20 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value User
 }
 
 func (c *UserPositionsClockCache) Get(key UserPositionsClockKey) (UserPosition, bool) {
-	idxVal, ok := c.items.Load(key)
-	if !ok {
-		return UserPosition{}, false
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
 	}
-	idx := idxVal.(uint64)
-	e := &c.ring[idx]
-	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-		atomic.StoreUint32(&e.referenced, 1)
-		return e.value, true
+	if c.cold != nil {
+		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			var v UserPosition
+			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+			c.SetByKey(key, v)
+			return v, true
+		}
 	}
 	return UserPosition{}, false
 }
@@ -125,15 +206,17 @@ func (c *UserPositionsClockCache) GetByFields(address common.Address) (UserPosit
 }
 
 func (c *UserPositionsClockCache) Delete(key UserPositionsClockKey) bool {
-	idxVal, ok := c.items.Load(key)
+	idx, ok := c.idxLookup(key)
 	if !ok {
 		return false
 	}
-	idx := idxVal.(uint64)
 	e := &c.ring[idx]
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
-			c.items.Delete(key)
+			c.idxUnlink(key)
+			if c.cold != nil {
+				c.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))
+			}
 			e.key = UserPositionsClockKey{}
 			e.value = UserPosition{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -149,21 +232,18 @@ func (c *UserPositionsClockCache) Range(fn func(UserPositionsClockKey, UserPosit
 	if fn == nil {
 		return
 	}
-	c.items.Range(func(keyAny, idxAny any) bool {
-		key, ok := keyAny.(UserPositionsClockKey)
-		if !ok {
-			return true
+	limit := atomic.LoadUint64(&c.hand)
+	if limit > c.capacity {
+		limit = c.capacity
+	}
+	for i := uint64(0); i < limit; i++ {
+		e := &c.ring[i]
+		if atomic.LoadUint32(&e.inUse) == 1 {
+			if !fn(e.key, e.value) {
+				return
+			}
 		}
-		idx, ok := idxAny.(uint64)
-		if !ok || idx >= c.capacity {
-			return true
-		}
-		e := &c.ring[idx]
-		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-			return fn(key, e.value)
-		}
-		return true
-	})
+	}
 }
 
 func (c *UserPositionsClockCache) AppendValues(dst []UserPosition) []UserPosition {
@@ -234,7 +314,7 @@ func (b *UserPositionBatch) Append(item UserPosition) {
 	b.colTotalIn.Append(hotStateUInt256(item.TotalIn))
 	b.colTotalOut.Append(hotStateUInt256(item.TotalOut))
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
-	b.colUpdatedAt.Append(item.UpdatedAt)
+	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
 	b.colTxIndex.Append(item.TxIndex)
 	b.colLogIndex.Append(item.LogIndex)
@@ -283,7 +363,7 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 				TotalIn:        hotStateUint256(colTotalIn.Row(i)),
 				TotalOut:       hotStateUint256(colTotalOut.Row(i)),
 				UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-				UpdatedAt:      colUpdatedAt.Row(i),
+				UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 				BlockNumber:    colBlockNumber.Row(i),
 				TxIndex:        colTxIndex.Row(i),
 				LogIndex:       colLogIndex.Row(i),
@@ -309,6 +389,11 @@ func (r *UserPositionBatchResolver) Queue(key UserPositionsClockKey) {
 	if _, ok := r.cache.Get(key); !ok {
 		r.misses = append(r.misses, key)
 	}
+}
+
+// Pending reports how many missed keys are queued for the next Resolve.
+func (r *UserPositionBatchResolver) Pending() int {
+	return len(r.misses)
 }
 
 func (r *UserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.Client, db string) error {
@@ -374,7 +459,7 @@ func (r *UserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.Client
 					TotalIn:        hotStateUint256(colTotalIn.Row(i)),
 					TotalOut:       hotStateUint256(colTotalOut.Row(i)),
 					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-					UpdatedAt:      colUpdatedAt.Row(i),
+					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
 					BlockNumber:    colBlockNumber.Row(i),
 					TxIndex:        colTxIndex.Row(i),
 					LogIndex:       colLogIndex.Row(i),
@@ -403,6 +488,18 @@ type HotState struct {
 	UserPositionsResolver *UserPositionBatchResolver
 	dirtyUserPositions    map[UserPositionsClockKey]struct{}
 	mu                    sync.Mutex
+	// coldAuthoritative is set when hot∪cold provably covers every persisted
+	// state row: either the cold tier was opened against an empty ClickHouse
+	// (from-genesis backfill), or a full rebuild-from-ClickHouse just streamed
+	// every state table through the caches with the cold tier attached. A
+	// hot+cold miss is then provably new, so the lazy state Get skips the
+	// ClickHouse point-SELECT entirely.
+	coldAuthoritative bool
+	// coldDir / coldCacheBytes / coldMemTableBytes remember the EnableColdCache
+	// configuration so the tier can be re-opened fresh on a rebuild.
+	coldDir           string
+	coldCacheBytes    int64
+	coldMemTableBytes uint64
 }
 
 func NewHotState(capacity uint64) *HotState {
@@ -415,6 +512,59 @@ func NewHotState(capacity uint64) *HotState {
 	}
 	state.UserPositionsResolver = NewUserPositionBatchResolver(state.UserPositions)
 	return state
+}
+
+// ColdAuthoritative reports whether the cold tier is authoritative for misses
+// (opened against an empty ClickHouse): a hot+cold miss is provably new, so
+// callers batching their own resolver round-trips may skip them entirely.
+func (s *HotState) ColdAuthoritative() bool {
+	return s != nil && s.coldAuthoritative
+}
+
+func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	if s.UserPositions.cold, err = coldcache.Open(filepath.Join(dir, "UserPositions"), cacheBytes, memTableBytes); err != nil {
+		return err
+	}
+	s.coldAuthoritative = authoritative
+	s.coldDir = dir
+	s.coldCacheBytes = cacheBytes
+	s.coldMemTableBytes = memTableBytes
+	return nil
+}
+
+// ReopenColdCacheFresh closes and re-opens the cold tier at its configured
+// directory (coldcache.Open wipes the dir, so any entries from before a
+// rollback are discarded). Authoritative stays false until the caller proves
+// coverage. Reports whether a cold tier is configured; no-op without one.
+func (s *HotState) ReopenColdCacheFresh() (bool, error) {
+	if s == nil || s.coldDir == "" {
+		return false, nil
+	}
+	dir, cacheBytes, memTableBytes := s.coldDir, s.coldCacheBytes, s.coldMemTableBytes
+	_ = s.CloseColdCache()
+	if err := s.EnableColdCache(dir, false, cacheBytes, memTableBytes); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *HotState) CloseColdCache() error {
+	if s == nil {
+		return nil
+	}
+	var firstErr error
+	if s.UserPositions.cold != nil {
+		if e := s.UserPositions.cold.Close(); e != nil && firstErr == nil {
+			firstErr = e
+		}
+		s.UserPositions.cold = nil
+	}
+	s.coldAuthoritative = false
+	return firstErr
 }
 
 func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {
@@ -435,9 +585,10 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if conn == nil {
-		s.dirtyUserPositions = make(map[UserPositionsClockKey]struct{})
+		clear(s.dirtyUserPositions)
 		return nil
 	}
+	hadWork := len(s.dirtyUserPositions) > 0
 	if len(s.dirtyUserPositions) > 0 {
 		batch := NewUserPositionBatch()
 		for key := range s.dirtyUserPositions {
@@ -448,9 +599,34 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
 		if err := batch.Insert(ctx, conn, db); err != nil {
 			return err
 		}
-		s.dirtyUserPositions = make(map[UserPositionsClockKey]struct{})
+		clear(s.dirtyUserPositions)
+	}
+	if hadWork {
+		if err := conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"}); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+func (s *HotState) RestoreUserPosition(key UserPositionsClockKey, value UserPosition, had bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if had {
+		s.UserPositions.SetByKey(key, value)
+		s.dirtyUserPositions[key] = struct{}{}
+		return
+	}
+	s.UserPositions.Delete(key)
+	delete(s.dirtyUserPositions, key)
+}
+
+func clockHash64(seed uint64, b []byte) uint64 {
+	h := seed
+	for _, x := range b {
+		h ^= uint64(x)
+		h *= 1099511628211
+	}
+	return h
 }
 
 func hotStateUInt256(v uint256.Int) proto.UInt256 {

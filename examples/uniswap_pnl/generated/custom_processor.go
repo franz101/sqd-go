@@ -8,14 +8,71 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
 
-// CustomProcessFn is the callback registered by the custom processor.
+// CustomProcessFn is the callback you register from your project package to
+// run custom business logic on each block. Assign it in an init() function:
+//
+//	func init() {
+//	    generated.CustomProcessFn = myProcess
+//	}
+//
+//	func myProcess(state *generated.State, block *generated.ParsedBlock) error {
+//	    // --- Access events by type (each slice is pre-decoded for this block) ---
+//	    //
+//	    // for _, ev := range block.MyContractTransfers {
+//	    //     from  := ev.From           // common.Address
+//	    //     to    := ev.To             // common.Address
+//	    //     value := ev.Value          // uint256.Int
+//	    //     block := ev.BlockNumber    // uint64 (from embedded EventMeta)
+//	    // }
+//	    //
+//	    // --- Or iterate ALL events in log-index order (mixed types) ---
+//	    //
+//	    // for ev := range block.EventsIter() {
+//	    //     switch e := ev.(type) {
+//	    //     case *generated.MyContractTransfer:
+//	    //         // handle transfer
+//	    //     case *generated.MyContractApproval:
+//	    //         // handle approval
+//	    //     }
+//	    // }
+//	    //
+//	    // --- Read state (lazy-loaded from ClickHouse on cache miss) ---
+//	    //
+//	    // val, ok := state.MyEntity.Get(keyField1, keyField2)
+//	    // if ok {
+//	    //     fmt.Println(val.SomeField)
+//	    // }
+//	    //
+//	    // --- Write state (persisted to ClickHouse on commit) ---
+//	    //
+//	    // state.MyEntity.Save(&generated.MyEntity{
+//	    //     KeyField: ev.SomeAddress,
+//	    //     Balance:  newBalance,
+//	    // }, ev.EventMeta)
+//	    //
+//	    return nil
+//	}
 var CustomProcessFn func(state *State, block *ParsedBlock) error
+
+// CustomProcessProtoFn is the proto-mode equivalent of CustomProcessFn.
+// Proto mode uses columnar storage (~50x less memory) with accessor methods
+// instead of struct fields:
+//
+//	block.QueryMyContractTransfer().Map(func(ev generated.MyContractTransferProtoView) {
+//	    from := ev.From()   // accessor method, not a struct field
+//	    to   := ev.To()
+//	    _ = from; _ = to
+//	})
+var CustomProcessProtoFn func(state *State, block *ProtoEventBlock) error
 
 // CustomProcessing wraps the block-based processing
 func CustomProcessing(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
@@ -23,14 +80,9 @@ func CustomProcessing(ctx context.Context, store Store, state *State, block *Par
 		return nil
 	}
 	state.Store = store
-	// Prefetch state
-	if err := prefetchBlockState(ctx, store, state, block); err != nil {
-		return fmt.Errorf("custom state prefetch failed: %w", err)
-	}
-	return customProcessingNoPrefetch(ctx, store, state, block)
-}
+	// Prefetch intentionally disabled: hot-state misses are resolved lazily
+	// (GetUserPosition/GetCondition/...) from durable ClickHouse state.
 
-func customProcessingNoPrefetch(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
 	// Process block
 	if CustomProcessFn != nil {
 		if err := CustomProcessFn(state, block); err != nil {
@@ -38,56 +90,202 @@ func customProcessingNoPrefetch(ctx context.Context, store Store, state *State, 
 		}
 	}
 
-	// Commit state & prune
-	if block.BlockNumber >= state.LastSyncBlock+1000 {
-		state.SaveSnapshot(block.BlockNumber)
+	return commitCustomProcessing(ctx, store, state, block.BlockNumber)
+}
+
+// CustomProcessingProto wraps proto block-based processing.
+func CustomProcessingProto(ctx context.Context, store Store, state *State, block *ProtoEventBlock) error {
+	if state == nil || block == nil {
+		return nil
+	}
+	state.Store = store
+	// Prefetch intentionally disabled: hot-state misses are resolved lazily.
+
+	if CustomProcessProtoFn != nil {
+		if err := CustomProcessProtoFn(state, block); err != nil {
+			return err
+		}
+	}
+
+	return commitCustomProcessing(ctx, store, state, protoBlockNumber(block))
+}
+
+func commitCustomProcessing(ctx context.Context, store Store, state *State, blockNumber uint64) error {
+	// Hybrid commit cadence. Commit when EITHER bound is hit, whichever first:
+	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 20000): the crash re-fetch budget.
+	//     Bounds how many blocks a crash must re-fetch+re-process from the durable
+	//     checkpoint. Dominates (and binds) during fast block-bound backfill. Every
+	//     commit re-persists each hot entity touched since the previous one, so a
+	//     frequently-updated entity (e.g. an active position written on every trade)
+	//     is re-written once per commit — pure redundancy. A larger interval folds
+	//     those repeated writes into one, which is the dominant backfill cost; 20000
+	//     blocks is still only a few portal responses to re-fetch on crash (cheap),
+	//     and dirty-but-evicted entries are preserved by the cold-tier spill, so
+	//     nothing is lost between commits.
+	//   - maxInterval (SQD_COMMIT_MAX_INTERVAL, default 3s): the durability-latency
+	//     bound. Ensures the live tail (few blocks/sec) still becomes durable
+	//     promptly instead of waiting maxBlocks (which could be ~30 min of wall
+	//     clock). Dominates at the head and binds during fetch-bound backfill
+	//     (~3k blk/s, where maxBlocks worth of blocks takes >maxInterval), which is
+	//     why raising maxBlocks does not loosen the live durability guarantee.
+	// This replaces the single magic block interval: the checkpoint never leads the
+	// durable horizon, and the gap is bounded in both blocks and wall-clock time.
+	// Both bounds are cached on State at construction (this runs per block).
+	maxBlocks := state.commitMaxBlocks
+	maxInterval := state.commitMaxInterval
+
+	nowNanos := time.Now().UnixNano()
+	if state.lastCommitWallNanos == 0 {
+		state.lastCommitWallNanos = nowNanos
+	}
+	blocksElapsed := blockNumber >= state.LastSyncBlock+maxBlocks
+	timeElapsed := time.Duration(nowNanos-state.lastCommitWallNanos) >= maxInterval
+	if blocksElapsed || timeElapsed {
+		state.lastCommitWallNanos = nowNanos
+		state.SaveSnapshot(blockNumber)
 		if err := state.Commit(ctx, store); err != nil {
 			return err
 		}
 
 		pruneInterval := uint64(100000)
 		if envVal := os.Getenv("CLICKHOUSE_PRUNE_INTERVAL"); envVal != "" {
-			if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil {
-				pruneInterval = parsed
+			parsed, err := strconv.ParseUint(envVal, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid CLICKHOUSE_PRUNE_INTERVAL %q: %w", envVal, err)
 			}
+			pruneInterval = parsed
 		}
-		if block.BlockNumber >= state.LastPruneBlock+pruneInterval {
-			if err := CompactionPruneState(ctx, store, block.BlockNumber); err != nil {
-				log.Printf("[PRUNING WARNING] Failed to prune Clickhouse tables: %v", err)
+		if state.LastPruneBlock == 0 {
+			// Anchor the prune baseline to the first committed block of the run so the
+			// first prune fires pruneInterval blocks later. A fresh/--restart run loads
+			// LastPruneBlock as 0; without this a high start block (e.g. 23M) trips the
+			// threshold on block 1 and runs a full OPTIMIZE/DELETE prune immediately —
+			// pointless (nothing old to prune yet) and needlessly heavy on the live
+			// connection while the first batch is still streaming.
+			state.LastPruneBlock = blockNumber
+		}
+		if blockNumber >= state.LastPruneBlock+pruneInterval {
+			// Prune removes superseded state rows — an optimization, never a
+			// correctness requirement. A failure (e.g. ClickHouse hitting its
+			// memory limit mid-mutation) must not abort the chain; skip this
+			// window and retry pruneInterval blocks later.
+			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
+				log.Printf("WARN: prune ClickHouse state at block %d failed (retrying in %d blocks): %v", blockNumber, pruneInterval, err)
 			}
-			state.LastPruneBlock = block.BlockNumber
+			state.LastPruneBlock = blockNumber
 		}
 
-		state.LastSyncBlock = block.BlockNumber
+		state.LastSyncBlock = blockNumber
 	}
-
 	return nil
 }
 
-const defaultRingBufferSize uint32 = 1024
-const prefetchSlotBatchSize = 8
-
-type Processor struct {
-	ring  *OrderedHistoricRingBuffer
-	State *State
+func protoBlockNumber(block *ProtoEventBlock) uint64 {
+	if block == nil {
+		return 0
+	}
+	if block.HeaderBlockNumber != 0 {
+		return block.HeaderBlockNumber
+	}
+	if block.BlockNumber.Rows() > 0 {
+		return block.BlockNumber[0]
+	}
+	return 0
 }
 
-func NewProcessor() (*Processor, error) {
-	ring, err := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
-	if err != nil {
-		return nil, err
+const defaultRingBufferSize uint32 = 8192
+
+type Processor struct {
+	ring      *OrderedHistoricRingBuffer
+	protoRing *ProtoRingBuffer
+	State     *State
+	ProtoMode bool
+}
+
+func NewProcessor(protoMode bool) (*Processor, error) {
+	var ring *OrderedHistoricRingBuffer
+	var protoRing *ProtoRingBuffer
+	var err error
+	if protoMode {
+		protoRing, err = NewProtoRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		ring, err = NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &Processor{
-		ring:  ring,
-		State: NewState(),
+		ring:      ring,
+		protoRing: protoRing,
+		State:     NewState(),
+		ProtoMode: protoMode,
 	}, nil
+}
+
+// ProcessJSONL implements ingestion.FastJSONLProcessor: raw portal JSONL is
+// parsed once, directly into the preallocated ring-buffer slots (Reset keeps
+// column/slice capacity, so steady-state appends allocate nothing regardless
+// of the adaptive page size), and the custom processor runs per block. This
+// replaces the legacy CustomLog path end to end: no per-log string clones in
+// the producer, no hex re-decode here, no per-event map[string]any.
+func (p *Processor) ProcessJSONL(ctx context.Context, store *database.Store, data []byte) (uint64, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	logProtoModeOnce.Do(func() {
+		log.Printf("processor: ProcessJSONL fast parse path (protoMode=%v)", p.ProtoMode)
+	})
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+			if err != nil {
+				return 0, err
+			}
+			p.protoRing = ring
+		}
+		return ParseJSONLProto(data, nil, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	}
+	if p.ring == nil {
+		ring, err := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, err
+		}
+		p.ring = ring
+	}
+	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
+		return CustomProcessing(ctx, stateStore, p.State, block)
+	})
 }
 
 func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {
 	if p == nil || len(logs) == 0 {
 		return nil
 	}
-	if p.ring == nil {
+	logProcessorStateOnce.Do(func() {
+		log.Printf("processor: legacy CustomLog path (protoMode=%v); set SQD_PARSE_DECODE_V2=1 for the fast parse path", p.ProtoMode)
+	})
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+			if err != nil {
+				return err
+			}
+			p.protoRing = ring
+		}
+	} else if p.ring == nil {
 		ring, err := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
 		if err != nil {
 			return err
@@ -97,7 +295,11 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 	if p.State == nil {
 		p.State = NewState()
 	}
-	p.State.Store = store
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
 
 	type blockGroup struct {
 		blockNum  uint64
@@ -105,15 +307,82 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 		logs      []DecodedLog
 	}
 
-	var groups []blockGroup
-	var curGroup *blockGroup
+	if p.ProtoMode {
+		var curProtoBlock *ProtoEventBlock
+		var curBlockNum uint64
+		// Reused across logs within this Process call: AppendFromLog copies every
+		// topic/data word into the proto columns and retains neither slice, so one
+		// scratch each avoids a per-log []common.Hash and []byte (FromHex) alloc.
+		var topicsScratch []common.Hash
+		var dataScratch []byte
+
+		for _, lg := range logs {
+			if curProtoBlock == nil || curBlockNum != lg.BlockNumber {
+				if curProtoBlock != nil {
+					if err := p.processProtoBlocks(ctx, stateStore, []*ProtoEventBlock{curProtoBlock}); err != nil {
+						return err
+					}
+				}
+				curBlockNum = lg.BlockNumber
+				curProtoBlock = p.protoRing.NextProtoSlot(curBlockNum, lg.BlockHash)
+			}
+			meta := EventMeta{
+				BlockNumber:      lg.BlockNumber,
+				BlockTimestamp:   lg.BlockTimestamp,
+				BlockHash:        abiunpack.DecodeTopicHash(lg.BlockHash),
+				ContractAddress:  abiunpack.AddressFromHex(lg.ContractAddress),
+				TransactionHash:  abiunpack.DecodeTopicHash(lg.TransactionHash),
+				TransactionIndex: lg.TransactionIndex,
+				LogIndex:         lg.LogIndex,
+			}
+			if cap(topicsScratch) < len(lg.Topics) {
+				topicsScratch = make([]common.Hash, len(lg.Topics))
+			}
+			topics := topicsScratch[:len(lg.Topics)]
+			for i, t := range lg.Topics {
+				topics[i] = abiunpack.DecodeTopicHash(t)
+			}
+			dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
+			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, dataScratch, meta)
+		}
+		if curProtoBlock != nil {
+			return p.processProtoBlocks(ctx, stateStore, []*ProtoEventBlock{curProtoBlock})
+		}
+		return nil
+	}
+
+	processGroup := func(group blockGroup) error {
+		if len(group.logs) == 0 {
+			return nil
+		}
+		p.ring.Push(group.blockNum, group.blockHash, group.logs)
+		block, ok := p.ring.GetParsedBlock(group.blockNum)
+		if !ok {
+			return fmt.Errorf("block for block %d not found after push", group.blockNum)
+		}
+		if err := CustomProcessing(ctx, stateStore, p.State, block); err != nil {
+			return fmt.Errorf("custom processing block %d failed: %w", block.BlockNumber, err)
+		}
+		return nil
+	}
+
+	var curGroup blockGroup
+	var hasGroup bool
 	for _, lg := range logs {
+		if hasGroup && curGroup.blockNum != lg.BlockNumber {
+			if err := processGroup(curGroup); err != nil {
+				return err
+			}
+			curGroup = blockGroup{}
+			hasGroup = false
+		}
+
 		meta := EventMeta{
 			BlockNumber:      lg.BlockNumber,
 			BlockTimestamp:   lg.BlockTimestamp,
-			BlockHash:        common.HexToHash(lg.BlockHash),
-			ContractAddress:  common.HexToAddress(lg.ContractAddress),
-			TransactionHash:  common.HexToHash(lg.TransactionHash),
+			BlockHash:        abiunpack.DecodeTopicHash(lg.BlockHash),
+			ContractAddress:  abiunpack.AddressFromHex(lg.ContractAddress),
+			TransactionHash:  abiunpack.DecodeTopicHash(lg.TransactionHash),
 			TransactionIndex: lg.TransactionIndex,
 			LogIndex:         lg.LogIndex,
 		}
@@ -125,46 +394,58 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 			continue
 		}
 
-		if curGroup == nil || curGroup.blockNum != lg.BlockNumber {
-			groups = append(groups, blockGroup{blockNum: lg.BlockNumber, blockHash: lg.BlockHash})
-			curGroup = &groups[len(groups)-1]
+		if !hasGroup {
+			curGroup = blockGroup{blockNum: lg.BlockNumber, blockHash: lg.BlockHash}
+			hasGroup = true
 		}
 		curGroup.logs = append(curGroup.logs, *decoded)
 	}
-
-	blocks := make([]*ParsedBlock, 0, len(groups))
-	for _, group := range groups {
-		p.ring.Push(group.blockNum, group.blockHash, group.logs)
-		block, ok := p.ring.GetParsedBlock(group.blockNum)
-		if !ok {
-			return fmt.Errorf("parsed block %d not found after push", group.blockNum)
-		}
-		blocks = append(blocks, block)
-	}
-
-	for start := 0; start < len(blocks); start += prefetchSlotBatchSize {
-		end := start + prefetchSlotBatchSize
-		if end > len(blocks) {
-			end = len(blocks)
-		}
-		chunk := blocks[start:end]
-		if err := prefetchBlocksState(ctx, store, p.State, chunk); err != nil {
-			return fmt.Errorf("custom state prefetch failed: %w", err)
-		}
-		for _, block := range chunk {
-			if err := customProcessingNoPrefetch(ctx, store, p.State, block); err != nil {
-				return fmt.Errorf("custom processing block %d failed: %w", block.BlockNumber, err)
-			}
-			PrintPnLSummary(p.State, block.BlockNumber)
+	if hasGroup {
+		if err := processGroup(curGroup); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-func (p *Processor) RestoreToBlock(blockNumber uint64) error {
-	if p == nil || p.State == nil {
+var (
+	logProtoModeOnce      sync.Once
+	logCustomFnOnce       sync.Once
+	logProcessorStateOnce sync.Once
+)
+
+// processProtoBlocks handles proto mode processing.
+func (p *Processor) processProtoBlocks(ctx context.Context, store Store, blocks []*ProtoEventBlock) error {
+	if len(blocks) == 0 {
 		return nil
+	}
+	if CustomProcessProtoFn == nil {
+		logCustomFnOnce.Do(func() {
+			fmt.Println("[PROTO MODE] CustomProcessProtoFn is nil, skipping custom proto processing")
+		})
+		return nil
+	}
+	for _, protoBlock := range blocks {
+		if err := CustomProcessingProto(ctx, store, p.State, protoBlock); err != nil {
+			return fmt.Errorf("custom proto processing block %d failed: %w", protoBlockNumber(protoBlock), err)
+		}
+	}
+	return nil
+}
+
+func (p *Processor) RestoreToBlock(blockNumber uint64) (uint64, error) {
+	if p == nil {
+		return 0, nil
+	}
+	if p.ring != nil {
+		p.ring.Reset()
+	}
+	if p.protoRing != nil {
+		p.protoRing.Reset()
+	}
+	if p.State == nil {
+		return blockNumber, nil
 	}
 	return p.State.RestoreToBlock(blockNumber)
 }
@@ -173,18 +454,17 @@ func (p *Processor) LoadFromDatabase(blockNumber uint64) error {
 	if p == nil {
 		return nil
 	}
+	if p.ring != nil {
+		p.ring.Reset()
+	}
+	if p.protoRing != nil {
+		p.protoRing.Reset()
+	}
 	if p.State == nil {
 		p.State = NewState()
 	}
 
-	httpPort := 8123
-	if portStr := os.Getenv("CLICKHOUSE_HTTP_PORT"); portStr != "" {
-		if pVal, err := strconv.Atoi(portStr); err == nil {
-			httpPort = pVal
-		}
-	}
-
-	if err := p.State.LoadFromClickHouse(context.Background(), httpPort, blockNumber); err != nil {
+	if err := p.State.LoadFromClickHouse(context.Background(), blockNumber); err != nil {
 		return fmt.Errorf("failed to load state from ClickHouse: %w", err)
 	}
 
@@ -193,11 +473,63 @@ func (p *Processor) LoadFromDatabase(blockNumber uint64) error {
 	return nil
 }
 
-func prefetchBlockState(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
-	return prefetchBlocksState(ctx, store, state, []*ParsedBlock{block})
+// CommittedBlock returns the highest block whose hot state has been durably
+// committed to ClickHouse (wait_for_async_insert=1). The ingestion checkpoint
+// must never lead this horizon, so a crash resumes from durable state and
+// re-fetches the (cheap) gap rather than losing un-committed updates.
+func (p *Processor) CommittedBlock() uint64 {
+	if p == nil || p.State == nil {
+		return 0
+	}
+	return p.State.LastSyncBlock
 }
 
-func prefetchBlocksState(ctx context.Context, store Store, state *State, blocks []*ParsedBlock) error {
-	return nil
+// Flush forces a durable commit of all hot state processed up to blockNumber and
+// advances the committed horizon. Called on clean completion / shutdown so the
+// tail (the < commit-cadence blocks since the last periodic commit) is persisted
+// and the checkpoint can advance to it. Returns the new committed horizon.
+func (p *Processor) Flush(ctx context.Context, store *database.Store, blockNumber uint64) (uint64, error) {
+	if p == nil || p.State == nil {
+		return 0, nil
+	}
+	if store != nil {
+		if err := p.State.Commit(ctx, store); err != nil {
+			return p.State.LastSyncBlock, err
+		}
+	}
+	if blockNumber > p.State.LastSyncBlock {
+		p.State.LastSyncBlock = blockNumber
+	}
+	p.State.lastCommitWallNanos = time.Now().UnixNano()
+	return p.State.LastSyncBlock, nil
 }
+
+// SetSnapshotsEnabled toggles in-memory fork-recovery snapshots. Disabled during
+// finalized backfill (no reorgs) to remove the dominant GC/memory cost.
+func (p *Processor) SetSnapshotsEnabled(enabled bool) {
+	if p == nil || p.State == nil {
+		return
+	}
+	p.State.SetSnapshotsEnabled(enabled)
+}
+
+// EnableColdCache attaches the Pebble cold tier to the hot caches (pointer-free
+// entities). authoritative=true (from-genesis, empty ClickHouse) lets a hot+cold
+// miss skip the ClickHouse point-SELECT. No-op if state is nil.
+func (p *Processor) EnableColdCache(dir string, authoritative bool) error {
+	if p == nil || p.State == nil || p.State.HotState == nil {
+		return nil
+	}
+	return p.State.HotState.EnableColdCache(dir, authoritative, 0, 0)
+}
+
+// CloseColdCache releases the cold tier (and its off-heap Pebble buffers). Called
+// by the ingestion layer on exit.
+func (p *Processor) CloseColdCache() error {
+	if p == nil || p.State == nil || p.State.HotState == nil {
+		return nil
+	}
+	return p.State.HotState.CloseColdCache()
+}
+
 func PrintPnLSummary(state *State, blockNumber uint64) {}
