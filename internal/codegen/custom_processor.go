@@ -333,13 +333,6 @@ var CustomProcessFn func(state *State, block *ParsedBlock) error
 //	})
 var CustomProcessProtoFn func(state *State, block *ProtoEventBlock) error
 
-// CustomPagePrefetchFn, when set, runs once per ProcessJSONL batch (a whole
-// portal page / consumer drain, often thousands of blocks) before the
-// processing pass. Use it to scan the page and warm hot-state caches with one
-// batched resolver round-trip per cache instead of one per block — per-block
-// resolves stay in place as the correctness fallback.
-var CustomPagePrefetchFn func(state *State, data []byte, ring *ProtoRingBuffer)
-
 // CustomProcessing wraps the block-based processing
 func CustomProcessing(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
 	if state == nil || block == nil {
@@ -519,11 +512,6 @@ func (p *Processor) ProcessJSONL(ctx context.Context, store *database.Store, dat
 				return 0, err
 			}
 			p.protoRing = ring
-		}
-		// Scan pass and processing pass share the ring: the scan completes
-		// (and releases every slot) before processing starts.
-		if CustomPagePrefetchFn != nil {
-			CustomPagePrefetchFn(p.State, data, p.protoRing)
 		}
 		return ParseJSONLProto(data, nil, p.protoRing, func(block *ProtoEventBlock) error {
 			return CustomProcessingProto(ctx, stateStore, p.State, block)

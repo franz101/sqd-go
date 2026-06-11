@@ -74,7 +74,6 @@ func fromDecimal(v decimal.Decimal) protomath.Decimal256 {
 func init() {
 	generated.CustomProcessFn = Process
 	generated.CustomProcessProtoFn = ProcessProto
-	generated.CustomPagePrefetchFn = PagePrefetch
 	cli.RegisterProcessorV2(generated.ProjectName, func(protoMode bool) (ingestion.Processor, error) {
 		return generated.NewProcessor(protoMode)
 	})
@@ -277,133 +276,6 @@ func ensureFPMMMarketsLoaded(state *generated.State, fpmmAddrs []common.Address)
 	}
 }
 
-// posResolveNanos / posResolveRoundTrips are diagnostic counters (single-goroutine processor).
-var posResolveNanos int64
-var posResolveRoundTrips int64
-
-// fillPositionClockKey extracts the (maker, tokenID) position key an order
-// fill will touch: the traded token is whichever asset id is non-zero (the
-// zero side is USDC collateral).
-func fillPositionClockKey(maker common.Address, makerAssetID, takerAssetID uint256.Int) (generated.UserPositionsClockKey, bool) {
-	tokenID := makerAssetID
-	if makerAssetID.IsZero() {
-		tokenID = takerAssetID
-	}
-	if tokenID.IsZero() {
-		return generated.UserPositionsClockKey{}, false
-	}
-	return generated.UserPositionsClockKey{User: maker, TokenID: tokenIDHash(tokenID)}, true
-}
-
-// ensurePositionsLoaded batches the user-position lookups for all order fills
-// in a block into one resolver round-trip. Without this every first-touch
-// (user, token) pair paid its own synchronous point-SELECT inside
-// PositionState.Get — ~237 SELECTs/s at ~2.8ms each on a resumed live run
-// (live pprof + system.query_log at block ~59.9M), serializing the consumer.
-func ensurePositionsLoaded(state *generated.State, keys []generated.UserPositionsClockKey) {
-	if len(keys) == 0 {
-		return
-	}
-	canResolve := state.Store != nil && state.Store.Conn() != nil
-	// Same soundness rule as conditions: on an authoritative from-genesis run
-	// with no position ever evicted from the hot ring, hot state is a superset
-	// of ClickHouse, so a hot miss proves a database miss.
-	if canResolve && state.HotState.ColdAuthoritative() && state.HotState.UserPositions.Evictions() == 0 {
-		canResolve = false
-	}
-	if !canResolve {
-		return
-	}
-	queued := 0
-	for _, key := range keys {
-		if _, ok := state.HotState.UserPositions.Get(key); ok {
-			continue // present or tombstoned — both already resolved
-		}
-		state.HotState.UserPositionsResolver.Queue(key)
-		queued++
-	}
-	if queued > 0 {
-		t0 := time.Now()
-		posResolveRoundTrips++
-		_ = state.HotState.UserPositionsResolver.Resolve(context.Background(), state.Store.Conn(), state.Store.DB())
-		posResolveNanos += time.Since(t0).Nanoseconds()
-	}
-}
-
-// PagePrefetch scans a whole ProcessJSONL batch (a consumer drain — often
-// thousands of blocks) before the processing pass and warms every hot-state
-// key the page will touch with one batched resolver round-trip per cache.
-// Per-block batching alone barely helps on a resumed run: most blocks carry
-// only 1-2 first-touch fills, so the consumer still pays ~1 point-SELECT per
-// block (~166/s live). Page-wide batching amortizes that to ~1 round-trip per
-// few thousand blocks. The scan re-parses the page (~1% of pipeline time);
-// entities created mid-page are born hot, and the per-block ensure* passes
-// remain as the correctness fallback.
-func PagePrefetch(state *generated.State, data []byte, ring *generated.ProtoRingBuffer) {
-	if state == nil || state.HotState == nil || state.Store == nil || state.Store.Conn() == nil || ring == nil {
-		return
-	}
-	// On an authoritative from-genesis run every ensure* skips its
-	// round-trips anyway, so the scan pass would be pure overhead.
-	if state.HotState.ColdAuthoritative() &&
-		state.HotState.Conditions.Evictions() == 0 &&
-		state.HotState.FixedProductMarketMakers.Evictions() == 0 &&
-		state.HotState.UserPositions.Evictions() == 0 {
-		return
-	}
-
-	var posKeys []generated.UserPositionsClockKey
-	var conditionIDs []common.Hash
-	var fpmmAddrs []common.Address
-	_, _ = generated.ParseJSONLProto(data, nil, ring, func(block *generated.ProtoEventBlock) error {
-		block.QueryExchangeOrderFilled().Map(func(ev generated.ExchangeOrderFilledProtoView) {
-			if k, ok := fillPositionClockKey(ev.Maker(), ev.MakerAssetID(), ev.TakerAssetID()); ok {
-				posKeys = append(posKeys, k)
-			}
-		})
-		block.QueryNegRiskExchangeOrderFilled().Map(func(ev generated.NegRiskExchangeOrderFilledProtoView) {
-			if k, ok := fillPositionClockKey(ev.Maker(), ev.MakerAssetID(), ev.TakerAssetID()); ok {
-				posKeys = append(posKeys, k)
-			}
-		})
-		block.QueryConditionalTokensPositionSplit().Map(func(ev generated.ConditionalTokensPositionSplitProtoView) {
-			conditionIDs = append(conditionIDs, ev.ConditionID())
-		})
-		block.QueryConditionalTokensPositionsMerge().Map(func(ev generated.ConditionalTokensPositionsMergeProtoView) {
-			conditionIDs = append(conditionIDs, ev.ConditionID())
-		})
-		block.QueryConditionalTokensPayoutRedemption().Map(func(ev generated.ConditionalTokensPayoutRedemptionProtoView) {
-			conditionIDs = append(conditionIDs, ev.ConditionID())
-		})
-		block.QueryNegRiskAdapterPositionSplit().Map(func(ev generated.NegRiskAdapterPositionSplitProtoView) {
-			conditionIDs = append(conditionIDs, ev.ConditionID())
-		})
-		block.QueryNegRiskAdapterPositionsMerge().Map(func(ev generated.NegRiskAdapterPositionsMergeProtoView) {
-			conditionIDs = append(conditionIDs, ev.ConditionID())
-		})
-		block.QueryNegRiskAdapterPayoutRedemption().Map(func(ev generated.NegRiskAdapterPayoutRedemptionProtoView) {
-			conditionIDs = append(conditionIDs, ev.ConditionID())
-		})
-		block.QueryFixedProductMarketMakerFPMMBuy().Map(func(ev generated.FixedProductMarketMakerFPMMBuyProtoView) {
-			fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
-		})
-		block.QueryFixedProductMarketMakerFPMMSell().Map(func(ev generated.FixedProductMarketMakerFPMMSellProtoView) {
-			fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
-		})
-		block.QueryFixedProductMarketMakerFPMMFundingAdded().Map(func(ev generated.FixedProductMarketMakerFPMMFundingAddedProtoView) {
-			fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
-		})
-		block.QueryFixedProductMarketMakerFPMMFundingRemoved().Map(func(ev generated.FixedProductMarketMakerFPMMFundingRemovedProtoView) {
-			fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
-		})
-		return nil
-	})
-
-	ensureConditionsLoaded(state, conditionIDs)
-	ensureFPMMMarketsLoaded(state, fpmmAddrs)
-	ensurePositionsLoaded(state, posKeys)
-}
-
 // Process is the single entry point for custom business logic in Parsed (V1) Mode.
 func Process(state *generated.State, block *generated.ParsedBlock) error {
 	var conditionIDs []common.Hash
@@ -441,21 +313,6 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 		fpmmAddrs = append(fpmmAddrs, block.FixedProductMarketMakerFPMMFundingRemoveds[i].ContractAddress)
 	}
 	ensureFPMMMarketsLoaded(state, fpmmAddrs)
-
-	var posKeys []generated.UserPositionsClockKey
-	for i := range block.ExchangeOrderFilleds {
-		ev := &block.ExchangeOrderFilleds[i]
-		if k, ok := fillPositionClockKey(ev.Maker, ev.MakerAssetID, ev.TakerAssetID); ok {
-			posKeys = append(posKeys, k)
-		}
-	}
-	for i := range block.NegRiskExchangeOrderFilleds {
-		ev := &block.NegRiskExchangeOrderFilleds[i]
-		if k, ok := fillPositionClockKey(ev.Maker, ev.MakerAssetID, ev.TakerAssetID); ok {
-			posKeys = append(posKeys, k)
-		}
-	}
-	ensurePositionsLoaded(state, posKeys)
 
 	for ev := range block.EventsIter() {
 		switch e := ev.(type) {
@@ -541,19 +398,6 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 		fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
 	})
 	ensureFPMMMarketsLoaded(state, fpmmAddrs)
-
-	var posKeys []generated.UserPositionsClockKey
-	block.QueryExchangeOrderFilled().Map(func(ev generated.ExchangeOrderFilledProtoView) {
-		if k, ok := fillPositionClockKey(ev.Maker(), ev.MakerAssetID(), ev.TakerAssetID()); ok {
-			posKeys = append(posKeys, k)
-		}
-	})
-	block.QueryNegRiskExchangeOrderFilled().Map(func(ev generated.NegRiskExchangeOrderFilledProtoView) {
-		if k, ok := fillPositionClockKey(ev.Maker(), ev.MakerAssetID(), ev.TakerAssetID()); ok {
-			posKeys = append(posKeys, k)
-		}
-	})
-	ensurePositionsLoaded(state, posKeys)
 
 	var conditionPreparationIdx int
 	var conditionResolutionIdx int
