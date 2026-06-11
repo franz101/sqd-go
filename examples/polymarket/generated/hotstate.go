@@ -59,6 +59,11 @@ type ConditionsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
@@ -149,6 +154,7 @@ func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCond
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -530,6 +536,11 @@ type UserPositionsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
@@ -624,6 +635,7 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value Memo
 			if c.cold != nil {
 				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))
 			}
+			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -1004,6 +1016,11 @@ type MarketsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
@@ -1094,6 +1111,7 @@ func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -1438,6 +1456,11 @@ type NegRiskEventsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
@@ -1528,6 +1551,7 @@ func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value Memo
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -1872,6 +1896,11 @@ type FixedProductMarketMakersClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
@@ -1965,6 +1994,7 @@ func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMake
 			if c.cold != nil {
 				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))
 			}
+			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -2310,6 +2340,11 @@ type ConditionPreparationsClockCache struct {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
@@ -2400,6 +2435,7 @@ func (c *ConditionPreparationsClockCache) SetByKey(key ConditionPreparationsCloc
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
@@ -2660,6 +2696,13 @@ func NewHotState(capacity uint64) *HotState {
 	state.FixedProductMarketMakersResolver = NewMemoryFixedProductMarketMakerBatchResolver(state.FixedProductMarketMakers)
 	state.ConditionPreparationsResolver = NewConditionalTokensConditionPreparationBatchResolver(state.ConditionPreparations)
 	return state
+}
+
+// ColdAuthoritative reports whether the cold tier is authoritative for misses
+// (opened against an empty ClickHouse): a hot+cold miss is provably new, so
+// callers batching their own resolver round-trips may skip them entirely.
+func (s *HotState) ColdAuthoritative() bool {
+	return s != nil && s.coldAuthoritative
 }
 
 func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {
@@ -2963,4 +3006,32 @@ func hotStateUint256Slice(values []proto.UInt256) []uint256.Int {
 		out = append(out, hotStateUint256(value))
 	}
 	return out
+}
+
+// Evictions reports how many entries CLOCK replacement has overwritten in each
+// cache. While zero, the hot ring still holds everything ever Set — so under an
+// authoritative (from-genesis) run, hot contents are a superset of the entity's
+// ClickHouse rows and a hot miss proves a database miss.
+func (c *ConditionsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
+func (c *UserPositionsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
+func (c *MarketsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
+func (c *NegRiskEventsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
+func (c *FixedProductMarketMakersClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
+func (c *ConditionPreparationsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
 }

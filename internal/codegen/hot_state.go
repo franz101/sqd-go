@@ -184,9 +184,19 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
+}
+
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *%[1]s) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
 }
 
 func New%[1]s(capacity uint64) *%[1]s {
@@ -290,7 +300,8 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-%[4]s			c.idxUnlink(e.key)
+%[4]s			atomic.AddUint64(&c.evictions, 1)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
@@ -658,6 +669,10 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 			coldSpecs = append(coldSpecs, spec)
 		}
 	}
+	b.WriteString("// ColdAuthoritative reports whether the cold tier is authoritative for misses\n")
+	b.WriteString("// (opened against an empty ClickHouse): a hot+cold miss is provably new, so\n")
+	b.WriteString("// callers batching their own resolver round-trips may skip them entirely.\n")
+	b.WriteString("func (s *HotState) ColdAuthoritative() bool {\n\treturn s != nil && s.coldAuthoritative\n}\n\n")
 	if len(coldSpecs) == 0 {
 		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n\treturn nil\n}\n\n")
 		b.WriteString("func (s *HotState) CloseColdCache() error {\n\treturn nil\n}\n\n")

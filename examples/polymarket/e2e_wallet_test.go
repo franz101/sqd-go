@@ -1,6 +1,7 @@
 package polymarket
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/big"
@@ -12,8 +13,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/examples/polymarket/generated"
 	"github.com/franz101/sqd-go/internal/database"
-	"github.com/franz101/sqd-go/internal/ingestion"
-	"github.com/franz101/sqd-go/internal/parser"
 	"github.com/holiman/uint256"
 	"github.com/klauspost/compress/zstd"
 	"github.com/shopspring/decimal"
@@ -401,14 +400,7 @@ func resolvedPositionPayoutPrice(state *generated.State, tokenID common.Hash) (d
 
 // processDataFiles reads and processes all zstd JSONL files from the data directory.
 func processDataFiles(ctx context.Context, t *testing.T, proc *generated.Processor, store *database.Store, dataDir string) (*processingStats, error) {
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, fmt.Errorf("create zstd decoder: %w", err)
-	}
-	defer decoder.Close()
-
 	stats := &processingStats{}
-	jsonlParser := parser.NewFastJSONLParser(100)
 
 	files, err := filepath.Glob(filepath.Join(dataDir, "*.jsonl.zstd"))
 	if err != nil {
@@ -419,73 +411,85 @@ func processDataFiles(ctx context.Context, t *testing.T, proc *generated.Process
 		return nil, fmt.Errorf("no zstd files found in %s", dataDir)
 	}
 
-	var ioNanos, procNanos int64
-	for _, filePath := range files {
-		baseName := filepath.Base(filePath)
-		t.Logf("processing: %s", baseName)
+	// Read+decompress the next file in a pipeline goroutine while the current
+	// one is processing (DecodeAll is concurrency-safe). Block replay order is
+	// preserved: files arrive on the channel in glob order and each file's
+	// blocks are processed in line order. UserPosition sell updates clamp to
+	// the current amount, so replay order is part of the state.
+	type fileData struct {
+		name string
+		data []byte
+		err  error
+	}
+	fileCh := make(chan fileData, 1)
+	go func() {
+		defer close(fileCh)
+		decoder, err := zstd.NewReader(nil)
+		if err != nil {
+			fileCh <- fileData{err: fmt.Errorf("create zstd decoder: %w", err)}
+			return
+		}
+		defer decoder.Close()
+		for _, filePath := range files {
+			compressed, err := os.ReadFile(filePath)
+			if err != nil {
+				fileCh <- fileData{err: fmt.Errorf("read file %s: %w", filePath, err)}
+				return
+			}
+			decompressed, err := decoder.DecodeAll(compressed, nil)
+			if err != nil {
+				fileCh <- fileData{err: fmt.Errorf("decompress file %s: %w", filePath, err)}
+				return
+			}
+			fileCh <- fileData{name: filepath.Base(filePath), data: decompressed}
+		}
+	}()
 
+	var ioWaitNanos, procNanos int64
+	for {
 		ioStart := time.Now()
-		compressed, err := os.ReadFile(filePath)
-		if err != nil {
-			return nil, fmt.Errorf("read file %s: %w", filePath, err)
+		fd, ok := <-fileCh
+		ioWaitNanos += time.Since(ioStart).Nanoseconds()
+		if !ok {
+			break
+		}
+		if fd.err != nil {
+			return nil, fd.err
 		}
 
-		decompressed, err := decoder.DecodeAll(compressed, nil)
-		if err != nil {
-			return nil, fmt.Errorf("decompress file %s: %w", filePath, err)
+		// blocks_<start>_<end>.jsonl.zstd carries the file's block range.
+		var rangeStart, rangeEnd uint64
+		if _, err := fmt.Sscanf(fd.name, "blocks_%d_%d.jsonl.zstd", &rangeStart, &rangeEnd); err != nil {
+			return nil, fmt.Errorf("parse block range from %s: %w", fd.name, err)
 		}
-		ioNanos += time.Since(ioStart).Nanoseconds()
+		if stats.firstBlock == 0 || rangeStart < stats.firstBlock {
+			stats.firstBlock = rangeStart
+		}
+		if rangeEnd > stats.lastBlock {
+			stats.lastBlock = rangeEnd
+		}
+		lines := uint64(bytes.Count(fd.data, []byte{'\n'}))
+		if n := len(fd.data); n > 0 && fd.data[n-1] != '\n' {
+			lines++
+		}
+		stats.blocks += lines
 
-		// Parse JSONL and process each block in source order. UserPosition sell
-		// updates clamp to the current amount, so replay order is part of the state.
+		// Single-pass fast path: raw JSONL decodes once into the preallocated
+		// proto ring slots; no CustomLog construction, no hex re-decode.
 		procStart := time.Now()
-		err = jsonlParser.Parse(decompressed, func(block *parser.Block) error {
-			stats.blocks++
-			stats.lastBlock = block.Header.Number
-			if stats.firstBlock == 0 {
-				stats.firstBlock = block.Header.Number
-			}
-
-			blockTime := time.Unix(int64(block.Header.Timestamp), 0).UTC()
-
-			blockLogs := make([]ingestion.CustomLog, 0, len(block.Logs))
-			for _, lg := range block.Logs {
-				// Deep-copy topics since parser reuses the slice
-				topics := make([]string, len(lg.Topics))
-				copy(topics, lg.Topics)
-
-				blockLogs = append(blockLogs, ingestion.CustomLog{
-					ChainID:          137, // Polygon
-					BlockNumber:      block.Header.Number,
-					BlockTimestamp:   blockTime,
-					BlockHash:        block.Header.Hash,
-					ContractAddress:  lg.Address,
-					TransactionHash:  lg.TransactionHash,
-					TransactionIndex: lg.TransactionIndex,
-					LogIndex:         lg.LogIndex,
-					Topics:           topics,
-					Data:             lg.Data,
-				})
-				stats.events++
-			}
-
-			if len(blockLogs) > 0 {
-				if err := proc.Process(ctx, store, blockLogs); err != nil {
-					return fmt.Errorf("process block %d: %w", block.Header.Number, err)
-				}
-			}
-			return nil
-		})
+		events, err := proc.ProcessJSONL(ctx, store, fd.data)
 		procNanos += time.Since(procStart).Nanoseconds()
 		if err != nil {
-			return nil, fmt.Errorf("parse JSONL from file %s: %w", filePath, err)
+			return nil, fmt.Errorf("process JSONL from file %s: %w", fd.name, err)
 		}
+		stats.events += events
 	}
 
-	t.Logf("[TIMING] read+decompress: %.2fs | parse+process: %.2fs",
-		float64(ioNanos)/1e9, float64(procNanos)/1e9)
-	t.Logf("[TIMING] fpmm resolve: %.2fs over %d round-trips",
-		float64(fpmmResolveNanos)/1e9, fpmmResolveRoundTrips)
+	t.Logf("[TIMING] io wait (read+decompress overlapped): %.2fs | parse+process: %.2fs",
+		float64(ioWaitNanos)/1e9, float64(procNanos)/1e9)
+	t.Logf("[TIMING] fpmm resolve: %.2fs over %d round-trips | condition resolve: %.2fs over %d round-trips",
+		float64(fpmmResolveNanos)/1e9, fpmmResolveRoundTrips,
+		float64(condResolveNanos)/1e9, condResolveRoundTrips)
 	return stats, nil
 }
 

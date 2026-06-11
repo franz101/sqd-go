@@ -138,24 +138,89 @@ func hashNegRiskKey(k negRiskKey) uint64 {
 	return binary.LittleEndian.Uint64(k.condition[:8]) + uint64(k.outcome)
 }
 
+// condResolveNanos / condResolveRoundTrips are diagnostic counters (single-goroutine processor).
+var condResolveNanos int64
+var condResolveRoundTrips int64
+
 func ensureConditionsLoaded(state *generated.State, conditionIDs []common.Hash) {
+	canResolve := state.Store != nil && state.Store.Conn() != nil
+	// From-genesis run (authoritative cold tier) with no Condition ever evicted
+	// from the hot ring: every condition this run committed AND every condition
+	// materialized from an in-run preparation event is still hot, so hot state
+	// is a superset of both ClickHouse tables — a hot miss proves a database
+	// miss and the resolver round-trips below can never find anything. (This
+	// path was 5.4s / 2,512 round-trips of the 0xf05b67 e2e before the check.)
+	if canResolve && state.HotState.ColdAuthoritative() && state.HotState.Conditions.Evictions() == 0 {
+		canResolve = false
+	}
+
+	// Pass 1: in-RAM probe; batch all misses into ONE resolver round-trip per
+	// block instead of one synchronous SELECT per ID inside State.Get. The
+	// resolver dedupes, issues WHERE id IN (...), and tombstones not-found
+	// keys, so repeat blocks never re-query the same missing condition.
+	queued := 0
 	for _, condID := range conditionIDs {
-		if _, ok := state.Condition.Get(condID); !ok {
-			if prep, ok := state.ConditionPreparation.Get(condID); ok {
-				cond := &generated.Condition{
-					ID:               prep.ConditionID,
-					Oracle:           prep.Oracle,
-					QuestionID:       prep.QuestionID,
-					OutcomeSlotCount: uint8(prep.OutcomeSlotCount.Uint64()),
-					Resolved:         false,
-				}
-				state.Condition.Save(cond, generated.EventMeta{
-					BlockNumber:      prep.BlockNumber,
-					BlockTimestamp:   prep.BlockTimestamp,
-					TransactionIndex: prep.TransactionIndex,
-					LogIndex:         prep.LogIndex,
-				})
+		if _, ok := state.HotState.Conditions.Get(generated.ConditionsClockKey{ID: condID}); ok {
+			continue // present or tombstoned — both already resolved
+		}
+		if !canResolve {
+			continue
+		}
+		state.HotState.ConditionsResolver.Queue(generated.ConditionsClockKey{ID: condID})
+		queued++
+	}
+	if queued > 0 {
+		t0 := time.Now()
+		condResolveRoundTrips++
+		_ = state.HotState.ConditionsResolver.Resolve(context.Background(), state.Store.Conn(), state.Store.DB())
+		condResolveNanos += time.Since(t0).Nanoseconds()
+	}
+
+	// Pass 2: conditions still unknown fall back to the raw preparation
+	// events, batched the same way.
+	prepQueued := 0
+	for _, condID := range conditionIDs {
+		if v, ok := state.HotState.Conditions.Get(generated.ConditionsClockKey{ID: condID}); ok && !v.Tombstone {
+			continue
+		}
+		if !canResolve {
+			continue
+		}
+		if _, ok := state.HotState.ConditionPreparations.Get(generated.ConditionPreparationsClockKey{ConditionID: condID}); ok {
+			continue
+		}
+		state.HotState.ConditionPreparationsResolver.Queue(generated.ConditionPreparationsClockKey{ConditionID: condID})
+		prepQueued++
+	}
+	if prepQueued > 0 {
+		t0 := time.Now()
+		condResolveRoundTrips++
+		_ = state.HotState.ConditionPreparationsResolver.Resolve(context.Background(), state.Store.Conn(), state.Store.DB())
+		condResolveNanos += time.Since(t0).Nanoseconds()
+	}
+
+	// Pass 3: materialize conditions from any preparations found. Hot-only
+	// lookups: everything relevant is in hot state (or tombstoned) after the
+	// batched resolves above, and when resolving is skipped entirely a State
+	// .Get here would reintroduce the per-miss ClickHouse round-trip.
+	for _, condID := range conditionIDs {
+		if v, ok := state.HotState.Conditions.Get(generated.ConditionsClockKey{ID: condID}); ok && !v.Tombstone {
+			continue
+		}
+		if prep, ok := state.HotState.ConditionPreparations.Get(generated.ConditionPreparationsClockKey{ConditionID: condID}); ok && !prep.Tombstone {
+			cond := &generated.Condition{
+				ID:               prep.ConditionID,
+				Oracle:           prep.Oracle,
+				QuestionID:       prep.QuestionID,
+				OutcomeSlotCount: uint8(prep.OutcomeSlotCount.Uint64()),
+				Resolved:         false,
 			}
+			state.Condition.Save(cond, generated.EventMeta{
+				BlockNumber:      prep.BlockNumber,
+				BlockTimestamp:   prep.BlockTimestamp,
+				TransactionIndex: prep.TransactionIndex,
+				LogIndex:         prep.LogIndex,
+			})
 		}
 	}
 }
@@ -166,6 +231,14 @@ var fpmmResolveRoundTrips int64
 
 func ensureFPMMMarketsLoaded(state *generated.State, fpmmAddrs []common.Address) {
 	if state.Store == nil || state.Store.Conn() == nil {
+		return
+	}
+	// Authoritative cold tier (from-genesis, empty ClickHouse at start): a
+	// hot+cold miss is provably new, so the prefetch SELECT can never find
+	// anything — the lazy Get in the handlers already short-circuits the same
+	// way. This path was 11.3s / 4,732 sync round-trips of the 0xf05b67 e2e
+	// before the check, against a database holding no FPMM rows to find.
+	if state.HotState.ColdAuthoritative() {
 		return
 	}
 	queued := 0
