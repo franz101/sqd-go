@@ -512,27 +512,21 @@ func (b *ProtoEventBlock) EventsIter() chan DecodedLog {
 	go func() {
 		defer close(ch)
 
-		var (
-			ConditionalTokensConditionPreparationIdx                         int
-			ConditionalTokensConditionResolutionIdx                          int
-			ConditionalTokensPositionSplitIdx                                int
-			ConditionalTokensPositionsMergeIdx                               int
-			ConditionalTokensPayoutRedemptionIdx                             int
-			ExchangeOrderFilledIdx                                           int
-			NegRiskExchangeOrderFilledIdx                                    int
-			NegRiskAdapterMarketPreparedIdx                                  int
-			NegRiskAdapterQuestionPreparedIdx                                int
-			NegRiskAdapterPositionSplitIdx                                   int
-			NegRiskAdapterPositionsMergeIdx                                  int
-			NegRiskAdapterPositionsConvertedIdx                              int
-			NegRiskAdapterPayoutRedemptionIdx                                int
-			FixedProductMarketMakerFactoryFixedProductMarketMakerCreationIdx int
-			FixedProductMarketMakerFPMMBuyIdx                                int
-			FixedProductMarketMakerFPMMSellIdx                               int
-			FixedProductMarketMakerFPMMFundingAddedIdx                       int
-			FixedProductMarketMakerFPMMFundingRemovedIdx                     int
-		)
+`)
 
+	// Idx declarations MUST come from the same events slice as the switch
+	// cases below — a fixed list compiles only for the one project whose
+	// event set happens to match it exactly ("declared and not used"
+	// everywhere else).
+	if len(events) > 0 {
+		fmt.Fprint(buf, "\t\tvar (\n")
+		for _, ev := range events {
+			fmt.Fprintf(buf, "\t\t\t%sIdx int\n", ev.GoTypeName)
+		}
+		fmt.Fprint(buf, "\t\t)\n")
+	}
+
+	fmt.Fprint(buf, `
 		for _, typ := range b.Sequence {
 			switch EventType(typ) {
 `)

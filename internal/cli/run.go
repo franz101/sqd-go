@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -127,6 +129,17 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 	SetV3Mode(false)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// SQD_PPROF_ADDR=localhost:6060 exposes net/http/pprof on a live run so
+	// profiles can be pulled without stopping the pipeline.
+	if addr := os.Getenv("SQD_PPROF_ADDR"); addr != "" {
+		go func() {
+			log.Printf("pprof listening on http://%s/debug/pprof/", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				log.Printf("pprof server: %v", err)
+			}
+		}()
+	}
 
 	if cpuprofile != "" {
 		f, err := os.Create(cpuprofile)

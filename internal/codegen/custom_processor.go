@@ -264,6 +264,7 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	b.WriteString(`import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"sync"
@@ -331,6 +332,13 @@ var CustomProcessFn func(state *State, block *ParsedBlock) error
 //	    _ = from; _ = to
 //	})
 var CustomProcessProtoFn func(state *State, block *ProtoEventBlock) error
+
+// CustomPagePrefetchFn, when set, runs once per ProcessJSONL batch (a whole
+// portal page / consumer drain, often thousands of blocks) before the
+// processing pass. Use it to scan the page and warm hot-state caches with one
+// batched resolver round-trip per cache instead of one per block — per-block
+// resolves stay in place as the correctness fallback.
+var CustomPagePrefetchFn func(state *State, data []byte, ring *ProtoRingBuffer)
 
 // CustomProcessing wraps the block-based processing
 func CustomProcessing(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
@@ -423,8 +431,12 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 			state.LastPruneBlock = blockNumber
 		}
 		if blockNumber >= state.LastPruneBlock+pruneInterval {
+			// Prune removes superseded state rows — an optimization, never a
+			// correctness requirement. A failure (e.g. ClickHouse hitting its
+			// memory limit mid-mutation) must not abort the chain; skip this
+			// window and retry pruneInterval blocks later.
 			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
-				return fmt.Errorf("prune ClickHouse state at block %d: %w", blockNumber, err)
+				log.Printf("WARN: prune ClickHouse state at block %d failed (retrying in %d blocks): %v", blockNumber, pruneInterval, err)
 			}
 			state.LastPruneBlock = blockNumber
 		}
@@ -497,6 +509,9 @@ func (p *Processor) ProcessJSONL(ctx context.Context, store *database.Store, dat
 		stateStore = store
 	}
 	p.State.Store = stateStore
+	logProtoModeOnce.Do(func() {
+		log.Printf("processor: ProcessJSONL fast parse path (protoMode=%v)", p.ProtoMode)
+	})
 	if p.ProtoMode {
 		if p.protoRing == nil {
 			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
@@ -504,6 +519,11 @@ func (p *Processor) ProcessJSONL(ctx context.Context, store *database.Store, dat
 				return 0, err
 			}
 			p.protoRing = ring
+		}
+		// Scan pass and processing pass share the ring: the scan completes
+		// (and releases every slot) before processing starts.
+		if CustomPagePrefetchFn != nil {
+			CustomPagePrefetchFn(p.State, data, p.protoRing)
 		}
 		return ParseJSONLProto(data, nil, p.protoRing, func(block *ProtoEventBlock) error {
 			return CustomProcessingProto(ctx, stateStore, p.State, block)
@@ -525,9 +545,8 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 	if p == nil || len(logs) == 0 {
 		return nil
 	}
-	// DEBUG: Log processor state
 	logProcessorStateOnce.Do(func() {
-		fmt.Printf("[PROCESSOR DEBUG] p.ProtoMode=%v, p.protoRing=%v, p.ring=%v\n", p.ProtoMode, p.protoRing != nil, p.ring != nil)
+		log.Printf("processor: legacy CustomLog path (protoMode=%v); set SQD_PARSE_DECODE_V2=1 for the fast parse path", p.ProtoMode)
 	})
 	if p.ProtoMode {
 		if p.protoRing == nil {
@@ -669,10 +688,6 @@ var (
 
 // processProtoBlocks handles proto mode processing.
 func (p *Processor) processProtoBlocks(ctx context.Context, store Store, blocks []*ProtoEventBlock) error {
-	// DEBUG: Log that we're in proto mode
-	logProtoModeOnce.Do(func() {
-		fmt.Println("[PROTO MODE] processProtoBlocks called with", len(blocks), "blocks")
-	})
 	if len(blocks) == 0 {
 		return nil
 	}

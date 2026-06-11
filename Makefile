@@ -6,7 +6,15 @@ include .env
 export
 endif
 
-.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-fast dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
+.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-fast dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all pnl-venv
+
+# Python venv for PnL scripts (auto-created with required deps)
+VENV := .venv
+PYTHON := $(VENV)/bin/python3
+pnl-venv:
+	@test -x $(PYTHON) || python3 -m venv $(VENV)
+	@$(PYTHON) -c "import requests, dotenv, yaml" 2>/dev/null || \
+		$(PYTHON) -m pip install --quiet --upgrade pip requests python-dotenv pyyaml
 
 DETECTOR_CONTAINER := $(shell docker ps --filter "publish=9003" --format "{{.Names}}" | head -n 1)
 CLICKHOUSE_CONTAINER ?= $(if $(DETECTOR_CONTAINER),$(DETECTOR_CONTAINER),$(shell docker ps --filter "name=clickhouse" --format "{{.Names}}" | head -n 1))
@@ -67,7 +75,7 @@ dev-v2: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 3664531 $(POLYMARKET_ARGS)
 
 dev-v2-live: codegen-polymarket build
-	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23364531 $(POLYMARKET_ARGS)
+	SQD_PARSE_DECODE_V2=1 CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23364531 $(POLYMARKET_ARGS)
 
 # dev-fast: clean V2 fast-path run from block 23M. Every speed setting is now a
 # codegen/config default (V2 proto, cold cache on, 20k commit interval,
@@ -75,6 +83,9 @@ dev-v2-live: codegen-polymarket build
 # this is just the normal pipeline from a fresh checkpoint. --restart drops +
 # recreates the DB so it genuinely begins at block 23,000,000.
 dev-fast: codegen-polymarket build
+	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23000000 $(POLYMARKET_ARGS)
+
+dev-fast-reset: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23000000 --restart $(POLYMARKET_ARGS)
 
 dev-v1: codegen-polymarket build
@@ -129,18 +140,18 @@ memch:
 	go run debugger/clickhouseProcessor.go $(MEMCH_ARGS)
 
 # PnL comparison against Local CH, Remote CH, and Goldsky
-pnl:
-	@python3 scripts/ch_pnl.py $(WALLET)
+pnl: pnl-venv
+	@$(PYTHON) scripts/ch_pnl.py $(WALLET)
 
 # Run PnL comparison for all wallets in drafts/pnl_wallets.yaml
-pnl-all:
+pnl-all: pnl-venv
 	@echo "Running PnL comparison for all wallets..."
-	@for wallet in $$(python3 -c "import yaml; print('\n'.join(w['address'] for w in yaml.safe_load(open('tmp/pnl_wallets.yaml'))['wallets'] if w.get('active', True)))"); do \
+	@for wallet in $$($(PYTHON) -c "import yaml; print('\n'.join(w['address'] for w in yaml.safe_load(open('tmp/pnl_wallets.yaml'))['wallets'] if w.get('active', True)))"); do \
 		echo ""; \
 		echo "========================================"; \
 		echo "Wallet: $$wallet"; \
 		echo "========================================"; \
-		python3 scripts/ch_pnl.py $$wallet || echo "Failed: $$wallet"; \
+		$(PYTHON) scripts/ch_pnl.py $$wallet || echo "Failed: $$wallet"; \
 	done
 	@echo ""
 	@echo "All results saved in tmp/compare_*.json"

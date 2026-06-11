@@ -111,9 +111,8 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 		return false
 	}
 	topic0 := topics[0]
-	if topic0 == common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") {
-		addressLower := toLowerASCII(address.Hex())
-		if addressLower == "0x8236a87084f8b84306f72007f36f2618a5634494" {
+	if topic0 == _aflTopic0_0 {
+		if address == _aflAddr_0_0_0 {
 			// LBTCTransfer
 			var ev LBTCTransfer
 			ev.EventMeta = meta
@@ -133,6 +132,9 @@ func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.
 	}
 	return false
 }
+
+var _aflTopic0_0 = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+var _aflAddr_0_0_0 = common.HexToAddress("0x8236a87084f8B84306f72007F36F2618A5634494")
 
 // LBTCTransferProtoView is a zero-copy view into LBTCTransfer proto columns.
 // It provides ECS-style access without allocation.
@@ -388,24 +390,7 @@ func (b *ProtoEventBlock) EventsIter() chan DecodedLog {
 		defer close(ch)
 
 		var (
-			ConditionalTokensConditionPreparationIdx                         int
-			ConditionalTokensConditionResolutionIdx                          int
-			ConditionalTokensPositionSplitIdx                                int
-			ConditionalTokensPositionsMergeIdx                               int
-			ConditionalTokensPayoutRedemptionIdx                             int
-			ExchangeOrderFilledIdx                                           int
-			NegRiskExchangeOrderFilledIdx                                    int
-			NegRiskAdapterMarketPreparedIdx                                  int
-			NegRiskAdapterQuestionPreparedIdx                                int
-			NegRiskAdapterPositionSplitIdx                                   int
-			NegRiskAdapterPositionsMergeIdx                                  int
-			NegRiskAdapterPositionsConvertedIdx                              int
-			NegRiskAdapterPayoutRedemptionIdx                                int
-			FixedProductMarketMakerFactoryFixedProductMarketMakerCreationIdx int
-			FixedProductMarketMakerFPMMBuyIdx                                int
-			FixedProductMarketMakerFPMMSellIdx                               int
-			FixedProductMarketMakerFPMMFundingAddedIdx                       int
-			FixedProductMarketMakerFPMMFundingRemovedIdx                     int
+			LBTCTransferIdx int
 		)
 
 		for _, typ := range b.Sequence {

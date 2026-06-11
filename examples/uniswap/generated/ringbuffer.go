@@ -107,6 +107,16 @@ func (r *OrderedHistoricRingBuffer) GetParsedBlock(blockNum uint64) (*ParsedBloc
 	return nil, false
 }
 
+// Reset resets the ring buffer to empty state.
+func (r *OrderedHistoricRingBuffer) Reset() {
+	r.headIndex = 0
+	r.tailIndex = 0
+	r.count = 0
+	for i := range r.blockNumbers {
+		r.blockNumbers[i] = 0
+	}
+}
+
 func (b *ParsedBlock) EventsIter() iter.Seq[Event] {
 	return func(yield func(Event) bool) {
 		var (

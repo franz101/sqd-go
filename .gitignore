@@ -3,4 +3,5 @@ tmp_codegen/
 **.zstd
 ecs/
 .env
-.claude
+.claude/
+.venv/
