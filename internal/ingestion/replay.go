@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/franz101/sqd-go/internal/client"
@@ -45,6 +46,10 @@ type ReplayBuffer struct {
 
 	mu       sync.Mutex
 	notifyCh chan struct{}
+	// latestBlock is the highest block number written (updated atomically).
+	// GetBlock uses it as a lock-free fast-reject: if the requested block
+	// exceeds this value it can't be in the buffer yet and the mutex is skipped.
+	latestBlock atomic.Uint64
 
 	// Seek point for replay — when set, ReadFrom returns the first block > seekBlock.
 	seekBlock uint64
@@ -102,6 +107,7 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 		raw: raw,
 	}
 	rb.index[blockNumber] = idx
+	rb.latestBlock.Store(blockNumber)
 
 	rb.writePos++
 	if rb.count < rb.capacity {
@@ -200,6 +206,9 @@ func (rb *ReplayBuffer) ReadFrom(inserter func(events []parser.DecodedEvent, blo
 // GetBlock returns a copy of the block entry for blockNumber if it exists in the buffer.
 // It returns ok=false if the block is not present.
 func (rb *ReplayBuffer) GetBlock(blockNumber uint64) (blockEntry, bool) {
+	if blockNumber > rb.latestBlock.Load() {
+		return blockEntry{}, false
+	}
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
@@ -300,6 +309,12 @@ func (rb *ReplayBuffer) PruneAfter(blockNumber uint64) {
 	rb.count = newCount
 	rb.writePos = (oldestPos + newCount) % rb.capacity
 	rb.rebuildIndexLocked()
+	if rb.count > 0 {
+		newestPos := (rb.writePos - 1 + rb.capacity) % rb.capacity
+		rb.latestBlock.Store(rb.slots[newestPos].number)
+	} else {
+		rb.latestBlock.Store(0)
+	}
 }
 
 // Len returns the number of blocks currently in the buffer.

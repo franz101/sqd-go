@@ -20,7 +20,14 @@ import (
 // Store wraps a ClickHouse native-protocol connection and the target database name.
 type Store struct {
 	conn *ch.Client
-	db   string
+	// insertConn is a second, dedicated connection used only by the base-event
+	// inserters (InsertLogs/InsertBlocks/TypedInserter.Insert). The consumer loop
+	// runs those on a goroutine that deliberately overlaps the custom processor's
+	// commit/query path on conn. A single ch.Client is NOT safe for concurrent Do
+	// (the server returns UNEXPECTED_PACKET on interleaved queries), so the two
+	// concurrent paths must own separate connections.
+	insertConn *ch.Client
+	db         string
 }
 
 // BlockRow is a single row in the blocks table, used during fork tracking.
@@ -81,7 +88,20 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 		conn.Close()
 		return nil, fmt.Errorf("create database %s: %w", db, err)
 	}
-	return &Store{conn: conn, db: db}, nil
+	// Dedicated connection for the base-event insert goroutine so it never shares
+	// a ch.Client with the concurrent commit/query path on conn. Same options as
+	// conn (queries are db-qualified, so the "default" database is fine).
+	insertConn, err := ch.Dial(ctx, ch.Options{
+		Address:  fmt.Sprintf("%s:%d", host, port),
+		Database: "default",
+		User:     user,
+		Password: password,
+	})
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("connect clickhouse (insert conn): %w", err)
+	}
+	return &Store{conn: conn, insertConn: insertConn, db: db}, nil
 }
 
 // DropClickHouseDatabase drops the named database (used by --restart).
@@ -100,6 +120,9 @@ func DropClickHouseDatabase(ctx context.Context, host string, port int, user, pa
 }
 
 func (s *Store) Close() error {
+	if s.insertConn != nil {
+		_ = s.insertConn.Close()
+	}
 	return s.conn.Close()
 }
 
@@ -264,7 +287,7 @@ func (in *Inserter) InsertBlocks(ctx context.Context, blocks []BlockRow) error {
 		in.blockTime.Append(block.BlockTimestamp)
 		in.blockHash.Append(block.BlockHash)
 	}
-	return in.store.conn.Do(ctx, ch.Query{
+	return in.store.insertConn.Do(ctx, ch.Query{
 		Body: fmt.Sprintf("INSERT INTO %s.blocks (chain_id, block_number, block_timestamp, block_hash) VALUES", quoteIdent(in.store.db)),
 		Input: []proto.InputColumn{
 			{Name: "chain_id", Data: &in.blockChain}, {Name: "block_number", Data: &in.blockNum},
@@ -295,7 +318,7 @@ func (in *Inserter) InsertLogs(ctx context.Context, events []parser.DecodedEvent
 	processed := 0
 	chunkSize := 10000
 
-	return in.store.conn.Do(ctx, ch.Query{
+	return in.store.insertConn.Do(ctx, ch.Query{
 		Body:  fmt.Sprintf("INSERT INTO %s.logs (chain_id, block_number, block_timestamp, block_hash, transaction_hash, transaction_index, log_index, address, event_name, topic0, params) VALUES", quoteIdent(in.store.db)),
 		Input: cols,
 		Settings: []ch.Setting{
@@ -442,7 +465,7 @@ func (in *TypedInserter) Insert(ctx context.Context, events []parser.DecodedEven
 	processed := 0
 	chunkSize := 10000
 
-	return in.store.conn.Do(ctx, ch.Query{
+	return in.store.insertConn.Do(ctx, ch.Query{
 		Body:  in.query,
 		Input: in.inputCols,
 		Settings: []ch.Setting{

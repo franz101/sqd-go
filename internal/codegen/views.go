@@ -175,31 +175,17 @@ type ProtoEventBlock struct {
 		}
 	}
 
-	for _, grp := range ordered {
+	for i, grp := range ordered {
 		evs := grp.events
 
-		// Determine if this group needs address checks.
-		hasAddrChecks := false
-		for _, ev := range evs {
-			if len(ev.ContractAddress) > 0 {
-				hasAddrChecks = true
-				break
-			}
-		}
+		fmt.Fprintf(&buf, "	if topic0 == _aflTopic0_%d {\n", i)
 
-		firstEv := evs[0]
-		fmt.Fprintf(&buf, "	if topic0 == common.HexToHash(%q) {\n", firstEv.Topic0)
-
-		if hasAddrChecks {
-			fmt.Fprint(&buf, "		addressLower := toLowerASCII(address.Hex())\n")
-		}
-
-		for _, ev := range evs {
+		for j, ev := range evs {
 			extraIndent := ""
 			if len(ev.ContractAddress) > 0 {
 				var addrExprs []string
-				for _, addr := range ev.ContractAddress {
-					addrExprs = append(addrExprs, fmt.Sprintf("addressLower == %q", strings.ToLower(addr)))
+				for k := range ev.ContractAddress {
+					addrExprs = append(addrExprs, fmt.Sprintf("address == _aflAddr_%d_%d_%d", i, j, k))
 				}
 				fmt.Fprintf(&buf, "		if %s {\n", strings.Join(addrExprs, " || "))
 				extraIndent = "	"
@@ -261,6 +247,24 @@ type ProtoEventBlock struct {
 		fmt.Fprint(&buf, "	}\n")
 	}
 	fmt.Fprint(&buf, "	return false\n}\n\n")
+
+	// Precompute each topic0 hash and contract address once at package scope so
+	// the per-log AppendFromLog dispatch compares against constants instead of
+	// recomputing common.HexToHash (which allocates a []byte via FromHex) and
+	// address.Hex (which Keccak-hashes for the EIP-55 checksum, then gets
+	// lowercased) on every call. Comparing common.Address values is exact-byte
+	// and inherently case-insensitive, so it matches the old lowercased-string
+	// compare without the allocations.
+	for i, grp := range ordered {
+		fmt.Fprintf(&buf, "var _aflTopic0_%d = common.HexToHash(%q)\n", i, grp.events[0].Topic0)
+		for j, ev := range grp.events {
+			for k, addr := range ev.ContractAddress {
+				fmt.Fprintf(&buf, "var _aflAddr_%d_%d_%d = common.HexToAddress(%q)\n", i, j, k, addr)
+			}
+		}
+	}
+	fmt.Fprint(&buf, "\n")
+
 	// Generate proto view types
 	for _, ev := range events {
 		fmt.Fprintf(&buf, "// %sProtoView is a zero-copy view into %s proto columns.\n", ev.GoTypeName, ev.GoTypeName)
@@ -508,27 +512,21 @@ func (b *ProtoEventBlock) EventsIter() chan DecodedLog {
 	go func() {
 		defer close(ch)
 
-		var (
-			ConditionalTokensConditionPreparationIdx                         int
-			ConditionalTokensConditionResolutionIdx                          int
-			ConditionalTokensPositionSplitIdx                                int
-			ConditionalTokensPositionsMergeIdx                               int
-			ConditionalTokensPayoutRedemptionIdx                             int
-			ExchangeOrderFilledIdx                                           int
-			NegRiskExchangeOrderFilledIdx                                    int
-			NegRiskAdapterMarketPreparedIdx                                  int
-			NegRiskAdapterQuestionPreparedIdx                                int
-			NegRiskAdapterPositionSplitIdx                                   int
-			NegRiskAdapterPositionsMergeIdx                                  int
-			NegRiskAdapterPositionsConvertedIdx                              int
-			NegRiskAdapterPayoutRedemptionIdx                                int
-			FixedProductMarketMakerFactoryFixedProductMarketMakerCreationIdx int
-			FixedProductMarketMakerFPMMBuyIdx                                int
-			FixedProductMarketMakerFPMMSellIdx                               int
-			FixedProductMarketMakerFPMMFundingAddedIdx                       int
-			FixedProductMarketMakerFPMMFundingRemovedIdx                     int
-		)
+`)
 
+	// Idx declarations MUST come from the same events slice as the switch
+	// cases below — a fixed list compiles only for the one project whose
+	// event set happens to match it exactly ("declared and not used"
+	// everywhere else).
+	if len(events) > 0 {
+		fmt.Fprint(buf, "\t\tvar (\n")
+		for _, ev := range events {
+			fmt.Fprintf(buf, "\t\t\t%sIdx int\n", ev.GoTypeName)
+		}
+		fmt.Fprint(buf, "\t\t)\n")
+	}
+
+	fmt.Fprint(buf, `
 		for _, typ := range b.Sequence {
 			switch EventType(typ) {
 `)

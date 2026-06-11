@@ -39,31 +39,6 @@ type Store struct {
 	db    *pebble.DB
 	cache *pebble.Cache
 	dir   string
-
-	// neg is an optional in-memory negative-lookup Bloom filter (the V3 cold-tier
-	// optimization). When set, a Get whose key is provably absent skips Pebble
-	// entirely. nil => V2 behaviour (every miss probes Pebble). See filter.go.
-	neg        *negFilter
-	filterHits uint64 // Pebble Gets skipped because the filter proved the key absent
-}
-
-// EnableNegativeFilter attaches a fixed-size in-memory negative-lookup Bloom
-// filter sized to at least bitBudget bits (rounded up to a power of two). Call
-// once, right after Open and before any Put/Get. This is what distinguishes the
-// V3 cold tier from V2.
-func (s *Store) EnableNegativeFilter(bitBudget uint64) {
-	if s == nil {
-		return
-	}
-	s.neg = newNegFilter(bitBudget)
-}
-
-// FilterSkips returns how many Pebble Gets the negative filter has avoided.
-func (s *Store) FilterSkips() uint64 {
-	if s == nil {
-		return 0
-	}
-	return s.filterHits
 }
 
 // Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
@@ -106,9 +81,6 @@ func (s *Store) Put(key, value []byte) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	if s.neg != nil {
-		s.neg.add(key)
-	}
 	return s.db.Set(key, value, pebble.NoSync)
 }
 
@@ -116,12 +88,6 @@ func (s *Store) Put(key, value []byte) error {
 // internal pebble closer is released), and whether it was found.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	if s == nil || s.db == nil {
-		return nil, false, nil
-	}
-	// Negative filter (V3): if the key was never written to the cold store, skip
-	// the Pebble round-trip. No false negatives, so this is always correct.
-	if s.neg != nil && !s.neg.mayContain(key) {
-		s.filterHits++
 		return nil, false, nil
 	}
 	v, closer, err := s.db.Get(key)

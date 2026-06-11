@@ -15,9 +15,9 @@ import (
 type parsedArgs struct {
 	command      string
 	project      string
-	restart      bool
-	noColdCache  bool
-	protoMode bool
+	restart     bool
+	noColdCache bool
+	protoMode   bool
 	initSource   string
 	initABI      string
 	initName     string
@@ -309,7 +309,7 @@ Flags:
   --pagesize, -p        (start/dev) Fixed page size range to fetch (default: 0 for dynamic)
   --no-proto            (start/dev) Use V1 legacy parsed mode instead of proto (struct-based event
                        processing with JSON decode; useful for debugging or unvalidated contracts)
-  --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default)
+  --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default; config: cold_cache: false)
 
 Examples:
   sqd-go

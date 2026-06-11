@@ -46,6 +46,12 @@ package generated
 	b.WriteString("\t// lastCommitWallNanos is the unix-nanos of the last hot-state commit, used\n")
 	b.WriteString("\t// by the hybrid block/time commit cadence. 0 means \"not yet committed\".\n")
 	b.WriteString("\tlastCommitWallNanos int64\n")
+	b.WriteString("\t// commitMaxBlocks / commitMaxInterval cache the hybrid commit cadence\n")
+	b.WriteString("\t// (SQD_COMMIT_INTERVAL, SQD_COMMIT_MAX_INTERVAL). Read once per State:\n")
+	b.WriteString("\t// commitCustomProcessing runs on every block, and an os.Getenv + parse\n")
+	b.WriteString("\t// per block is measurable overhead at backfill rates.\n")
+	b.WriteString("\tcommitMaxBlocks uint64\n")
+	b.WriteString("\tcommitMaxInterval time.Duration\n")
 	b.WriteString("\t// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only\n")
 	b.WriteString("\t// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized\n")
 	b.WriteString("\t// head); during finalized backfill they are pure GC/memory churn, so the\n")
@@ -78,6 +84,19 @@ package generated
 		b.WriteString(handle.stateType)
 		b.WriteString("{state: s}\n")
 	}
+	b.WriteString(`	s.commitMaxBlocks = 20000
+	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
+		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
+			s.commitMaxBlocks = parsed
+		}
+	}
+	s.commitMaxInterval = 3 * time.Second
+	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
+		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
+			s.commitMaxInterval = parsed
+		}
+	}
+`)
 	b.WriteString("\treturn s\n}\n\n")
 
 	b.WriteString(`func (s *State) Commit(ctx context.Context, store Store) error {
@@ -143,13 +162,24 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	}
 	defer conn.Close()
 
-	// A reorg-time reload rebuilds hot state from rolled-back ClickHouse. Any cold
-	// tier attached now holds entries for blocks > the rollback point, which would
-	// be stale; detach it so post-reload misses fall back to ClickHouse (correct).
-	// At startup this is a no-op (cold is enabled after this call).
-	_ = s.HotState.CloseColdCache()
+	// Rebuilding from (rolled-back) ClickHouse makes the cold tier authoritative
+	// again: re-open it fresh (Open wipes the dir, discarding entries past the
+	// rollback point), keep it ATTACHED during Recover so rows beyond the hot
+	// ring capacity spill to Pebble instead of being dropped, then mark it
+	// authoritative — hot∪cold now provably covers every state row ≤ blockNumber
+	// and a steady-state miss never needs a ClickHouse point-SELECT. Without a
+	// configured cold tier this is the old behavior (plain hot reload, lazy
+	// per-miss resolution).
+	coldAttached, err := s.HotState.ReopenColdCacheFresh()
+	if err != nil {
+		return fmt.Errorf("load state: reopen cold tier: %w", err)
+	}
 	if err := s.HotState.Recover(ctx, conn, db); err != nil {
 		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
+	}
+	if coldAttached {
+		s.HotState.coldAuthoritative = true
+		log.Printf("[LOAD STATE] cold tier rebuilt and authoritative at block %d: steady-state misses skip ClickHouse", blockNumber)
 	}
 
 	s.LastSyncBlock = blockNumber
@@ -333,9 +363,11 @@ func renderStateImports(b *bytes.Buffer, handles []stateHandleSpec) {
 	imports := map[string]struct{}{
 		`"context"`:                     {},
 		`"fmt"`:                         {},
+		`"log"`:                         {},
 		`"os"`:                          {},
 		`"strconv"`:                     {},
 		`"sync"`:                        {},
+		`"time"`:                        {},
 		`"github.com/ClickHouse/ch-go"`: {},
 	}
 	for _, handle := range handles {

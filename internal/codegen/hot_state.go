@@ -184,9 +184,19 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	capacity uint64
 	hand     uint64
 	size     uint64
+	// evictions counts entries overwritten by CLOCK replacement. While zero,
+	// the hot ring still holds everything ever Set — so under an authoritative
+	// (from-genesis) run, hot contents are a superset of the entity's
+	// ClickHouse rows and a hot miss proves a database miss.
+	evictions uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
+}
+
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *%[1]s) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
 }
 
 func New%[1]s(capacity uint64) *%[1]s {
@@ -290,7 +300,8 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
-%[4]s			c.idxUnlink(e.key)
+%[4]s			atomic.AddUint64(&c.evictions, 1)
+			c.idxUnlink(e.key)
 			e.key = key
 			e.value = value
 			atomic.StoreUint32(&e.referenced, 0)
@@ -532,10 +543,15 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(spec.batchType)
 	b.WriteString(") Insert(ctx context.Context, conn *ch.Client, db string) error {\n\tif b.Rows() == 0 {\n\t\treturn nil\n\t}\n\treturn conn.Do(ctx, ch.Query{Body: fmt.Sprintf(")
 	b.WriteString(strconv.Quote("INSERT INTO %s.%s " + customInsertColumnList(spec.table) + " VALUES"))
-	// wait_for_async_insert MUST be 1: hot-state commits are read back on
-	// prefetch/recovery/rollback. With wait=0 (fire-and-forget) a SELECT after
-	// Commit can miss un-flushed rows, returning stale/partial state under load.
-	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: \"async_insert\", Value: \"1\", Important: true}, {Key: \"wait_for_async_insert\", Value: \"1\", Important: true}}})\n}\n\n")
+	// wait_for_async_insert is 0 (fire-and-forget) so a Commit with N dirty tables
+	// issues N pipelined inserts without blocking on each table's server-side flush
+	// (each block on the async busy-timeout was the dominant backfill cost). The
+	// read-back invariant the old wait=1 protected — recovery/rollback/resolver
+	// SELECTs must see committed rows — is instead upheld by HotState.Commit, which
+	// issues ONE "SYSTEM FLUSH ASYNC INSERT QUEUE" barrier (under s.mu) after the
+	// inserts and before returning, draining every buffer. Same durability, one
+	// flush per commit instead of one wait per table: ~2.3x faster end-to-end.
+	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: \"async_insert\", Value: \"1\", Important: true}, {Key: \"wait_for_async_insert\", Value: \"0\", Important: true}}})\n}\n\n")
 }
 
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
@@ -608,10 +624,18 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		}
 	}
 	b.WriteString("\tmu sync.Mutex\n")
-	b.WriteString("\t// coldAuthoritative is set when the cold tier was opened against an empty\n")
-	b.WriteString("\t// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,\n")
-	b.WriteString("\t// so the lazy state Get skips the ClickHouse point-SELECT entirely.\n")
+	b.WriteString("\t// coldAuthoritative is set when hot∪cold provably covers every persisted\n")
+	b.WriteString("\t// state row: either the cold tier was opened against an empty ClickHouse\n")
+	b.WriteString("\t// (from-genesis backfill), or a full rebuild-from-ClickHouse just streamed\n")
+	b.WriteString("\t// every state table through the caches with the cold tier attached. A\n")
+	b.WriteString("\t// hot+cold miss is then provably new, so the lazy state Get skips the\n")
+	b.WriteString("\t// ClickHouse point-SELECT entirely.\n")
 	b.WriteString("\tcoldAuthoritative bool\n")
+	b.WriteString("\t// coldDir / coldCacheBytes / coldMemTableBytes remember the EnableColdCache\n")
+	b.WriteString("\t// configuration so the tier can be re-opened fresh on a rebuild.\n")
+	b.WriteString("\tcoldDir           string\n")
+	b.WriteString("\tcoldCacheBytes    int64\n")
+	b.WriteString("\tcoldMemTableBytes uint64\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -653,8 +677,13 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 			coldSpecs = append(coldSpecs, spec)
 		}
 	}
+	b.WriteString("// ColdAuthoritative reports whether the cold tier is authoritative for misses\n")
+	b.WriteString("// (opened against an empty ClickHouse): a hot+cold miss is provably new, so\n")
+	b.WriteString("// callers batching their own resolver round-trips may skip them entirely.\n")
+	b.WriteString("func (s *HotState) ColdAuthoritative() bool {\n\treturn s != nil && s.coldAuthoritative\n}\n\n")
 	if len(coldSpecs) == 0 {
 		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n\treturn nil\n}\n\n")
+		b.WriteString("func (s *HotState) ReopenColdCacheFresh() (bool, error) {\n\treturn false, nil\n}\n\n")
 		b.WriteString("func (s *HotState) CloseColdCache() error {\n\treturn nil\n}\n\n")
 	} else {
 		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n")
@@ -668,7 +697,21 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 			b.WriteString("), cacheBytes, memTableBytes); err != nil {\n\t\treturn err\n\t}\n")
 		}
 		b.WriteString("\ts.coldAuthoritative = authoritative\n")
+		b.WriteString("\ts.coldDir = dir\n")
+		b.WriteString("\ts.coldCacheBytes = cacheBytes\n")
+		b.WriteString("\ts.coldMemTableBytes = memTableBytes\n")
 		b.WriteString("\treturn nil\n}\n\n")
+
+		b.WriteString("// ReopenColdCacheFresh closes and re-opens the cold tier at its configured\n")
+		b.WriteString("// directory (coldcache.Open wipes the dir, so any entries from before a\n")
+		b.WriteString("// rollback are discarded). Authoritative stays false until the caller proves\n")
+		b.WriteString("// coverage. Reports whether a cold tier is configured; no-op without one.\n")
+		b.WriteString("func (s *HotState) ReopenColdCacheFresh() (bool, error) {\n")
+		b.WriteString("\tif s == nil || s.coldDir == \"\" {\n\t\treturn false, nil\n\t}\n")
+		b.WriteString("\tdir, cacheBytes, memTableBytes := s.coldDir, s.coldCacheBytes, s.coldMemTableBytes\n")
+		b.WriteString("\t_ = s.CloseColdCache()\n")
+		b.WriteString("\tif err := s.EnableColdCache(dir, false, cacheBytes, memTableBytes); err != nil {\n\t\treturn false, err\n\t}\n")
+		b.WriteString("\treturn true, nil\n}\n\n")
 
 		b.WriteString("func (s *HotState) CloseColdCache() error {\n")
 		b.WriteString("\tif s == nil {\n\t\treturn nil\n\t}\n")
@@ -735,6 +778,26 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	}
 	b.WriteString("\t\treturn nil\n")
 	b.WriteString("\t}\n")
+	// hadWork: true if any non-event table is dirty this commit. Gates the single
+	// async-flush barrier below so an empty commit issues no server round-trip.
+	b.WriteString("\thadWork := ")
+	hadWorkFirst := true
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		if !hadWorkFirst {
+			b.WriteString(" || ")
+		}
+		b.WriteString("len(s.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString(") > 0")
+		hadWorkFirst = false
+	}
+	if hadWorkFirst {
+		b.WriteString("false")
+	}
+	b.WriteString("\n")
 	for _, spec := range specs {
 		if spec.table.IsEvent {
 			continue
@@ -762,6 +825,16 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(")\n")
 		b.WriteString("\t}\n")
 	}
+	// Single async-flush barrier: the per-table inserts above are
+	// wait_for_async_insert=0, so this one server flush makes all of them durable
+	// and queryable before Commit returns (still under s.mu), preserving the
+	// recovery/rollback/resolver read-back invariant at one flush per commit
+	// instead of one wait per table insert.
+	b.WriteString("\tif hadWork {\n")
+	b.WriteString("\t\tif err := conn.Do(ctx, ch.Query{Body: \"SYSTEM FLUSH ASYNC INSERT QUEUE\"}); err != nil {\n")
+	b.WriteString("\t\t\treturn err\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
 	b.WriteString("\treturn nil\n}\n")
 
 		// Generate Restore methods for journal rollback

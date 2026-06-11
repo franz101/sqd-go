@@ -264,6 +264,7 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	b.WriteString(`import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"sync"
@@ -272,6 +273,7 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
 
 // CustomProcessFn is the callback you register from your project package to
@@ -369,27 +371,27 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 
 func commitCustomProcessing(ctx context.Context, store Store, state *State, blockNumber uint64) error {
 	// Hybrid commit cadence. Commit when EITHER bound is hit, whichever first:
-	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 5000): the crash re-fetch budget.
+	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 20000): the crash re-fetch budget.
 	//     Bounds how many blocks a crash must re-fetch+re-process from the durable
-	//     checkpoint. Dominates during fast backfill.
+	//     checkpoint. Dominates (and binds) during fast block-bound backfill. Every
+	//     commit re-persists each hot entity touched since the previous one, so a
+	//     frequently-updated entity (e.g. an active position written on every trade)
+	//     is re-written once per commit — pure redundancy. A larger interval folds
+	//     those repeated writes into one, which is the dominant backfill cost; 20000
+	//     blocks is still only a few portal responses to re-fetch on crash (cheap),
+	//     and dirty-but-evicted entries are preserved by the cold-tier spill, so
+	//     nothing is lost between commits.
 	//   - maxInterval (SQD_COMMIT_MAX_INTERVAL, default 3s): the durability-latency
 	//     bound. Ensures the live tail (few blocks/sec) still becomes durable
 	//     promptly instead of waiting maxBlocks (which could be ~30 min of wall
-	//     clock). Dominates at the head.
+	//     clock). Dominates at the head and binds during fetch-bound backfill
+	//     (~3k blk/s, where maxBlocks worth of blocks takes >maxInterval), which is
+	//     why raising maxBlocks does not loosen the live durability guarantee.
 	// This replaces the single magic block interval: the checkpoint never leads the
 	// durable horizon, and the gap is bounded in both blocks and wall-clock time.
-	maxBlocks := uint64(5000)
-	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
-		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
-			maxBlocks = parsed
-		}
-	}
-	maxInterval := 3 * time.Second
-	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
-		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
-			maxInterval = parsed
-		}
-	}
+	// Both bounds are cached on State at construction (this runs per block).
+	maxBlocks := state.commitMaxBlocks
+	maxInterval := state.commitMaxInterval
 
 	nowNanos := time.Now().UnixNano()
 	if state.lastCommitWallNanos == 0 {
@@ -412,9 +414,22 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 			}
 			pruneInterval = parsed
 		}
+		if state.LastPruneBlock == 0 {
+			// Anchor the prune baseline to the first committed block of the run so the
+			// first prune fires pruneInterval blocks later. A fresh/--restart run loads
+			// LastPruneBlock as 0; without this a high start block (e.g. 23M) trips the
+			// threshold on block 1 and runs a full OPTIMIZE/DELETE prune immediately —
+			// pointless (nothing old to prune yet) and needlessly heavy on the live
+			// connection while the first batch is still streaming.
+			state.LastPruneBlock = blockNumber
+		}
 		if blockNumber >= state.LastPruneBlock+pruneInterval {
+			// Prune removes superseded state rows — an optimization, never a
+			// correctness requirement. A failure (e.g. ClickHouse hitting its
+			// memory limit mid-mutation) must not abort the chain; skip this
+			// window and retry pruneInterval blocks later.
 			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
-				return fmt.Errorf("prune ClickHouse state at block %d: %w", blockNumber, err)
+				log.Printf("WARN: prune ClickHouse state at block %d failed (retrying in %d blocks): %v", blockNumber, pruneInterval, err)
 			}
 			state.LastPruneBlock = blockNumber
 		}
@@ -469,13 +484,57 @@ func NewProcessor(protoMode bool) (*Processor, error) {
 	}, nil
 }
 
+// ProcessJSONL implements ingestion.FastJSONLProcessor: raw portal JSONL is
+// parsed once, directly into the preallocated ring-buffer slots (Reset keeps
+// column/slice capacity, so steady-state appends allocate nothing regardless
+// of the adaptive page size), and the custom processor runs per block. This
+// replaces the legacy CustomLog path end to end: no per-log string clones in
+// the producer, no hex re-decode here, no per-event map[string]any.
+func (p *Processor) ProcessJSONL(ctx context.Context, store *database.Store, data []byte) (uint64, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	logProtoModeOnce.Do(func() {
+		log.Printf("processor: ProcessJSONL fast parse path (protoMode=%v)", p.ProtoMode)
+	})
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+			if err != nil {
+				return 0, err
+			}
+			p.protoRing = ring
+		}
+		return ParseJSONLProto(data, nil, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	}
+	if p.ring == nil {
+		ring, err := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, err
+		}
+		p.ring = ring
+	}
+	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
+		return CustomProcessing(ctx, stateStore, p.State, block)
+	})
+}
+
 func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {
 	if p == nil || len(logs) == 0 {
 		return nil
 	}
-	// DEBUG: Log processor state
 	logProcessorStateOnce.Do(func() {
-		fmt.Printf("[PROCESSOR DEBUG] p.ProtoMode=%v, p.protoRing=%v, p.ring=%v\n", p.ProtoMode, p.protoRing != nil, p.ring != nil)
+		log.Printf("processor: legacy CustomLog path (protoMode=%v); set SQD_PARSE_DECODE_V2=1 for the fast parse path", p.ProtoMode)
 	})
 	if p.ProtoMode {
 		if p.protoRing == nil {
@@ -510,6 +569,11 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 	if p.ProtoMode {
 		var curProtoBlock *ProtoEventBlock
 		var curBlockNum uint64
+		// Reused across logs within this Process call: AppendFromLog copies every
+		// topic/data word into the proto columns and retains neither slice, so one
+		// scratch each avoids a per-log []common.Hash and []byte (FromHex) alloc.
+		var topicsScratch []common.Hash
+		var dataScratch []byte
 
 		for _, lg := range logs {
 			if curProtoBlock == nil || curBlockNum != lg.BlockNumber {
@@ -524,17 +588,21 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 			meta := EventMeta{
 				BlockNumber:      lg.BlockNumber,
 				BlockTimestamp:   lg.BlockTimestamp,
-				BlockHash:        common.HexToHash(lg.BlockHash),
-				ContractAddress:  common.HexToAddress(lg.ContractAddress),
-				TransactionHash:  common.HexToHash(lg.TransactionHash),
+				BlockHash:        abiunpack.DecodeTopicHash(lg.BlockHash),
+				ContractAddress:  abiunpack.AddressFromHex(lg.ContractAddress),
+				TransactionHash:  abiunpack.DecodeTopicHash(lg.TransactionHash),
 				TransactionIndex: lg.TransactionIndex,
 				LogIndex:         lg.LogIndex,
 			}
-			topics := make([]common.Hash, len(lg.Topics))
-			for i, t := range lg.Topics {
-				topics[i] = common.HexToHash(t)
+			if cap(topicsScratch) < len(lg.Topics) {
+				topicsScratch = make([]common.Hash, len(lg.Topics))
 			}
-			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, common.FromHex(lg.Data), meta)
+			topics := topicsScratch[:len(lg.Topics)]
+			for i, t := range lg.Topics {
+				topics[i] = abiunpack.DecodeTopicHash(t)
+			}
+			dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
+			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, dataScratch, meta)
 		}
 		if curProtoBlock != nil {
 			return p.processProtoBlocks(ctx, stateStore, []*ProtoEventBlock{curProtoBlock})
@@ -571,9 +639,9 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 		meta := EventMeta{
 			BlockNumber:      lg.BlockNumber,
 			BlockTimestamp:   lg.BlockTimestamp,
-			BlockHash:        common.HexToHash(lg.BlockHash),
-			ContractAddress:  common.HexToAddress(lg.ContractAddress),
-			TransactionHash:  common.HexToHash(lg.TransactionHash),
+			BlockHash:        abiunpack.DecodeTopicHash(lg.BlockHash),
+			ContractAddress:  abiunpack.AddressFromHex(lg.ContractAddress),
+			TransactionHash:  abiunpack.DecodeTopicHash(lg.TransactionHash),
 			TransactionIndex: lg.TransactionIndex,
 			LogIndex:         lg.LogIndex,
 		}
@@ -608,10 +676,6 @@ var (
 
 // processProtoBlocks handles proto mode processing.
 func (p *Processor) processProtoBlocks(ctx context.Context, store Store, blocks []*ProtoEventBlock) error {
-	// DEBUG: Log that we're in proto mode
-	logProtoModeOnce.Do(func() {
-		fmt.Println("[PROTO MODE] processProtoBlocks called with", len(blocks), "blocks")
-	})
 	if len(blocks) == 0 {
 		return nil
 	}
@@ -728,18 +792,11 @@ func (p *Processor) CloseColdCache() error {
 	return p.State.HotState.CloseColdCache()
 }
 
-func prefetchBlockState(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
-	return prefetchBlocksState(ctx, store, state, []*ParsedBlock{block})
-}
-
-func prefetchProtoBlockState(ctx context.Context, store Store, state *State, block *ProtoEventBlock) error {
-	return prefetchProtoBlocksState(ctx, store, state, []*ProtoEventBlock{block})
-}
-
 `)
 
-	renderGenericPrefetchBlocksState(&b, cfg, events, hotStateTables)
-	renderGenericPrefetchProtoBlocksState(&b, cfg, events, hotStateTables)
+	// Prefetch was intentionally removed: hot-state misses resolve lazily (and
+	// batched per block where it matters), so emitting per-event prefetch
+	// sweeps was dead weight in every generated processor.
 	b.WriteString(`func PrintPnLSummary(state *State, blockNumber uint64) {}
 `)
 

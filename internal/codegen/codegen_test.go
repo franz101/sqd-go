@@ -338,7 +338,8 @@ type MemoryHoldingSchema struct {
 	assertNotContains(t, stateGo, "User"+"PositionKey")
 
 	processorGo := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
-	assertContains(t, processorGo, "hot.HoldingsResolver.Queue(HoldingsClockKey{Account: ev.Account, AssetID: ev.AssetID})")
+	assertContains(t, processorGo, "Prefetch intentionally disabled: hot-state misses are resolved lazily")
+	assertNotContains(t, processorGo, "Resolver.Queue(")
 	assertNotContains(t, processorGo, "set"+"EventMeta")
 }
 

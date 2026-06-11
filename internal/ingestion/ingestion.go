@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,17 +41,13 @@ type Options struct {
 	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
 	StateLoader        func(blockNumber uint64) error // called on startup to load processor state from database
 	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
-	// ColdCache enables a Pebble-backed cold tier under the hot caches (finalized
-	// backfill only). It removes the per-miss ClickHouse point-SELECT: an evicted
-	// entry is served from local disk, and on a from-genesis run a hot+cold miss is
-	// provably new so ClickHouse is skipped entirely. Default off.
-	ColdCache    bool
-	ColdCacheDir string // base directory for cold-tier files (default os.TempDir()/sqd-coldcache)
+	ColdCacheDir string // base directory for Pebble cold-tier files (default os.TempDir()/sqd-coldcache)
+	ColdCache    bool   // enable Pebble cold tier (default true via config; false disables)
 }
 
 const (
 	cursorPollInterval = 5 * time.Second
-	statsInterval      = 10 * time.Second
+	statsInterval      = 5 * time.Second
 
 	// Adaptive page sizing: when pageSize=0, grow page size based on performance
 	// Target ~20k blocks/second processing rate
@@ -145,7 +142,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	log.Printf("ClickHouse connected: %s:%d/%s (fork=%s)", opts.ClickHouseHost, opts.ClickHousePort, opts.ClickHouseDatabase, forkMode)
 
 	coldDir := opts.ColdCacheDir
-	if opts.ColdCache && coldDir == "" {
+	if coldDir == "" {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
@@ -175,6 +172,32 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	currentBlock := chain.StartBlock
 	if flagStartBlock > 0 {
 		currentBlock = flagStartBlock
+	}
+	// Cold tier (Pebble): an evicted hot entry is served from local disk instead
+	// of a ClickHouse point-SELECT. Enabled BEFORE state recovery so the
+	// rebuild-from-ClickHouse below runs with the tier attached: rows past the
+	// hot ring capacity spill to Pebble instead of being dropped, after which
+	// hot∪cold provably covers all persisted state and the tier is marked
+	// authoritative (a miss never needs a ClickHouse point-SELECT — ClickHouse
+	// is only read here, on recovery). Fresh runs (no rows for this chain) are
+	// authoritative immediately. Reorg-safe: RestoreToBlock detaches the tier,
+	// so post-reorg reads fall back to the rolled-back ClickHouse.
+	if coldCache {
+		if cc, ok := proc.(ColdCacheProcessor); ok {
+			_, hasAny, err := store.LastBlock(ctx, chain.ID)
+			if err != nil {
+				return fmt.Errorf("cold cache: probe last block: %w", err)
+			}
+			authoritative := !hasAny
+			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
+			if err := cc.EnableColdCache(dir, authoritative); err != nil {
+				return fmt.Errorf("enable cold cache: %w", err)
+			}
+			defer func() { _ = cc.CloseColdCache() }()
+			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
+		} else {
+			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
+		}
 	}
 	state := NewForkTracker(forkMode)
 	if cursorMode {
@@ -275,31 +298,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		snapshotController = sc
 		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
 	}
-	// Cold tier (Pebble): an evicted hot entry is served from local disk instead of
-	// a ClickHouse point-SELECT. Authoritative iff ClickHouse holds no rows for this
-	// chain at start (fresh / --restart): a hot+cold miss is then provably new and
-	// the per-miss SELECT is skipped entirely. On resume-with-data it stays
-	// non-authoritative — still serving re-referenced evictions from disk, but never
-	// skipping a needed lookup. Reorg-safe: any state recovery (RestoreToBlock /
-	// LoadFromDatabase) detaches the cold tier, so post-reorg reads fall back to the
-	// rolled-back ClickHouse.
-	if coldCache {
-		if cc, ok := proc.(ColdCacheProcessor); ok {
-			_, hasAny, err := store.LastBlock(ctx, chain.ID)
-			if err != nil {
-				return fmt.Errorf("cold cache: probe last block: %w", err)
-			}
-			authoritative := !hasAny
-			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
-			if err := cc.EnableColdCache(dir, authoritative); err != nil {
-				return fmt.Errorf("enable cold cache: %w", err)
-			}
-			defer func() { _ = cc.CloseColdCache() }()
-			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
-		} else {
-			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
-		}
+	// Backfill GC tuning: double GOGC to halve GC frequency while snapshots
+	// are off. The snapshotless phase generates large but short-lived batches;
+	// GOGC=200 trades ~2× steady-state heap for fewer STW pauses. Restored to
+	// the previous value when snapshots are enabled or processChain returns.
+	backfillGC := cursorMode && !snapshotsActive
+	var prevGOGC int
+	if backfillGC {
+		prevGOGC = debug.SetGCPercent(200)
 	}
+	defer func() {
+		if backfillGC {
+			debug.SetGCPercent(prevGOGC)
+		}
+	}()
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
 	useParseDecodeV2 := os.Getenv("SQD_PARSE_DECODE_V2") != "" && fastJSONLOK
 	if os.Getenv("SQD_PARSE_DECODE_V2") != "" && !fastJSONLOK {
@@ -563,7 +575,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 
 				batchStartBlock := pBlock
-				var lastBlockNumber uint64
 				for idx, db := range decodedBlocks {
 					// Backpressure check: wait if producer is too far ahead of consumer
 					for {
@@ -584,7 +595,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 					isLastInBatch := (idx == len(decodedBlocks)-1)
 					replayBuf.Write(chain.ID, db.number, db.hash, db.timestamp, db.events, db.logs, db.typedEvents, response.Head.Finalized, isLastInBatch, rangeLabel, batchStartBlock, db.raw)
-					lastBlockNumber = db.number
 					pHash = db.hash
 				}
 
@@ -595,7 +605,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				if len(decodedBlocks) > 0 {
 					select {
 					case next := <-advance:
-						log.Printf("[CURSOR DEBUG] pBlock: %d -> lastBlockNumber: %d -> consumer next: %d (blocks in batch: %d)", pBlock, lastBlockNumber, next.nextBlock, len(decodedBlocks))
 						pBlock = next.nextBlock
 						pHash = next.parentHash
 					case <-pCtx.Done():
@@ -722,6 +731,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					if entry.number+snapshotEnableMargin >= entry.finalized.Number {
 						snapshotController.SetSnapshotsEnabled(true)
 						snapshotsActive = true
+						if backfillGC {
+							debug.SetGCPercent(prevGOGC)
+							backfillGC = false
+						}
 						log.Printf("Chain %d: snapshots enabled — consumer block %d is within %d of finalized head %d",
 							chain.ID, entry.number, snapshotEnableMargin, entry.finalized.Number)
 					}
@@ -738,54 +751,74 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			pendingBatchBlocks++
 
 			if entry.isLastInBatch {
-				insertStart := time.Now()
-
-				// 1. Logs insertion
-				if cfg.ShouldStoreRawLogs() && len(batchDecodedEvents) > 0 {
-					if err := baseInserter.InsertLogs(ctx, batchDecodedEvents); err != nil {
-						return fmt.Errorf("InsertLogs: %w", err)
+				// CH inserts run in a background goroutine (I/O-bound, writes to
+				// ClickHouse async-insert buffers) while the custom processor runs
+				// here (CPU-bound, updates in-memory hot state). The two share no
+				// mutable state so overlapping them saves min(insert, custom) per
+				// batch. The batch slices are read-only until resetBatch() which
+				// runs after both sides complete.
+				//
+				// Safety: insertDone is drained on EVERY exit path (error or
+				// success) before the checkpoint can advance, so a crash never
+				// sees a checkpoint ahead of durable CH rows.
+				insertDone := make(chan error, 1)
+				go func() {
+					t0 := time.Now()
+					if cfg.ShouldStoreRawLogs() && len(batchDecodedEvents) > 0 {
+						if err := baseInserter.InsertLogs(ctx, batchDecodedEvents); err != nil {
+							insertDone <- fmt.Errorf("InsertLogs: %w", err)
+							return
+						}
 					}
-				}
-
-				// 2. Typed events insertion
-				for tableName, events := range batchTypedEvents {
-					if len(events) == 0 {
-						continue
+					for tName, tevs := range batchTypedEvents {
+						if len(tevs) == 0 {
+							continue
+						}
+						ins := typedInserters[tName]
+						if ins == nil {
+							insertDone <- fmt.Errorf("missing TypedInserter for %s", tName)
+							return
+						}
+						if err := ins.Insert(ctx, tevs); err != nil {
+							insertDone <- fmt.Errorf("InsertTypedLogs(%s): %w", tName, err)
+							return
+						}
 					}
-					inserter := typedInserters[tableName]
-					if inserter == nil {
-						return fmt.Errorf("missing TypedInserter for %s", tableName)
+					if storeBlocks && len(batchBlockRows) > 0 {
+						if err := baseInserter.InsertBlocks(ctx, batchBlockRows); err != nil {
+							insertDone <- fmt.Errorf("InsertBlocks: %w", err)
+							return
+						}
 					}
-					if err := inserter.Insert(ctx, events); err != nil {
-						return fmt.Errorf("InsertTypedLogs(%s): %w", tableName, err)
-					}
-				}
-
-				// 3. Optional block ledger insertion
-				if storeBlocks && len(batchBlockRows) > 0 {
-					if err := baseInserter.InsertBlocks(ctx, batchBlockRows); err != nil {
-						return fmt.Errorf("InsertBlocks: %w", err)
-					}
-				}
-				profInsertNanos.Add(int64(time.Since(insertStart)))
+					profInsertNanos.Add(int64(time.Since(t0)))
+					insertDone <- nil
+				}()
 
 				if err := sendProducerAdvance(entry.number+1, entry.hash); err != nil {
+					<-insertDone // drain goroutine before returning
 					return err
 				}
 
-				// 4. Custom Processor
+				// Custom processor runs on this goroutine, concurrent with CH inserts
 				if useParseDecodeV2 && len(batchRawJSONL) > 0 {
 					procStart := time.Now()
 					if _, err := fastJSONLProc.ProcessJSONL(ctx, store, batchRawJSONL); err != nil {
+						<-insertDone // drain goroutine before returning
 						return fmt.Errorf("custom processor v2 error: %w", err)
 					}
 					profCustomNanos.Add(int64(time.Since(procStart)))
 				} else if proc != nil && len(batchCustomLogs) > 0 {
 					procStart := time.Now()
 					if err := proc.Process(ctx, store, batchCustomLogs); err != nil {
+						<-insertDone // drain goroutine before returning
 						return fmt.Errorf("custom processor error: %w", err)
 					}
 					profCustomNanos.Add(int64(time.Since(procStart)))
+				}
+
+				// Both sides must complete before the checkpoint advances.
+				if insertErr := <-insertDone; insertErr != nil {
+					return insertErr
 				}
 
 				if cursorMode {
@@ -838,12 +871,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						}
 					}
 				}
-
-				scanned := entry.number - entry.requestStartBlock + 1
-				elapsed := time.Now().Sub(startTime)
-				rate := float64(atomic.LoadUint64(&totalBlocks)) / elapsed.Seconds()
-				log.Printf("Chain %d: %s scanned %d blocks, event blocks: %d, events: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
-					chain.ID, entry.rangeLabel, scanned, batchEventBlocks, batchEventsCount, entry.number, atomic.LoadUint64(&totalBlocks), atomic.LoadUint64(&totalEvents), rate)
 
 				lastCheckpoint = entry.number
 				resetBatch()

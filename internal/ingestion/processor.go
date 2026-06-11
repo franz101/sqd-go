@@ -70,16 +70,6 @@ type ColdCacheProcessor interface {
 	CloseColdCache() error
 }
 
-// ColdNegativeFilterProcessor is optionally implemented by cold-tier processors
-// that also support the V3 in-RAM negative-lookup Bloom filter: a hot+cold miss
-// for a provably-new key skips even the Pebble probe (and, when authoritative,
-// the ClickHouse SELECT), resolving from a single cache-line test in RAM. This is
-// what distinguishes V3 from V2 on a from-genesis backfill, where nearly every
-// hot miss is a brand-new key. Enabled by the ingestion layer when V3 is selected.
-type ColdNegativeFilterProcessor interface {
-	EnableColdNegativeFilter(bits uint64)
-}
-
 // ProcessorFunc adapts individual callback functions to the Processor interface.
 // Any nil callbacks are treated as no-ops.
 type ProcessorFunc struct {
