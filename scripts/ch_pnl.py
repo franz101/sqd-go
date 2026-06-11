@@ -121,8 +121,11 @@ def fetch_local_ch(wallet: str):
     elapsed = now() - t0
     d = r.json()
     rows = d.get("data", [])
+    # Local memory_user_positions stores human units (stake / USDC) since the
+    # unit migration — no 1e6 rescale. (scale=True here was shrinking every
+    # local value a million-fold and printing $0.00.)
     positions = ch_data_to_positions(rows, pnl_key="realized_pn_l", block_key="block_number",
-                                     scale=True, scale_price=False)  # local stores amount/pnl/bought scaled, but not avg_price
+                                     scale=False)
     return positions, elapsed
 
 # ============================================================

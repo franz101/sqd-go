@@ -69,6 +69,11 @@ type ConditionsClockCache struct {
 	cold *coldcache.Store
 }
 
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *ConditionsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
 func NewConditionsClockCache(capacity uint64) *ConditionsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
@@ -544,6 +549,11 @@ type UserPositionsClockCache struct {
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
+}
+
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *UserPositionsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
 }
 
 func NewUserPositionsClockCache(capacity uint64) *UserPositionsClockCache {
@@ -1026,6 +1036,11 @@ type MarketsClockCache struct {
 	cold *coldcache.Store
 }
 
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *MarketsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
 func NewMarketsClockCache(capacity uint64) *MarketsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
@@ -1466,6 +1481,11 @@ type NegRiskEventsClockCache struct {
 	cold *coldcache.Store
 }
 
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *NegRiskEventsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
+}
+
 func NewNegRiskEventsClockCache(capacity uint64) *NegRiskEventsClockCache {
 	if capacity == 0 {
 		capacity = DefaultClockCacheCapacity
@@ -1904,6 +1924,11 @@ type FixedProductMarketMakersClockCache struct {
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
+}
+
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *FixedProductMarketMakersClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
 }
 
 func NewFixedProductMarketMakersClockCache(capacity uint64) *FixedProductMarketMakersClockCache {
@@ -2348,6 +2373,11 @@ type ConditionPreparationsClockCache struct {
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
 	cold *coldcache.Store
+}
+
+// Evictions reports how many entries CLOCK replacement has overwritten.
+func (c *ConditionPreparationsClockCache) Evictions() uint64 {
+	return atomic.LoadUint64(&c.evictions)
 }
 
 func NewConditionPreparationsClockCache(capacity uint64) *ConditionPreparationsClockCache {
@@ -3006,32 +3036,4 @@ func hotStateUint256Slice(values []proto.UInt256) []uint256.Int {
 		out = append(out, hotStateUint256(value))
 	}
 	return out
-}
-
-// Evictions reports how many entries CLOCK replacement has overwritten in each
-// cache. While zero, the hot ring still holds everything ever Set — so under an
-// authoritative (from-genesis) run, hot contents are a superset of the entity's
-// ClickHouse rows and a hot miss proves a database miss.
-func (c *ConditionsClockCache) Evictions() uint64 {
-	return atomic.LoadUint64(&c.evictions)
-}
-
-func (c *UserPositionsClockCache) Evictions() uint64 {
-	return atomic.LoadUint64(&c.evictions)
-}
-
-func (c *MarketsClockCache) Evictions() uint64 {
-	return atomic.LoadUint64(&c.evictions)
-}
-
-func (c *NegRiskEventsClockCache) Evictions() uint64 {
-	return atomic.LoadUint64(&c.evictions)
-}
-
-func (c *FixedProductMarketMakersClockCache) Evictions() uint64 {
-	return atomic.LoadUint64(&c.evictions)
-}
-
-func (c *ConditionPreparationsClockCache) Evictions() uint64 {
-	return atomic.LoadUint64(&c.evictions)
 }

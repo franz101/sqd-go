@@ -789,18 +789,11 @@ func (p *Processor) CloseColdCache() error {
 	return p.State.HotState.CloseColdCache()
 }
 
-func prefetchBlockState(ctx context.Context, store Store, state *State, block *ParsedBlock) error {
-	return prefetchBlocksState(ctx, store, state, []*ParsedBlock{block})
-}
-
-func prefetchProtoBlockState(ctx context.Context, store Store, state *State, block *ProtoEventBlock) error {
-	return prefetchProtoBlocksState(ctx, store, state, []*ProtoEventBlock{block})
-}
-
 `)
 
-	renderGenericPrefetchBlocksState(&b, cfg, events, hotStateTables)
-	renderGenericPrefetchProtoBlocksState(&b, cfg, events, hotStateTables)
+	// Prefetch was intentionally removed: hot-state misses resolve lazily (and
+	// batched per block where it matters), so emitting per-event prefetch
+	// sweeps was dead weight in every generated processor.
 	b.WriteString(`func PrintPnLSummary(state *State, blockNumber uint64) {}
 `)
 

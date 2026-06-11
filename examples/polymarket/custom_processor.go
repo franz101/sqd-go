@@ -103,6 +103,9 @@ var (
 	// loop is a 256-bit modular exponentiation — the single most expensive
 	// primitive in the processor — so this is the highest-value cache of the three.
 	negRiskPosCache = newClockCache[negRiskKey, uint256.Int](maxCryptoCacheLen, 64, hashNegRiskKey)
+	// conditionIDCache memoizes the CTF conditionID derivation (a keccak over
+	// oracle+questionID), keyed by both since the derivation is generic.
+	conditionIDCache    = newClockCache[conditionIDKey, common.Hash](maxCryptoCacheLen, 64, hashConditionIDKey)
 	lastPnLSummaryBlock uint64
 )
 
@@ -124,6 +127,11 @@ type negRiskKey struct {
 	outcome   uint8
 }
 
+type conditionIDKey struct {
+	oracle   common.Address
+	question common.Hash
+}
+
 // Shard hashes read 8 bytes from a field that is itself a keccak output, so the
 // low bits are already uniformly distributed across shards.
 func hashCollectionKey(k collectionKey) uint64 {
@@ -136,6 +144,10 @@ func hashPositionKey(k positionKey) uint64 {
 
 func hashNegRiskKey(k negRiskKey) uint64 {
 	return binary.LittleEndian.Uint64(k.condition[:8]) + uint64(k.outcome)
+}
+
+func hashConditionIDKey(k conditionIDKey) uint64 {
+	return binary.LittleEndian.Uint64(k.question[:8])
 }
 
 // condResolveNanos / condResolveRoundTrips are diagnostic counters (single-goroutine processor).
@@ -1501,11 +1513,17 @@ func getNegRiskPositionID(marketID common.Hash, questionIndex uint32, outcomeInd
 }
 
 func getConditionID(oracle common.Address, questionID common.Hash) common.Hash {
+	key := conditionIDKey{oracle: oracle, question: questionID}
+	if val, ok := conditionIDCache.Load(key); ok {
+		return val
+	}
 	var payload [84]byte
 	copy(payload[:20], oracle.Bytes())
 	copy(payload[20:52], questionID.Bytes())
 	payload[83] = 0x02
-	return crypto.Keccak256Hash(payload[:])
+	val := crypto.Keccak256Hash(payload[:])
+	conditionIDCache.Store(key, val)
+	return val
 }
 
 func getPositionID(collateral common.Address, collection common.Hash) uint256.Int {
