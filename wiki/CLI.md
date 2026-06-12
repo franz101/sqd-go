@@ -89,6 +89,9 @@ Shows usage text.
 | `CLICKHOUSE_DATABASE` | project name | ClickHouse database name |
 | `STATE_SNAPSHOT_INTERVAL` | `4000` | Blocks between state snapshots |
 | `CLICKHOUSE_PRUNE_INTERVAL` | `100000` | Blocks between compaction/prune cycles |
+| `SQD_COLDCACHE_MB` | RAM/8, clamped 256–8192 | Cold-tier (Pebble) block cache cap in MiB |
+| `SQD_PPROF_ADDR` | unset | e.g. `localhost:6060` — expose net/http/pprof on a live run |
+| `SQD_PORTAL_ENDPOINT` | unset | Override the SQD portal URL (testing/mirrors) |
 
 ## Config Format (config.yaml)
 
@@ -134,7 +137,9 @@ codegen: config.yaml → manifest.json + schema.sql + events.go + ...
 start: connect ClickHouse → ensure tables → load cursor
    ↓
 fetch: SQD HTTP POST (zstd) → decompress JSONL
-   ↓
+   ↓   (live runs fetch via /finalized-stream while >512 blocks below the
+   ↓    finalized head — the hot /stream endpoint paces deep catch-up reads —
+   ↓    then switch to /stream at the head)
 parse: FastJSONParser → per-block EVMLog arrays
    ↓
 decode: UnpackLogWithMeta → typed Go event structs

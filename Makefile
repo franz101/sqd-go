@@ -83,11 +83,8 @@ dev-polymarket: codegen-polymarket build
 dev-v2: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 3664531 $(POLYMARKET_ARGS)
 
-# 8 GiB Pebble block cache by default (override with SQD_COLDCACHE_MB): long
-# live runs are cold-tier read-bound, and a large cache keeps the hot working
-# set of state lookups off disk.
 dev-v2-live: codegen-polymarket build
-	SQD_COLDCACHE_MB=$(or $(SQD_COLDCACHE_MB),8192) SQD_PARSE_DECODE_V2=1 CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23364531 $(POLYMARKET_ARGS)
+	SQD_PARSE_DECODE_V2=1 CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23364531 $(POLYMARKET_ARGS)
 
 # dev-fast: clean V2 fast-path run from block 23M. Every speed setting is now a
 # codegen/config default (V2 proto, cold cache on, 20k commit interval,

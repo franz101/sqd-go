@@ -22,8 +22,11 @@
 package coldcache
 
 import (
+	"bufio"
+	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
@@ -31,12 +34,60 @@ import (
 
 // Default off-heap budgets. Both are hard caps; steady-state RSS ≈ Cache +
 // MemTableSize + small bookkeeping (validated by the ./disk spike at ~88 MiB).
-// SQD_COLDCACHE_MB overrides the block-cache cap (still a hard cap; dense
-// ranges with a large live-entity working set benefit from 256-512).
+// SQD_COLDCACHE_MB overrides the block-cache cap (still a hard cap). The
+// cache default scales with the machine: long live runs are cold-tier
+// read-bound, and a larger block cache keeps the hot working set of state
+// lookups off disk.
 const (
-	DefaultCacheBytes   int64  = 256 << 20
-	DefaultMemTableSize uint64 = 16 << 20
+	MinDefaultCacheBytes int64  = 256 << 20
+	MaxDefaultCacheBytes int64  = 8 << 30
+	DefaultMemTableSize  uint64 = 16 << 20
 )
+
+// defaultCacheBytes picks the block-cache cap when neither the caller nor
+// SQD_COLDCACHE_MB sets one: 1/8 of total RAM, clamped to
+// [MinDefaultCacheBytes, MaxDefaultCacheBytes]. If total RAM is unknown
+// (non-Linux), it stays at the conservative minimum.
+func defaultCacheBytes() int64 {
+	total := totalRAMBytes()
+	if total <= 0 {
+		return MinDefaultCacheBytes
+	}
+	c := total / 8
+	if c < MinDefaultCacheBytes {
+		return MinDefaultCacheBytes
+	}
+	if c > MaxDefaultCacheBytes {
+		return MaxDefaultCacheBytes
+	}
+	return c
+}
+
+// totalRAMBytes returns total system memory, or 0 if it can't be determined.
+func totalRAMBytes() int64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kb << 10
+	}
+	return 0
+}
 
 // Store is a single-writer raw byte-slice KV backed by Pebble.
 type Store struct {
@@ -49,10 +100,12 @@ type Store struct {
 // cacheBytes/memTableBytes <= 0 fall back to the defaults.
 func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 	if cacheBytes <= 0 {
-		cacheBytes = DefaultCacheBytes
 		if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
 			cacheBytes = mb << 20
+		} else {
+			cacheBytes = defaultCacheBytes()
 		}
+		log.Printf("cold tier: block cache %d MiB (override with SQD_COLDCACHE_MB)", cacheBytes>>20)
 	}
 	if memTableBytes == 0 {
 		memTableBytes = DefaultMemTableSize

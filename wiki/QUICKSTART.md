@@ -145,6 +145,7 @@ See [Custom Schema](CUSTOM_SCHEMA.md) and [Custom Processor](CUSTOM_PROCESSOR.md
 | `CLICKHOUSE_USER` | `default` | User |
 | `CLICKHOUSE_PASSWORD` | `sqd-clickhouse` | Password |
 | `CLICKHOUSE_DATABASE` | project name | Database name |
+| `SQD_COLDCACHE_MB` | RAM/8, clamped 256–8192 | Cold-tier (Pebble) block cache cap in MiB |
 
 ## What's Next
 
