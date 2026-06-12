@@ -12,6 +12,7 @@ services:
       - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000" # Native client interface (defaults to 9000)
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config.d/log-retention.xml:/etc/clickhouse-server/config.d/log-retention.xml:ro
     ulimits:
       nofile:
         soft: 262144
