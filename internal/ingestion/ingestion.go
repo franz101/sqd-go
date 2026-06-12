@@ -565,13 +565,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					if havePending {
 						replayBuf.WriteParsed(chain.ID, pending, response.Head.Finalized, true, rangeLabel, batchStartBlock, batchFlush, evCount)
 						pHash = pending.Hash
-						select {
-						case next := <-advance:
-							pBlock = next.nextBlock
-							pHash = next.parentHash
-						case <-pCtx.Done():
-							return
-						}
+						// Self-advance: the producer already tracks the parent hash of
+						// the last block it wrote, so it can fetch the next page while
+						// the consumer is still processing this one. Goroutine sampling
+						// showed the old per-page advance handshake left the producer
+						// blocked ~50% of wall time (fetch and consume fully serialized
+						// at page boundaries); the replay-buffer backpressure and the
+						// insert-batch pool already bound how far it can run ahead.
+						pBlock = pending.Number + 1
 					} else {
 						if batchFlush != nil {
 							_ = batchFlush(pCtx) // zero rows: only returns the pooled batch
@@ -956,13 +957,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 			if entry.isLastInBatch && batchParse {
 				// Producer-parse mode: this batch's blocks were already processed
-				// per entry above (the producer parsed them). Here only the batch
-				// bookkeeping remains: advance the producer, account events, and
-				// pipeline the batch's event-row flush against the next batch.
-				if err := sendProducerAdvance(entry.number+1, entry.hash); err != nil {
-					_ = drainPendingInsert()
-					return err
-				}
+				// per entry above (the producer parsed them), and the producer
+				// self-advances — it is fetching the next page right now. Here only
+				// the batch bookkeeping remains: account events and pipeline the
+				// batch's event-row flush against the next batch.
 				atomic.AddUint64(&totalEvents, entry.batchEvents)
 				if err := drainPendingInsert(); err != nil {
 					return err

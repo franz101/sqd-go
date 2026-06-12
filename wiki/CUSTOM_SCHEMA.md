@@ -23,17 +23,26 @@ Create `custom_schema.go` next to your `config.yaml`. Struct naming convention:
 
 ### Struct Comments: Primary Key
 
-Use a `pk:` comment to declare the primary key:
+Use a `pk:` comment to declare the primary key. This is the complete `custom_schema.go` backing the Uniswap PnL transfer tracker from [CUSTOM_PROCESSOR.md](CUSTOM_PROCESSOR.md) (see `examples/uniswap_pnl/`):
 
 ```go
-// pk: ID
-type MemoryConditionSchema struct {
-    ID               common.Hash
-    Oracle           common.Address
-    QuestionID       common.Hash
-    OutcomeSlotCount uint8
-    Resolved         bool
-    Payouts          []uint256.Int
+package uniswap_pnl
+
+import (
+    "time"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/holiman/uint256"
+)
+
+// pk: Address
+type UserPositionSchema struct {
+    Address        common.Address
+    Balance        uint256.Int
+    TotalIn        uint256.Int
+    TotalOut       uint256.Int
+    UpdatedAtBlock uint64
+    UpdatedAt      time.Time
 }
 ```
 
@@ -72,23 +81,22 @@ These enable the `ReplacingMergeTree(block_number)` engine to deduplicate rows f
 
 ## Generated DDL
 
-For each schema struct, codegen produces:
+For each schema struct, codegen produces (this is the actual output for `UserPositionSchema` above):
 
 ```sql
 CREATE TABLE IF NOT EXISTS <db>.user_positions (
-  id FixedString(32),
-  oracle FixedString(20),
-  question_id FixedString(32),
-  outcome_slot_count UInt8,
-  resolved UInt8,
+  address FixedString(20),
+  balance UInt256,
+  total_in UInt256,
+  total_out UInt256,
   updated_at_block UInt64,
   updated_at DateTime64(3, 'UTC') DEFAULT now64(3),
   block_number UInt64,
   transaction_index UInt64,
   log_index UInt64
 ) ENGINE = ReplacingMergeTree(block_number)
-PRIMARY KEY (id)
-ORDER BY (id, block_number, transaction_index, log_index);
+PRIMARY KEY (address)
+ORDER BY (address, block_number, transaction_index, log_index);
 ```
 
 Output paths:
@@ -101,28 +109,28 @@ Codegen produces a complete state management layer:
 
 ### `generated/hotstate.go`
 
-CLOCK cache-backed maps for each entity:
+CLOCK cache-backed maps for each entity (plural names):
 
 ```go
 type HotState struct {
-    Conditions  *clock.CLock[string, MemoryCondition]
-    UserPositions *clock.CLock[userPositionKey, MemoryUserPosition]
-    // ... one per schema type
+    UserPositions         *UserPositionsClockCache
+    UserPositionsResolver *UserPositionBatchResolver
+    dirtyUserPositions    map[UserPositionsClockKey]struct{}
+    // ... one cache/resolver/dirty-set per schema type
 }
 ```
 
-The CLOCK cache provides O(1) amortized lookups with cache-friendly eviction when memory pressure builds. The `HotState` is embedded in `State` and auto-persisted to ClickHouse at snapshot intervals.
+The CLOCK cache provides O(1) amortized lookups with cache-friendly eviction when memory pressure builds. The `HotState` is embedded in `State` and auto-persisted to ClickHouse at commit intervals.
 
 ### `generated/state.go`
 
-The `State` struct ties everything together:
+The `State` struct ties everything together. Each entity gets a **singular** typed handle — this is what you use inside your `Process` function (`state.UserPosition.Get(...)`, not `state.UserPositions`):
 
 ```go
 type State struct {
     HotState       *HotState
     Store          Store
-    Conditions     entityStateHandle[MemoryCondition]
-    UserPositions  entityStateHandle[MemoryUserPosition]
+    UserPosition   UserPositionState  // one handle per entity, named after the entity
     mu             sync.RWMutex
     LastSyncBlock  uint64
     LastPruneBlock uint64
@@ -132,10 +140,10 @@ type State struct {
 ```
 
 Key methods:
-- `SaveSnapshot(blockNumber)` — deep-copies all entity maps into a ring buffer (32 slots)
+- `SaveSnapshot(blockNumber)` — deep-copies all entity maps into a ring buffer (128 slots)
 - `RestoreToBlock(blockNumber)` — finds nearest snapshot ≤ blockNumber, restores maps, purges later snapshots
 - `Commit(ctx, store)` — flushes dirty entities to ClickHouse via native protocol
-- `LoadFromClickHouse(ctx, httpPort, blockNumber)` — restores from ClickHouse at startup (if `LoadStateFromClickHouseFn` is set)
+- `LoadFromClickHouse(ctx, blockNumber)` — restores from ClickHouse at startup
 
 ### `generated/compaction.go`
 
@@ -148,33 +156,42 @@ If codegen detects hot state tables, it generates a `Processor` struct that:
 2. Decodes raw logs into typed events via `UnpackLogWithMeta`
 3. Groups events by block, pushes to ring buffer
 4. Calls `CustomProcessFn` (your user-defined function) per block slot
-5. Auto-commits state at `STATE_SNAPSHOT_INTERVAL` blocks
-6. Auto-prunes ClickHouse at `CLICKHOUSE_PRUNE_INTERVAL` blocks
+5. Auto-commits state on a hybrid cadence: every `SQD_COMMIT_INTERVAL` blocks (default 20000) or `SQD_COMMIT_MAX_INTERVAL` of wall time (default 3s)
+6. Auto-prunes ClickHouse at `CLICKHOUSE_PRUNE_INTERVAL` blocks (default 100000)
 
-## Config: `state` Section
+## Config: `state` Section (Optional)
 
-To connect a custom schema to the hot state system, declare it in `config.yaml`:
+Every struct in `custom_schema.go` automatically becomes a hot-state table with a generated state handle — no config needed. The Uniswap example above works with a `config.yaml` that has no `state:` section at all.
+
+The handle name is the entity name with a leading `Memory` prefix stripped: `UserPositionSchema` → `state.UserPosition`, `MemoryConditionSchema` → `state.Condition`.
+
+Use the `state:` section when you want to override defaults (table name, prefetch keys, handle name) or to back a state entity by an existing *event* table instead of a schema struct:
 
 ```yaml
 state:
-  - name: Conditions
+  - name: Condition
     source_table: memory_conditions
+    key:
+      - ID
     mode: hotstate
-  - name: UserPositions
+  - name: Position
     source_table: memory_user_positions
+    key:
+      - User
+      - TokenID
     mode: hotstate
 ```
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `name` | Yes | Entity name (matches schema struct name minus `Schema`) |
+| `name` | Yes | Entity/handle name (e.g. `Condition` for `MemoryConditionSchema`) |
 | `source_table` | No | Override the table name (default: pluralized+snake_cased) |
 | `mode` | No | `hotstate` or `db_prefetch` (default: `hotstate`) |
 | `key` | No | Override prefetch key fields |
 
-The `state` config drives:
+The `state` config overrides:
 - Prefetch queries (load existing state from ClickHouse before processing)
-- State handle generation in `state.go`
+- State handle naming in `state.go`
 - Ring buffer wiring in `custom_processor.go`
 
 ## Where to Place `custom_schema.go`
@@ -188,7 +205,9 @@ Codegen searches these paths in order (first found wins):
 
 This allows placing the schema either next to config.yaml or in the project root.
 
-## Real-World Example: Polymarket
+## Multi-Entity Example: Polymarket
+
+A larger schema with several entities (see `examples/polymarket/`). Note the `Memory` prefix — it is stripped from the generated handle names (`state.Condition`, `state.UserPosition`, `state.NegRiskEvent`):
 
 ```go
 // pk: ID
@@ -219,4 +238,4 @@ type MemoryNegRiskEventSchema struct {
 }
 ```
 
-These produce three ClickHouse tables (`memory_conditions`, `memory_user_positions`, `memory_negrisk_events`) with full snapshot/restore/commit/prune lifecycle. The custom processor (`custom_processor.go`) runs the PnL logic using these in-memory maps and periodically commits to ClickHouse.
+These produce three ClickHouse tables (`memory_conditions`, `memory_user_positions`, `memory_neg_risk_events`) with full snapshot/restore/commit/prune lifecycle. The custom processor (`custom_processor.go`) runs the PnL logic using these in-memory maps and periodically commits to ClickHouse.

@@ -99,7 +99,7 @@ The generated processor:
 4. Retrieves `ParsedBlock` which wraps decoded events with metadata
 5. Batches blocks in groups of 8 for prefetch (loads existing state from ClickHouse)
 6. Calls `CustomProcessFn(state, block)` for each block
-7. At `STATE_SNAPSHOT_INTERVAL` (default 4000) blocks: saves snapshot, commits hot state to ClickHouse, prunes old rows
+7. Commits hot state to ClickHouse on a hybrid cadence — every `SQD_COMMIT_INTERVAL` blocks (default 20000) or `SQD_COMMIT_MAX_INTERVAL` of wall time (default 3s), whichever fires first — and prunes old rows every `CLICKHOUSE_PRUNE_INTERVAL` blocks (default 100000)
 
 ### `ParsedBlock.EventsIter()`
 
@@ -121,11 +121,10 @@ When custom schema tables are defined, `state` provides:
 
 ```go
 type State struct {
-    HotState       *HotState              // CLOCK cache maps
-    Store          Store                  // ClickHouse native connection
-    // Per-entity handles:
-    Conditions     entityStateHandle[MemoryCondition]
-    UserPositions  entityStateHandle[MemoryUserPosition]
+    HotState       *HotState          // CLOCK cache maps
+    Store          Store              // ClickHouse native connection
+    // One typed handle per entity, named after the entity (singular):
+    UserPosition   UserPositionState
     // ...
 }
 ```
@@ -133,20 +132,20 @@ type State struct {
 **Reading state:**
 
 ```go
-pos, ok := state.UserPositions.Get(key)
+pos, ok := state.UserPosition.Get(e.From)
 if !ok {
-    pos = &MemoryUserPosition{User: user, TokenID: tokenID}
+    pos = &generated.UserPosition{Address: e.From}
 }
 ```
 
 **Writing state:**
 
 ```go
-pos.Balance = new(big.Int).Add(&pos.Balance, &amount)
-state.UserPositions.Save(pos, eventMeta)
+pos.Balance.Add(&pos.Balance, &e.Value)
+state.UserPosition.Save(pos, e.EventMeta)
 ```
 
-The entity state handle (`entityStateHandle[T]`) wraps the hot state map and provides `Get`, `Set`, and `Save` methods. `Save` marks the entity dirty for the next commit cycle.
+The generated entity handle (e.g. `UserPositionState`) wraps the hot state map and provides `Get` (keyed by the schema's `pk:` fields) and `Save` methods. `Save` marks the entity dirty for the next commit cycle.
 
 **Reading existing state from ClickHouse (prefetch):**
 
@@ -154,7 +153,7 @@ The prefetch system automatically queries ClickHouse for entity state matching k
 
 ### Snapshots and Fork Recovery
 
-The `State` maintains a 32-slot ring buffer of deep-copied snapshots, taken every `STATE_SNAPSHOT_INTERVAL` blocks. On fork recovery:
+The `State` maintains a 128-slot ring buffer of deep-copied snapshots. Snapshots are only enabled once the consumer is near the finalized head — below it forks can't happen, so finalized backfill skips them. On fork recovery:
 
 1. `RestoreToBlock(safeBlock)` finds the newest snapshot ≤ `safeBlock`
 2. All entity maps are restored from the snapshot
@@ -211,13 +210,36 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 }
 ```
 
+### Verify: Query a Random Position
+
+Once the indexer has committed state (after the first commit interval), spot-check a random wallet directly in ClickHouse — every row exists because a `Transfer` touched it, so its totals must never be zero:
+
+```bash
+docker exec -it clickhouse clickhouse-client \
+  --password sqd-clickhouse \
+  --query "SELECT hex(address) AS wallet, balance, total_in, total_out
+           FROM case_1_lbtc_event_only.user_positions FINAL
+           ORDER BY rand() LIMIT 1 FORMAT Vertical"
+```
+
+A query test for the whole table — must return `0`; anything else means events are decoded but not reaching the state handles:
+
+```sql
+SELECT count() AS broken_rows
+FROM case_1_lbtc_event_only.user_positions
+FINAL
+WHERE total_in = 0 AND total_out = 0
+```
+
+`FINAL` matters: the table is `ReplacingMergeTree`, so unmerged duplicate rows are deduplicated at query time. See [PNL_EXAMPLE.md](PNL_EXAMPLE.md) for more queries.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STATE_SNAPSHOT_INTERVAL` | `4000` | Blocks between state snapshots/commits |
+| `SQD_COMMIT_INTERVAL` | `20000` | Max blocks between hot-state commits |
+| `SQD_COMMIT_MAX_INTERVAL` | `3s` | Max wall time between hot-state commits |
 | `CLICKHOUSE_PRUNE_INTERVAL` | `100000` | Blocks between compaction prune cycles |
-| `CLICKHOUSE_HTTP_PORT` | `8123` | Port for `LoadFromDatabase` HTTP queries |
 
 ## Without Custom Schema (Legacy Pattern)
 
