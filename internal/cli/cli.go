@@ -221,7 +221,9 @@ func loadEnv(path string) {
 }
 
 func envOrDefault(key, defaultVal string) string {
-	if v := os.Getenv(key); v != "" {
+	// Honor an explicitly-set value even when it is empty (e.g.
+	// CLICKHOUSE_PASSWORD='' means "no password", not "use the default").
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return defaultVal
