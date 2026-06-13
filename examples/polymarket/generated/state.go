@@ -24,6 +24,9 @@ func (h ConditionState) Get(id common.Hash) (*Condition, bool) {
 	}
 	val, ok := h.state.HotState.Conditions.GetByFields(id)
 	if !ok {
+		if h.state.HotState != nil && h.state.HotState.coldAuthoritative {
+			return nil, false
+		}
 		if h.state.Store != nil && h.state.Store.Conn() != nil {
 			key := ConditionsClockKey{ID: id}
 			h.state.HotState.ConditionsResolver.Queue(key)
@@ -111,6 +114,9 @@ func (h MarketState) Get(id common.Hash) (*Market, bool) {
 	}
 	val, ok := h.state.HotState.Markets.GetByFields(id)
 	if !ok {
+		if h.state.HotState != nil && h.state.HotState.coldAuthoritative {
+			return nil, false
+		}
 		if h.state.Store != nil && h.state.Store.Conn() != nil {
 			key := MarketsClockKey{ID: id}
 			h.state.HotState.MarketsResolver.Queue(key)
@@ -153,6 +159,9 @@ func (h NegRiskEventState) Get(id common.Hash) (*NegRiskEvent, bool) {
 	}
 	val, ok := h.state.HotState.NegRiskEvents.GetByFields(id)
 	if !ok {
+		if h.state.HotState != nil && h.state.HotState.coldAuthoritative {
+			return nil, false
+		}
 		if h.state.Store != nil && h.state.Store.Conn() != nil {
 			key := NegRiskEventsClockKey{ID: id}
 			h.state.HotState.NegRiskEventsResolver.Queue(key)
@@ -348,17 +357,29 @@ type memorySnapshot struct {
 const maxSnapshots = 128
 
 // hotCacheCapacity returns the per-entity hot clock-cache capacity.
-// SQD_HOTCACHE_CAP overrides the default (entries per cache, preallocated
-// flat rings — memory is capacity * entry size * number of entities, fixed at
-// startup). Raise it when the live-entity working set exceeds the default and
-// misses fall through to the cold tier's synchronous disk reads.
+// SQD_HOTCACHE_CAP overrides the config.yaml hot_cache_capacity (entries per
+// cache, preallocated flat rings — memory is capacity * entry size * number of
+// entities, fixed at startup). Raise it when the live-entity working set exceeds
+// the default and misses fall through to the cold tier's disk reads.
 func hotCacheCapacity() uint64 {
 	if envVal := os.Getenv("SQD_HOTCACHE_CAP"); envVal != "" {
 		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
 			return parsed
 		}
 	}
-	return DefaultClockCacheCapacity
+	return 2000000
+}
+
+// coldCacheBytes returns the shared cold-tier block-cache budget in bytes, or 0
+// to let the cold tier pick its own default (RAM/8, clamped). SQD_COLDCACHE_MB
+// overrides the config.yaml cold_cache_mb.
+func coldCacheBytes() int64 {
+	if envVal := os.Getenv("SQD_COLDCACHE_MB"); envVal != "" {
+		if parsed, err := strconv.ParseInt(envVal, 10, 64); err == nil && parsed > 0 {
+			return parsed << 20
+		}
+	}
+	return 8192 << 20
 }
 
 func NewState() *State {

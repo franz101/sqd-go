@@ -2,6 +2,15 @@ name: polymarket
 ecosystem: evm
 store_blocks: false
 store_raw_logs: false
+# State cache (generic framework feature). The cold tier overflows evicted
+# hot-state entities — including slice-bearing ones like Condition.payouts — to a
+# local Pebble store (with per-sstable bloom filters) instead of re-querying
+# ClickHouse per block. This kills the resumed-run Condition SELECT storm.
+# RAM is bounded (one shared block cache); on-disk Pebble grows unbounded.
+# Env SQD_COLDCACHE_MB / SQD_HOTCACHE_CAP override these at runtime.
+cold_cache: true
+cold_cache_mb: 8192          # shared off-heap block cache budget (8 GiB)
+hot_cache_capacity: 2000000  # hot ring entries per entity; overflow spills to cold
 # include_metadata: # EXCLUDED BY DEFAULT KEEP DISABLED
 #   - chain_id
 #   - block_hash

@@ -23,6 +23,7 @@ package coldcache
 
 import (
 	"bufio"
+	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -91,22 +92,90 @@ func totalRAMBytes() int64 {
 
 // Store is a single-writer raw byte-slice KV backed by Pebble.
 type Store struct {
-	db    *pebble.DB
-	cache *pebble.Cache
-	dir   string
+	db  *pebble.DB
+	dir string
+	// ownedCache is non-nil only for a single-owner Store (opened via Open); it is
+	// Closed with the Store. Stores opened via OpenWithCache share a caller-owned
+	// SharedCache and leave it alone on Close.
+	ownedCache *SharedCache
 }
 
-// Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
-// cacheBytes/memTableBytes <= 0 fall back to the defaults.
-func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
-	if cacheBytes <= 0 {
-		if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
-			cacheBytes = mb << 20
-		} else {
-			cacheBytes = defaultCacheBytes()
-		}
-		log.Printf("cold tier: block cache %d MiB (override with SQD_COLDCACHE_MB)", cacheBytes>>20)
+// resolveCacheBytes picks the off-heap block-cache budget: explicit bytes if >0,
+// else SQD_COLDCACHE_MB, else defaultCacheBytes() (RAM/8, clamped).
+func resolveCacheBytes(cacheBytes int64) int64 {
+	if cacheBytes > 0 {
+		return cacheBytes
 	}
+	if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
+		return mb << 20
+	}
+	return defaultCacheBytes()
+}
+
+// SharedCache is a Pebble block cache shared by several Stores so total off-heap
+// cache memory is bounded by ONE budget no matter how many cold tiers are open
+// (the hot state has one Store per entity — UserPositions, Conditions, ...). The
+// working sets of every entity compete in a single unified LRU instead of each
+// reserving its own SQD_COLDCACHE_MB. The caller owns it and must Close it after
+// every Store opened against it has been closed.
+type SharedCache struct {
+	cache *pebble.Cache
+	bytes int64
+}
+
+// NewSharedCache allocates a shared block cache sized like Open's default
+// resolution. Off-heap (per pebble/docs/memory.md), so the Go heap is unaffected.
+func NewSharedCache(cacheBytes int64) *SharedCache {
+	b := resolveCacheBytes(cacheBytes)
+	log.Printf("cold tier: shared block cache %d MiB across all entities (override with SQD_COLDCACHE_MB)", b>>20)
+	return &SharedCache{cache: pebble.NewCache(b), bytes: b}
+}
+
+// Bytes reports the cache budget (for logging / RSS accounting).
+func (sc *SharedCache) Bytes() int64 {
+	if sc == nil {
+		return 0
+	}
+	return sc.bytes
+}
+
+// Close releases the caller's reference to the cache. Pebble frees the backing
+// memory once every DB sharing it has also been closed (it is ref-counted).
+func (sc *SharedCache) Close() {
+	if sc == nil || sc.cache == nil {
+		return
+	}
+	sc.cache.Unref()
+	sc.cache = nil
+}
+
+// Open creates a fresh (wiped) single-owner Pebble store at dir with capped
+// off-heap memory. cacheBytes/memTableBytes <= 0 fall back to the defaults. Use
+// OpenWithCache when several stores should share one block-cache budget.
+func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
+	sc := NewSharedCache(cacheBytes)
+	s, err := openStore(dir, sc, memTableBytes)
+	if err != nil {
+		sc.Close()
+		return nil, err
+	}
+	s.ownedCache = sc
+	return s, nil
+}
+
+// OpenWithCache creates a fresh (wiped) Pebble store at dir backed by a shared,
+// caller-owned block cache. The Store does NOT own the cache: Close leaves it
+// intact for the other stores and the owner.
+func OpenWithCache(dir string, sc *SharedCache, memTableBytes uint64) (*Store, error) {
+	if sc == nil || sc.cache == nil {
+		return nil, errClosedSharedCache
+	}
+	return openStore(dir, sc, memTableBytes)
+}
+
+var errClosedSharedCache = errors.New("coldcache: OpenWithCache given a nil/closed SharedCache")
+
+func openStore(dir string, sc *SharedCache, memTableBytes uint64) (*Store, error) {
 	if memTableBytes == 0 {
 		memTableBytes = DefaultMemTableSize
 	}
@@ -119,9 +188,8 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	cache := pebble.NewCache(cacheBytes)
 	opts := &pebble.Options{
-		Cache:                       cache,
+		Cache:                       sc.cache,
 		MemTableSize:                memTableBytes,
 		MemTableStopWritesThreshold: 4,
 		DisableWAL:                  true, // ephemeral: CH is the durable truth
@@ -137,10 +205,9 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 	}
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
-		cache.Unref()
 		return nil, err
 	}
-	return &Store{db: db, cache: cache, dir: dir}, nil
+	return &Store{db: db, dir: dir}, nil
 }
 
 // Put stores value under key. Pebble copies both slices synchronously, so callers
@@ -200,14 +267,17 @@ func (s *Store) Delete(key []byte) error {
 	return s.db.Delete(key, pebble.NoSync)
 }
 
-// Close releases the database and its off-heap cache, then removes the directory.
+// Close releases the database (and, for a single-owner store, its off-heap
+// cache), then removes the directory. Stores sharing a caller-owned SharedCache
+// leave the cache untouched — the owner Closes it once all stores are closed.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
 	err := s.db.Close()
-	if s.cache != nil {
-		s.cache.Unref()
+	if s.ownedCache != nil {
+		s.ownedCache.Close()
+		s.ownedCache = nil
 	}
 	if s.dir != "" {
 		_ = os.RemoveAll(s.dir)

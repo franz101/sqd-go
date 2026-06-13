@@ -4,6 +4,7 @@ package generated
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
@@ -20,6 +21,14 @@ import (
 )
 
 const DefaultClockCacheCapacity uint64 = 100000
+
+// coldBoolByte packs a bool for the cold-tier value codec.
+func coldBoolByte(x bool) byte {
+	if x {
+		return 1
+	}
+	return 0
+}
 
 type MemoryCondition struct {
 	ID               common.Hash    `ch:"name=id;type=FixedString(32)"`
@@ -159,6 +168,9 @@ func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCond
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			if c.cold != nil {
+				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), coldEncodeMemoryCondition(&e.value))
+			}
 			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
@@ -183,14 +195,19 @@ func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCond
 }
 
 func (c *ConditionsClockCache) Get(key ConditionsClockKey) (MemoryCondition, bool) {
-	idx, ok := c.idxLookup(key)
-	if !ok {
-		return MemoryCondition{}, false
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
 	}
-	e := &c.ring[idx]
-	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-		atomic.StoreUint32(&e.referenced, 1)
-		return e.value, true
+	if c.cold != nil {
+		if raw, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			v := coldDecodeMemoryCondition(raw)
+			c.SetByKey(key, v)
+			return v, true
+		}
 	}
 	return MemoryCondition{}, false
 }
@@ -208,6 +225,9 @@ func (c *ConditionsClockCache) Delete(key ConditionsClockKey) bool {
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
 			c.idxUnlink(key)
+			if c.cold != nil {
+				c.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))
+			}
 			e.key = ConditionsClockKey{}
 			e.value = MemoryCondition{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -259,6 +279,67 @@ func (c *ConditionsClockCache) AppendValues(dst []MemoryCondition) []MemoryCondi
 
 func (c *ConditionsClockCache) Len() uint64 {
 	return atomic.LoadUint64(&c.size)
+}
+
+func coldEncodeMemoryCondition(v *MemoryCondition) []byte {
+	b := make([]byte, 0, 135)
+	b = append(b, v.ID[:]...)
+	b = append(b, v.Oracle[:]...)
+	b = append(b, v.QuestionID[:]...)
+	b = append(b, v.OutcomeSlotCount)
+	b = append(b, coldBoolByte(v.Resolved))
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(v.Payouts)))
+	for i := range v.Payouts {
+		bs := v.Payouts[i].Bytes32()
+		b = append(b, bs[:]...)
+	}
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.UpdatedAtBlock))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.UpdatedAt))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.BlockNumber))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.TxIndex))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.LogIndex))
+	b = append(b, coldBoolByte(v.Tombstone))
+	return b
+}
+
+func coldDecodeMemoryCondition(p []byte) MemoryCondition {
+	var v MemoryCondition
+	off := 0
+	copy(v.ID[:], p[off:off+32])
+	off += 32
+	copy(v.Oracle[:], p[off:off+20])
+	off += 20
+	copy(v.QuestionID[:], p[off:off+32])
+	off += 32
+	v.OutcomeSlotCount = p[off]
+	off++
+	v.Resolved = p[off] != 0
+	off++
+	{
+		n := int(binary.LittleEndian.Uint32(p[off : off+4]))
+		off += 4
+		if n > 0 {
+			v.Payouts = make([]uint256.Int, n)
+			for i := 0; i < n; i++ {
+				v.Payouts[i].SetBytes(p[off : off+32])
+				off += 32
+			}
+		}
+	}
+	v.UpdatedAtBlock = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.UpdatedAt = int64(binary.LittleEndian.Uint64(p[off : off+8]))
+	off += 8
+	v.BlockNumber = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.TxIndex = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.LogIndex = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.Tombstone = p[off] != 0
+	off++
+	_ = off
+	return v
 }
 
 type MemoryConditionBatch struct {
@@ -1125,6 +1206,9 @@ func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			if c.cold != nil {
+				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), coldEncodeMemoryMarket(&e.value))
+			}
 			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
@@ -1149,14 +1233,19 @@ func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
 }
 
 func (c *MarketsClockCache) Get(key MarketsClockKey) (MemoryMarket, bool) {
-	idx, ok := c.idxLookup(key)
-	if !ok {
-		return MemoryMarket{}, false
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
 	}
-	e := &c.ring[idx]
-	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-		atomic.StoreUint32(&e.referenced, 1)
-		return e.value, true
+	if c.cold != nil {
+		if raw, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			v := coldDecodeMemoryMarket(raw)
+			c.SetByKey(key, v)
+			return v, true
+		}
 	}
 	return MemoryMarket{}, false
 }
@@ -1174,6 +1263,9 @@ func (c *MarketsClockCache) Delete(key MarketsClockKey) bool {
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
 			c.idxUnlink(key)
+			if c.cold != nil {
+				c.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))
+			}
 			e.key = MarketsClockKey{}
 			e.value = MemoryMarket{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -1225,6 +1317,57 @@ func (c *MarketsClockCache) AppendValues(dst []MemoryMarket) []MemoryMarket {
 
 func (c *MarketsClockCache) Len() uint64 {
 	return atomic.LoadUint64(&c.size)
+}
+
+func coldEncodeMemoryMarket(v *MemoryMarket) []byte {
+	b := make([]byte, 0, 85)
+	b = append(b, v.ID[:]...)
+	b = binary.LittleEndian.AppendUint32(b, v.QuestionCount)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(v.QuestionIDs)))
+	for i := range v.QuestionIDs {
+		b = append(b, v.QuestionIDs[i][:]...)
+	}
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.UpdatedAtBlock))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.UpdatedAt))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.BlockNumber))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.TxIndex))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.LogIndex))
+	b = append(b, coldBoolByte(v.Tombstone))
+	return b
+}
+
+func coldDecodeMemoryMarket(p []byte) MemoryMarket {
+	var v MemoryMarket
+	off := 0
+	copy(v.ID[:], p[off:off+32])
+	off += 32
+	v.QuestionCount = binary.LittleEndian.Uint32(p[off : off+4])
+	off += 4
+	{
+		n := int(binary.LittleEndian.Uint32(p[off : off+4]))
+		off += 4
+		if n > 0 {
+			v.QuestionIDs = make([]common.Hash, n)
+			for i := 0; i < n; i++ {
+				copy(v.QuestionIDs[i][:], p[off:off+32])
+				off += 32
+			}
+		}
+	}
+	v.UpdatedAtBlock = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.UpdatedAt = int64(binary.LittleEndian.Uint64(p[off : off+8]))
+	off += 8
+	v.BlockNumber = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.TxIndex = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.LogIndex = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.Tombstone = p[off] != 0
+	off++
+	_ = off
+	return v
 }
 
 type MemoryMarketBatch struct {
@@ -1570,6 +1713,9 @@ func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value Memo
 				atomic.StoreUint32(&e.inUse, 1)
 				continue
 			}
+			if c.cold != nil {
+				c.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), coldEncodeMemoryNegRiskEvent(&e.value))
+			}
 			atomic.AddUint64(&c.evictions, 1)
 			c.idxUnlink(e.key)
 			e.key = key
@@ -1594,14 +1740,19 @@ func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value Memo
 }
 
 func (c *NegRiskEventsClockCache) Get(key NegRiskEventsClockKey) (MemoryNegRiskEvent, bool) {
-	idx, ok := c.idxLookup(key)
-	if !ok {
-		return MemoryNegRiskEvent{}, false
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			return e.value, true
+		}
 	}
-	e := &c.ring[idx]
-	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
-		atomic.StoreUint32(&e.referenced, 1)
-		return e.value, true
+	if c.cold != nil {
+		if raw, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+			v := coldDecodeMemoryNegRiskEvent(raw)
+			c.SetByKey(key, v)
+			return v, true
+		}
 	}
 	return MemoryNegRiskEvent{}, false
 }
@@ -1619,6 +1770,9 @@ func (c *NegRiskEventsClockCache) Delete(key NegRiskEventsClockKey) bool {
 	if atomic.CompareAndSwapUint32(&e.inUse, 1, 0) {
 		if e.key == key {
 			c.idxUnlink(key)
+			if c.cold != nil {
+				c.cold.Delete(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key)))
+			}
 			e.key = NegRiskEventsClockKey{}
 			e.value = MemoryNegRiskEvent{}
 			atomic.StoreUint32(&e.referenced, 0)
@@ -1670,6 +1824,57 @@ func (c *NegRiskEventsClockCache) AppendValues(dst []MemoryNegRiskEvent) []Memor
 
 func (c *NegRiskEventsClockCache) Len() uint64 {
 	return atomic.LoadUint64(&c.size)
+}
+
+func coldEncodeMemoryNegRiskEvent(v *MemoryNegRiskEvent) []byte {
+	b := make([]byte, 0, 85)
+	b = append(b, v.ID[:]...)
+	b = binary.LittleEndian.AppendUint32(b, v.QuestionCount)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(v.QuestionIDs)))
+	for i := range v.QuestionIDs {
+		b = append(b, v.QuestionIDs[i][:]...)
+	}
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.UpdatedAtBlock))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.UpdatedAt))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.BlockNumber))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.TxIndex))
+	b = binary.LittleEndian.AppendUint64(b, uint64(v.LogIndex))
+	b = append(b, coldBoolByte(v.Tombstone))
+	return b
+}
+
+func coldDecodeMemoryNegRiskEvent(p []byte) MemoryNegRiskEvent {
+	var v MemoryNegRiskEvent
+	off := 0
+	copy(v.ID[:], p[off:off+32])
+	off += 32
+	v.QuestionCount = binary.LittleEndian.Uint32(p[off : off+4])
+	off += 4
+	{
+		n := int(binary.LittleEndian.Uint32(p[off : off+4]))
+		off += 4
+		if n > 0 {
+			v.QuestionIDs = make([]common.Hash, n)
+			for i := 0; i < n; i++ {
+				copy(v.QuestionIDs[i][:], p[off:off+32])
+				off += 32
+			}
+		}
+	}
+	v.UpdatedAtBlock = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.UpdatedAt = int64(binary.LittleEndian.Uint64(p[off : off+8]))
+	off += 8
+	v.BlockNumber = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.TxIndex = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.LogIndex = binary.LittleEndian.Uint64(p[off : off+8])
+	off += 8
+	v.Tombstone = p[off] != 0
+	off++
+	_ = off
+	return v
 }
 
 type MemoryNegRiskEventBatch struct {
@@ -2706,6 +2911,10 @@ type HotState struct {
 	coldDir           string
 	coldCacheBytes    int64
 	coldMemTableBytes uint64
+	// coldCache is the single off-heap block cache shared by every entity's
+	// cold tier, so total cold-cache RAM is bounded by ONE budget regardless of
+	// how many state entities are persisted.
+	coldCache *coldcache.SharedCache
 }
 
 func NewHotState(capacity uint64) *HotState {
@@ -2745,11 +2954,29 @@ func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes in
 	if s == nil {
 		return nil
 	}
+	// One shared block cache for every entity's cold tier: total off-heap
+	// cache RAM is bounded by a single budget, the on-disk Pebble stores grow
+	// unbounded.
+	s.coldCache = coldcache.NewSharedCache(cacheBytes)
 	var err error
-	if s.UserPositions.cold, err = coldcache.Open(filepath.Join(dir, "UserPositions"), cacheBytes, memTableBytes); err != nil {
+	if s.Conditions.cold, err = coldcache.OpenWithCache(filepath.Join(dir, "Conditions"), s.coldCache, memTableBytes); err != nil {
+		_ = s.CloseColdCache()
 		return err
 	}
-	if s.FixedProductMarketMakers.cold, err = coldcache.Open(filepath.Join(dir, "FixedProductMarketMakers"), cacheBytes, memTableBytes); err != nil {
+	if s.UserPositions.cold, err = coldcache.OpenWithCache(filepath.Join(dir, "UserPositions"), s.coldCache, memTableBytes); err != nil {
+		_ = s.CloseColdCache()
+		return err
+	}
+	if s.Markets.cold, err = coldcache.OpenWithCache(filepath.Join(dir, "Markets"), s.coldCache, memTableBytes); err != nil {
+		_ = s.CloseColdCache()
+		return err
+	}
+	if s.NegRiskEvents.cold, err = coldcache.OpenWithCache(filepath.Join(dir, "NegRiskEvents"), s.coldCache, memTableBytes); err != nil {
+		_ = s.CloseColdCache()
+		return err
+	}
+	if s.FixedProductMarketMakers.cold, err = coldcache.OpenWithCache(filepath.Join(dir, "FixedProductMarketMakers"), s.coldCache, memTableBytes); err != nil {
+		_ = s.CloseColdCache()
 		return err
 	}
 	s.coldAuthoritative = authoritative
@@ -2780,17 +3007,41 @@ func (s *HotState) CloseColdCache() error {
 		return nil
 	}
 	var firstErr error
+	if s.Conditions.cold != nil {
+		if e := s.Conditions.cold.Close(); e != nil && firstErr == nil {
+			firstErr = e
+		}
+		s.Conditions.cold = nil
+	}
 	if s.UserPositions.cold != nil {
 		if e := s.UserPositions.cold.Close(); e != nil && firstErr == nil {
 			firstErr = e
 		}
 		s.UserPositions.cold = nil
 	}
+	if s.Markets.cold != nil {
+		if e := s.Markets.cold.Close(); e != nil && firstErr == nil {
+			firstErr = e
+		}
+		s.Markets.cold = nil
+	}
+	if s.NegRiskEvents.cold != nil {
+		if e := s.NegRiskEvents.cold.Close(); e != nil && firstErr == nil {
+			firstErr = e
+		}
+		s.NegRiskEvents.cold = nil
+	}
 	if s.FixedProductMarketMakers.cold != nil {
 		if e := s.FixedProductMarketMakers.cold.Close(); e != nil && firstErr == nil {
 			firstErr = e
 		}
 		s.FixedProductMarketMakers.cold = nil
+	}
+	// Release the shared block cache only after every store sharing it is
+	// closed (Pebble ref-counts it).
+	if s.coldCache != nil {
+		s.coldCache.Close()
+		s.coldCache = nil
 	}
 	s.coldAuthoritative = false
 	return firstErr

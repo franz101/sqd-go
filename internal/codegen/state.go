@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"bytes"
+	"fmt"
 	"go/format"
 	"sort"
 	"strings"
@@ -75,21 +76,44 @@ package generated
 	b.WriteString("}\n\n")
 	b.WriteString("const maxSnapshots = 128\n\n")
 
-	b.WriteString(`// hotCacheCapacity returns the per-entity hot clock-cache capacity.
-// SQD_HOTCACHE_CAP overrides the default (entries per cache, preallocated
-// flat rings — memory is capacity * entry size * number of entities, fixed at
-// startup). Raise it when the live-entity working set exceeds the default and
-// misses fall through to the cold tier's synchronous disk reads.
+	// Precedence for the state-cache sizing knobs is env > config.yaml > built-in
+	// default, so an operator can always override the declared config at runtime.
+	hotDefault := "DefaultClockCacheCapacity"
+	if cfg != nil && cfg.HotCacheCapacity != nil && *cfg.HotCacheCapacity > 0 {
+		hotDefault = fmt.Sprintf("%d", *cfg.HotCacheCapacity)
+	}
+	coldDefault := "0" // 0 => coldcache resolves its own default (RAM/8, clamped)
+	if cfg != nil && cfg.ColdCacheMB != nil && *cfg.ColdCacheMB > 0 {
+		coldDefault = fmt.Sprintf("%d<<20", *cfg.ColdCacheMB)
+	}
+
+	fmt.Fprintf(&b, `// hotCacheCapacity returns the per-entity hot clock-cache capacity.
+// SQD_HOTCACHE_CAP overrides the config.yaml hot_cache_capacity (entries per
+// cache, preallocated flat rings — memory is capacity * entry size * number of
+// entities, fixed at startup). Raise it when the live-entity working set exceeds
+// the default and misses fall through to the cold tier's disk reads.
 func hotCacheCapacity() uint64 {
 	if envVal := os.Getenv("SQD_HOTCACHE_CAP"); envVal != "" {
 		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
 			return parsed
 		}
 	}
-	return DefaultClockCacheCapacity
+	return %[1]s
 }
 
-`)
+// coldCacheBytes returns the shared cold-tier block-cache budget in bytes, or 0
+// to let the cold tier pick its own default (RAM/8, clamped). SQD_COLDCACHE_MB
+// overrides the config.yaml cold_cache_mb.
+func coldCacheBytes() int64 {
+	if envVal := os.Getenv("SQD_COLDCACHE_MB"); envVal != "" {
+		if parsed, err := strconv.ParseInt(envVal, 10, 64); err == nil && parsed > 0 {
+			return parsed << 20
+		}
+	}
+	return %[2]s
+}
+
+`, hotDefault, coldDefault)
 	b.WriteString("func NewState() *State {\n")
 	b.WriteString("\ts := &State{HotState: NewHotState(hotCacheCapacity()), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}\n")
 	for _, handle := range handles {

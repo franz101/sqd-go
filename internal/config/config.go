@@ -23,7 +23,16 @@ type Config struct {
 	StoreRawLogs    *bool                  `yaml:"store_raw_logs,omitempty" json:"store_raw_logs,omitempty"`
 	ProtoMode       *bool                  `yaml:"proto_mode,omitempty" json:"proto_mode,omitempty"`
 	ColdCache       *bool                  `yaml:"cold_cache,omitempty" json:"cold_cache,omitempty"`
-	IncludeMetadata []string               `yaml:"include_metadata,omitempty" json:"include_metadata,omitempty"`
+	// ColdCacheMB bounds the shared off-heap Pebble block cache for the cold tier
+	// (one budget across every state entity). Env SQD_COLDCACHE_MB overrides it;
+	// unset falls back to RAM/8 clamped. On-disk Pebble growth is uncapped.
+	ColdCacheMB *int64 `yaml:"cold_cache_mb,omitempty" json:"cold_cache_mb,omitempty"`
+	// HotCacheCapacity is the per-entity hot clock-cache size in entries
+	// (preallocated). Env SQD_HOTCACHE_CAP overrides it; unset uses the built-in
+	// default. With the cold tier on, overflow spills to disk rather than
+	// re-querying ClickHouse, so this can stay modest to bound hot RAM.
+	HotCacheCapacity *uint64 `yaml:"hot_cache_capacity,omitempty" json:"hot_cache_capacity,omitempty"`
+	IncludeMetadata  []string               `yaml:"include_metadata,omitempty" json:"include_metadata,omitempty"`
 	ExcludeMetadata []map[string]string    `yaml:"exclude_metadata,omitempty" json:"exclude_metadata,omitempty"`
 	State           []StateConfig          `yaml:"state,omitempty" json:"state,omitempty"`
 }

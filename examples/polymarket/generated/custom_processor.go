@@ -708,7 +708,7 @@ func (p *Processor) EnableColdCache(dir string, authoritative bool) error {
 	if p == nil || p.State == nil || p.State.HotState == nil {
 		return nil
 	}
-	return p.State.HotState.EnableColdCache(dir, authoritative, 0, 0)
+	return p.State.HotState.EnableColdCache(dir, authoritative, coldCacheBytes(), 0)
 }
 
 // CloseColdCache releases the cold tier (and its off-heap Pebble buffers). Called
