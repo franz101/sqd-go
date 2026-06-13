@@ -218,9 +218,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					meta := EventMeta{
 						BlockNumber:      blockNum,
 						BlockTimestamp:   time.Unix(int64(blockTimestamp), 0).UTC(),
-						BlockHash:        common.HexToHash(blockHash),
-						ContractAddress:  common.HexToAddress(address),
-						TransactionHash:  common.HexToHash(txHash),
+						BlockHash:        abiunpack.DecodeTopicHash(blockHash),
+						ContractAddress:  abiunpack.AddressFromHex(address),
+						TransactionHash:  abiunpack.DecodeTopicHash(txHash),
 						TransactionIndex: txIndex,
 						LogIndex:         logIndex,
 					}

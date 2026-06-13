@@ -81,7 +81,11 @@ func init() {
 
 // Constants
 var (
-	fiftyCents                     = decimal.NewFromFloat(0.5)
+	fiftyCents = decimal.NewFromFloat(0.5)
+	// fiftyCentsD256 is 0.5 at scale 18 (exact: 5e17). Splits and merges price
+	// every outcome at 0.5, so the native handlers reuse this constant instead
+	// of round-tripping the shopspring fiftyCents through fromDecimal per event.
+	fiftyCentsD256, _              = protomath.ParseDecimal256("0.5", protomath.Decimal256Scale18)
 	negRiskAdapterAddr             = common.HexToAddress(generated.NegRiskAdapterMarketPreparedAddress)
 	exchangeAddr                   = common.HexToAddress(generated.ExchangeOrderFilledAddress)
 	negRiskExchangeAddr            = common.HexToAddress(generated.NegRiskExchangeOrderFilledAddress)
@@ -735,13 +739,21 @@ func handleFPMMBuy(state *generated.State, ev *generated.FixedProductMarketMaker
 		return
 	}
 
-	// Divide by 1e6 to convert raw outcome tokens to "full stake" units
-	amountRaw := Uint256ToDecimal(ev.OutcomeTokensBought)
-	amount := amountRaw.Div(decimal.NewFromInt(1e6))
-	// Price calculation: investmentAmount / amount (in stake units) gives USDC per stake
-	price := CollateralToDecimal(ev.InvestmentAmount).Div(amount)
 	posID := getFixedProductMarketMakerPositionID(fpmm, outcomeIndex)
-	updateUserPositionWithBuy(state, ev.Buyer, posID, price, amount, decimal.Zero, ev.EventMeta)
+	// Native: amount = tokens/1e6, price = (investment/1e6)/amount. The 1e6
+	// cancels in the ratio, matching the shopspring path to scale 18.
+	amount, okA := usdcRawToDec18(&ev.OutcomeTokensBought)
+	invest, okI := usdcRawToDec18(&ev.InvestmentAmount)
+	if okA && okI && !amount.IsZero() {
+		if price, ok := invest.Div(amount, protomath.Decimal256Scale18); ok {
+			updateUserPositionWithBuyD256(state, ev.Buyer, posID, price, amount, protomath.Decimal256{}, ev.EventMeta)
+			return
+		}
+	}
+	// Unreachable overflow fallback: shopspring 1e6 rescale.
+	amountD := Uint256ToDecimal(ev.OutcomeTokensBought).Div(decimal.NewFromInt(1e6))
+	priceD := CollateralToDecimal(ev.InvestmentAmount).Div(amountD)
+	updateUserPositionWithBuy(state, ev.Buyer, posID, priceD, amountD, decimal.Zero, ev.EventMeta)
 }
 
 func handleFPMMSell(state *generated.State, ev *generated.FixedProductMarketMakerFPMMSell, fpmmAddr common.Address) {
@@ -757,13 +769,19 @@ func handleFPMMSell(state *generated.State, ev *generated.FixedProductMarketMake
 		return
 	}
 
-	// Divide by 1e6 to convert raw outcome tokens to "full stake" units
-	amountRaw := Uint256ToDecimal(ev.OutcomeTokensSold)
-	amount := amountRaw.Div(decimal.NewFromInt(1e6))
-	// Price calculation: returnAmount / amount (in stake units) gives USDC per stake
-	price := CollateralToDecimal(ev.ReturnAmount).Div(amount)
 	posID := getFixedProductMarketMakerPositionID(fpmm, outcomeIndex)
-	updateUserPositionWithSell(state, ev.Seller, posID, price, amount, ev.EventMeta)
+	amount, okA := usdcRawToDec18(&ev.OutcomeTokensSold)
+	ret, okR := usdcRawToDec18(&ev.ReturnAmount)
+	if okA && okR && !amount.IsZero() {
+		if price, ok := ret.Div(amount, protomath.Decimal256Scale18); ok {
+			updateUserPositionWithSellD256(state, ev.Seller, posID, price, amount, ev.EventMeta)
+			return
+		}
+	}
+	// Unreachable overflow fallback: shopspring 1e6 rescale.
+	amountD := Uint256ToDecimal(ev.OutcomeTokensSold).Div(decimal.NewFromInt(1e6))
+	priceD := CollateralToDecimal(ev.ReturnAmount).Div(amountD)
+	updateUserPositionWithSell(state, ev.Seller, posID, priceD, amountD, ev.EventMeta)
 }
 
 func handleFPMMFundingAdded(state *generated.State, ev *generated.FixedProductMarketMakerFPMMFundingAdded, fpmmAddr common.Address) {
@@ -783,8 +801,60 @@ func handleFPMMFundingAdded(state *generated.State, ev *generated.FixedProductMa
 	}
 	largerOutcomeIndex := 1 - sendbackOutcomeIndex
 
+	// Compute every value in Decimal256 first (no state mutation), so any
+	// unreachable overflow falls back to the shopspring handler cleanly.
+	scale := protomath.Decimal256Scale18
+	var diff uint256.Int
+	diff.Sub(&ev.AmountsAdded[largerOutcomeIndex], &ev.AmountsAdded[sendbackOutcomeIndex])
+	amount, okA := usdcRawToDec18(&diff)
+	price, okP := computeFpmmPriceD256(ev.AmountsAdded, sendbackOutcomeIndex)
+	if !okA || !okP {
+		handleFPMMFundingAddedShop(state, ev, fpmm)
+		return
+	}
+	posID := getFixedProductMarketMakerPositionID(fpmm, sendbackOutcomeIndex)
+
+	if ev.SharesMinted.IsZero() {
+		updateUserPositionWithBuyD256(state, ev.Funder, posID, price, amount, protomath.Decimal256{}, ev.EventMeta)
+		return
+	}
+
+	// totalSpend is max(amountsAdded) in USDC's 1e6 collateral scale.
+	totalSpendWei := ev.AmountsAdded[0]
+	if ev.AmountsAdded[1].Gt(&totalSpendWei) {
+		totalSpendWei = ev.AmountsAdded[1]
+	}
+	totalSpend, okT := usdcRawToDec18(&totalSpendWei)
+	sharesMinted, okS := rawIntToDec18(&ev.SharesMinted)
+	tokenCost, okTC := amount.Mul(price, scale)
+	if !okT || !okS || !okTC {
+		handleFPMMFundingAddedShop(state, ev, fpmm)
+		return
+	}
+	lpShareCost, okL := totalSpend.Sub(tokenCost)
+	if !okL {
+		handleFPMMFundingAddedShop(state, ev, fpmm)
+		return
+	}
+	lpSharePrice, okLP := lpShareCost.Div(sharesMinted, scale)
+	if !okLP {
+		handleFPMMFundingAddedShop(state, ev, fpmm)
+		return
+	}
+	updateUserPositionWithBuyD256(state, ev.Funder, posID, price, amount, protomath.Decimal256{}, ev.EventMeta)
+	updateUserPositionWithBuyD256(state, ev.Funder, uint256FromAddress(fpmm.ID), lpSharePrice, sharesMinted, protomath.Decimal256{}, ev.EventMeta)
+}
+
+// handleFPMMFundingAddedShop is the legacy shopspring fallback for the
+// unreachable Decimal256 overflow path.
+func handleFPMMFundingAddedShop(state *generated.State, ev *generated.FixedProductMarketMakerFPMMFundingAdded, fpmm *generated.FixedProductMarketMaker) {
+	sendbackOutcomeIndex := uint8(0)
+	if ev.AmountsAdded[0].Gt(&ev.AmountsAdded[1]) {
+		sendbackOutcomeIndex = 1
+	}
+	largerOutcomeIndex := 1 - sendbackOutcomeIndex
+
 	amountRaw := new(uint256.Int).Sub(&ev.AmountsAdded[largerOutcomeIndex], &ev.AmountsAdded[sendbackOutcomeIndex])
-	// Divide by 1e6 to convert to "full stake" units
 	amount := Uint256ToDecimal(*amountRaw).Div(decimal.NewFromInt(1e6))
 	price := computeFpmmPriceDecimal(ev.AmountsAdded, sendbackOutcomeIndex)
 	posID := getFixedProductMarketMakerPositionID(fpmm, sendbackOutcomeIndex)
@@ -794,7 +864,6 @@ func handleFPMMFundingAdded(state *generated.State, ev *generated.FixedProductMa
 		return
 	}
 
-	// totalSpend is max(amountsAdded) in USDC's 1e6 collateral scale.
 	totalSpendWei := ev.AmountsAdded[0]
 	if ev.AmountsAdded[1].Gt(&totalSpendWei) {
 		totalSpendWei = ev.AmountsAdded[1]
@@ -815,10 +884,62 @@ func handleFPMMFundingRemoved(state *generated.State, ev *generated.FixedProduct
 		return
 	}
 
+	// Compute both outcome legs (price, amount, running tokensCost) in
+	// Decimal256 before any state mutation, so the overflow fallback is clean.
+	scale := protomath.Decimal256Scale18
+	var tokenPrice, tokenAmount [2]protomath.Decimal256
+	var tokensCost protomath.Decimal256
+	for i := uint8(0); i < 2; i++ {
+		p, okP := computeFpmmPriceD256(ev.AmountsRemoved, i)
+		a, okA := usdcRawToDec18(&ev.AmountsRemoved[i])
+		cost, okC := p.Mul(a, scale)
+		if !okP || !okA || !okC {
+			handleFPMMFundingRemovedShop(state, ev, fpmm)
+			return
+		}
+		nc, okN := tokensCost.Add(cost)
+		if !okN {
+			handleFPMMFundingRemovedShop(state, ev, fpmm)
+			return
+		}
+		tokenPrice[i], tokenAmount[i], tokensCost = p, a, nc
+	}
+
+	lpPosID := uint256FromAddress(fpmm.ID)
+	hasShares := !ev.SharesBurnt.IsZero()
+	var lpSalePrice, sharesBurnt protomath.Decimal256
+	if hasShares {
+		collRemoved, okCR := usdcRawToDec18(&ev.CollateralRemovedFromFeePool)
+		sb, okSB := rawIntToDec18(&ev.SharesBurnt)
+		net, okNet := collRemoved.Sub(tokensCost)
+		if !okCR || !okSB || !okNet {
+			handleFPMMFundingRemovedShop(state, ev, fpmm)
+			return
+		}
+		lp, okLP := net.Div(sb, scale)
+		if !okLP {
+			handleFPMMFundingRemovedShop(state, ev, fpmm)
+			return
+		}
+		lpSalePrice, sharesBurnt = lp, sb
+	}
+
+	for i := uint8(0); i < 2; i++ {
+		posID := getFixedProductMarketMakerPositionID(fpmm, i)
+		updateUserPositionWithBuyD256(state, ev.Funder, posID, tokenPrice[i], tokenAmount[i], protomath.Decimal256{}, ev.EventMeta)
+	}
+	// updateUserPositionWithSellD256 is a no-op when the LP position is absent.
+	if hasShares {
+		updateUserPositionWithSellD256(state, ev.Funder, lpPosID, lpSalePrice, sharesBurnt, ev.EventMeta)
+	}
+}
+
+// handleFPMMFundingRemovedShop is the legacy shopspring fallback for the
+// unreachable Decimal256 overflow path.
+func handleFPMMFundingRemovedShop(state *generated.State, ev *generated.FixedProductMarketMakerFPMMFundingRemoved, fpmm *generated.FixedProductMarketMaker) {
 	tokensCost := decimal.Zero
 	for i := uint8(0); i < 2; i++ {
 		tokenPrice := computeFpmmPriceDecimal(ev.AmountsRemoved, i)
-		// Divide by 1e6 to convert to "full stake" units
 		tokenAmount := Uint256ToDecimal(ev.AmountsRemoved[i]).Div(decimal.NewFromInt(1e6))
 		tokensCost = tokensCost.Add(tokenPrice.Mul(tokenAmount))
 		posID := getFixedProductMarketMakerPositionID(fpmm, i)
@@ -831,7 +952,6 @@ func handleFPMMFundingRemoved(state *generated.State, ev *generated.FixedProduct
 
 	lpSalePrice := CollateralToDecimal(ev.CollateralRemovedFromFeePool).Sub(tokensCost).Div(Uint256ToDecimal(ev.SharesBurnt))
 	lpPosID := uint256FromAddress(fpmm.ID)
-	// Skip LP share sell if position doesn't exist in hot state
 	up := getUserPosition(state, ev.Funder, lpPosID)
 	if up != nil {
 		updateUserPositionWithSell(state, ev.Funder, lpPosID, lpSalePrice, Uint256ToDecimal(ev.SharesBurnt), ev.EventMeta)
@@ -847,6 +967,25 @@ func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokens
 		return
 	}
 
+	// Native scale-18 amount (raw / 1e6); fall back to shopspring on the
+	// unreachable overflow. Price is the constant 0.5 for every outcome.
+	amount, okA := usdcRawToDec18(&ev.Amount)
+	if !okA {
+		handlePositionSplitShop(state, ev)
+		return
+	}
+	if amount.IsZero() {
+		return
+	}
+
+	for outcomeIndex := uint8(0); outcomeIndex < 2; outcomeIndex++ {
+		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[outcomeIndex])
+		posID := getPositionID(ev.CollateralToken, collID)
+		updateUserPositionWithBuyD256(state, ev.Stakeholder, posID, fiftyCentsD256, amount, protomath.Decimal256{}, ev.EventMeta)
+	}
+}
+
+func handlePositionSplitShop(state *generated.State, ev *generated.ConditionalTokensPositionSplit) {
 	// Divide by 1e6 to convert to "full stake" units
 	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	if amount.IsZero() {
@@ -854,8 +993,7 @@ func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokens
 	}
 
 	for outcomeIndex := uint8(0); outcomeIndex < 2; outcomeIndex++ {
-		indexSet := new(uint256.Int).Lsh(uint256.NewInt(1), uint(outcomeIndex))
-		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSet.ToBig())
+		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[outcomeIndex])
 		posID := getPositionID(ev.CollateralToken, collID)
 		updateUserPositionWithBuy(state, ev.Stakeholder, posID, fiftyCents, amount, decimal.Zero, ev.EventMeta)
 	}
@@ -870,6 +1008,23 @@ func handlePositionsMerge(state *generated.State, ev *generated.ConditionalToken
 		return
 	}
 
+	amount, okA := usdcRawToDec18(&ev.Amount)
+	if !okA {
+		handlePositionsMergeShop(state, ev)
+		return
+	}
+	if amount.IsZero() {
+		return
+	}
+
+	for outcomeIndex := uint8(0); outcomeIndex < 2; outcomeIndex++ {
+		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[outcomeIndex])
+		posID := getPositionID(ev.CollateralToken, collID)
+		updateUserPositionWithSellD256(state, ev.Stakeholder, posID, fiftyCentsD256, amount, ev.EventMeta)
+	}
+}
+
+func handlePositionsMergeShop(state *generated.State, ev *generated.ConditionalTokensPositionsMerge) {
 	// Divide by 1e6 to convert to "full stake" units
 	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	if amount.IsZero() {
@@ -877,11 +1032,8 @@ func handlePositionsMerge(state *generated.State, ev *generated.ConditionalToken
 	}
 
 	for outcomeIndex := uint8(0); outcomeIndex < 2; outcomeIndex++ {
-		indexSet := new(uint256.Int).Lsh(uint256.NewInt(1), uint(outcomeIndex))
-		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSet.ToBig())
+		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[outcomeIndex])
 		posID := getPositionID(ev.CollateralToken, collID)
-
-
 		updateUserPositionWithSell(state, ev.Stakeholder, posID, fiftyCents, amount, ev.EventMeta)
 	}
 }
@@ -902,12 +1054,16 @@ func handleNegRiskPositionSplit(state *generated.State, ev *generated.NegRiskAda
 		state.Condition.Save(cond, ev.EventMeta)
 	}
 
-	// Divide by 1e6 to convert to "full stake" units
-	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	posIDYes := getNegRiskPositionIDByCondition(ev.ConditionID, 0)
-	updateUserPositionWithBuy(state, ev.Stakeholder, posIDYes, fiftyCents, amount, decimal.Zero, ev.EventMeta)
-
 	posIDNo := getNegRiskPositionIDByCondition(ev.ConditionID, 1)
+	if amount, ok := usdcRawToDec18(&ev.Amount); ok {
+		updateUserPositionWithBuyD256(state, ev.Stakeholder, posIDYes, fiftyCentsD256, amount, protomath.Decimal256{}, ev.EventMeta)
+		updateUserPositionWithBuyD256(state, ev.Stakeholder, posIDNo, fiftyCentsD256, amount, protomath.Decimal256{}, ev.EventMeta)
+		return
+	}
+	// Unreachable overflow fallback: shopspring 1e6 rescale.
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
+	updateUserPositionWithBuy(state, ev.Stakeholder, posIDYes, fiftyCents, amount, decimal.Zero, ev.EventMeta)
 	updateUserPositionWithBuy(state, ev.Stakeholder, posIDNo, fiftyCents, amount, decimal.Zero, ev.EventMeta)
 }
 
@@ -927,12 +1083,16 @@ func handleNegRiskPositionsMerge(state *generated.State, ev *generated.NegRiskAd
 		state.Condition.Save(cond, ev.EventMeta)
 	}
 
-	// Divide by 1e6 to convert to "full stake" units
-	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
 	posIDYes := getNegRiskPositionIDByCondition(ev.ConditionID, 0)
-	updateUserPositionWithSell(state, ev.Stakeholder, posIDYes, fiftyCents, amount, ev.EventMeta)
-
 	posIDNo := getNegRiskPositionIDByCondition(ev.ConditionID, 1)
+	if amount, ok := usdcRawToDec18(&ev.Amount); ok {
+		updateUserPositionWithSellD256(state, ev.Stakeholder, posIDYes, fiftyCentsD256, amount, ev.EventMeta)
+		updateUserPositionWithSellD256(state, ev.Stakeholder, posIDNo, fiftyCentsD256, amount, ev.EventMeta)
+		return
+	}
+	// Unreachable overflow fallback: shopspring 1e6 rescale.
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
+	updateUserPositionWithSell(state, ev.Stakeholder, posIDYes, fiftyCents, amount, ev.EventMeta)
 	updateUserPositionWithSell(state, ev.Stakeholder, posIDNo, fiftyCents, amount, ev.EventMeta)
 }
 
@@ -1094,21 +1254,27 @@ func handlePayoutRedemptionCTF(state *generated.State, ev *generated.Conditional
 		return
 	}
 
-	denomDec, ok := calculatePayoutDenominator(cond)
+	denom, ok := payoutDenominatorU256(cond)
 	if !ok {
 		return
 	}
 
 	for i := range cond.Payouts {
-		indexSet := new(uint256.Int).Lsh(uint256.NewInt(1), uint(i))
-		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSet.ToBig())
+		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[i])
 		posID := getPositionID(ev.CollateralToken, collID)
 
-		price := Uint256ToDecimal(cond.Payouts[i]).Div(denomDec)
 		up := getUserPosition(state, ev.Redeemer, posID)
-		if up != nil && !toDecimal(up.Amount).IsZero() {
-			updateUserPositionWithSell(state, ev.Redeemer, posID, price, toDecimal(up.Amount), ev.EventMeta)
+		if up == nil || up.Amount.IsZero() {
+			continue
 		}
+		// price = payouts[i] / denom; the position is sold in full (amount =
+		// up.Amount, already Decimal256 — no conversion).
+		if price, okP := ratioDec18(&cond.Payouts[i], &denom); okP {
+			updateUserPositionWithSellD256(state, ev.Redeemer, posID, price, up.Amount, ev.EventMeta)
+			continue
+		}
+		priceD := Uint256ToDecimal(cond.Payouts[i]).Div(Uint256ToDecimal(denom))
+		updateUserPositionWithSell(state, ev.Redeemer, posID, priceD, toDecimal(up.Amount), ev.EventMeta)
 	}
 }
 
@@ -1118,7 +1284,7 @@ func handlePayoutRedemptionNR(state *generated.State, ev *generated.NegRiskAdapt
 		return
 	}
 
-	denomDec, ok := calculatePayoutDenominator(cond)
+	denom, ok := payoutDenominatorU256(cond)
 	if !ok {
 		return
 	}
@@ -1126,9 +1292,15 @@ func handlePayoutRedemptionNR(state *generated.State, ev *generated.NegRiskAdapt
 	for i := uint8(0); i < 2; i++ {
 		if int(i) < len(ev.Amounts) && int(i) < len(cond.Payouts) {
 			posID := getNegRiskPositionIDByCondition(ev.ConditionID, i)
-			amount := Uint256ToDecimal(ev.Amounts[i]).Div(decimal.NewFromInt(1e6))
-			price := Uint256ToDecimal(cond.Payouts[i]).Div(denomDec)
-			updateUserPositionWithSell(state, ev.Redeemer, posID, price, amount, ev.EventMeta)
+			amount, okA := usdcRawToDec18(&ev.Amounts[i])
+			price, okP := ratioDec18(&cond.Payouts[i], &denom)
+			if okA && okP {
+				updateUserPositionWithSellD256(state, ev.Redeemer, posID, price, amount, ev.EventMeta)
+				continue
+			}
+			amountD := Uint256ToDecimal(ev.Amounts[i]).Div(decimal.NewFromInt(1e6))
+			priceD := Uint256ToDecimal(cond.Payouts[i]).Div(Uint256ToDecimal(denom))
+			updateUserPositionWithSell(state, ev.Redeemer, posID, priceD, amountD, ev.EventMeta)
 		}
 	}
 }
@@ -1182,7 +1354,23 @@ func uint256FromAddress(addr common.Address) uint256.Int {
 	return out
 }
 
-var oneE12U256 = uint256.NewInt(1_000_000_000_000)
+var (
+	oneE12U256 = uint256.NewInt(1_000_000_000_000)
+	oneE18U256 = uint256.NewInt(1_000_000_000_000_000_000)
+)
+
+// indexSetBig holds the constant index-set masks (1<<i) as preallocated
+// big.Ints. getCollectionID only reads its indexSet argument, and the
+// processor is single-goroutine, so sharing one pointer per index removes a
+// uint256.Lsh + big.Int(ToBig) allocation from every split / merge / redemption
+// outcome iteration — the masks are always small constants (1, 2, 4, …).
+var indexSetBig = func() [64]*big.Int {
+	var a [64]*big.Int
+	for i := range a {
+		a[i] = new(big.Int).Lsh(big.NewInt(1), uint(i))
+	}
+	return a
+}()
 
 // usdcRawToDec18 converts a 1e6-scaled on-chain amount (USDC / outcome tokens)
 // to a scale-18 Decimal256: coefficient = raw * 1e12. Equivalent to the legacy
@@ -1193,6 +1381,46 @@ func usdcRawToDec18(v *uint256.Int) (protomath.Decimal256, bool) {
 		return protomath.Decimal256{}, false
 	}
 	return protomath.FromUInt256AsDecimal256(protomath.FromHoliman(scaled))
+}
+
+// rawIntToDec18 represents a raw integer count (exponent 0, e.g. LP shares used
+// without a 1e6 rescale) as a scale-18 Decimal256: coefficient = v * 1e18.
+// Equivalent to the legacy Uint256ToDecimal(v) feeding the shopspring updates.
+func rawIntToDec18(v *uint256.Int) (protomath.Decimal256, bool) {
+	var scaled uint256.Int
+	if _, overflow := scaled.MulOverflow(v, oneE18U256); overflow {
+		return protomath.Decimal256{}, false
+	}
+	return protomath.FromUInt256AsDecimal256(protomath.FromHoliman(scaled))
+}
+
+// ratioDec18 computes num/denom (both raw integer counts) as a scale-18
+// Decimal256 dimensionless ratio. Div interprets both operands at the same
+// scale, so the scale cancels and the result is num*1e18/denom — the
+// allocation-free equivalent of the shopspring DivRound used for FPMM and
+// payout prices. Precision (18 digits) matches the proven order-fill path.
+func ratioDec18(num, denom *uint256.Int) (protomath.Decimal256, bool) {
+	if denom.IsZero() {
+		return protomath.Decimal256{}, true // zero ratio
+	}
+	numD, ok1 := protomath.FromUInt256AsDecimal256(protomath.FromHoliman(*num))
+	denomD, ok2 := protomath.FromUInt256AsDecimal256(protomath.FromHoliman(*denom))
+	if !ok1 || !ok2 {
+		return protomath.Decimal256{}, false
+	}
+	return numD.Div(denomD, protomath.Decimal256Scale18)
+}
+
+// computeFpmmPriceD256 is the native-Decimal256 equivalent of
+// computeFpmmPriceDecimal: price = amounts[1-i] / (amounts[0]+amounts[1]).
+func computeFpmmPriceD256(amounts []uint256.Int, outcomeIndex uint8) (protomath.Decimal256, bool) {
+	if len(amounts) < 2 || outcomeIndex > 1 {
+		return protomath.Decimal256{}, true
+	}
+	var denom uint256.Int
+	denom.Add(&amounts[0], &amounts[1])
+	num := amounts[1-outcomeIndex]
+	return ratioDec18(&num, &denom)
 }
 
 // updateUserPositionWithBuyD256 is the native-Decimal256 equivalent of
@@ -1348,14 +1576,21 @@ func computeNegRiskYesPriceDecimal(noPrice decimal.Decimal, noCount, questionCou
 }
 
 func calculatePayoutDenominator(cond *generated.Condition) (decimal.Decimal, bool) {
-	denom := uint256.NewInt(0)
-	for _, p := range cond.Payouts {
-		denom.Add(denom, &p)
-	}
-	if denom.IsZero() {
+	denom, ok := payoutDenominatorU256(cond)
+	if !ok {
 		return decimal.Zero, false
 	}
-	return Uint256ToDecimal(*denom), true
+	return Uint256ToDecimal(denom), true
+}
+
+// payoutDenominatorU256 sums the payout numerators as a raw uint256 (no
+// big.Int / shopspring allocation), for the native ratio-based redemption price.
+func payoutDenominatorU256(cond *generated.Condition) (uint256.Int, bool) {
+	var denom uint256.Int
+	for i := range cond.Payouts {
+		denom.Add(&denom, &cond.Payouts[i])
+	}
+	return denom, !denom.IsZero()
 }
 
 func Uint256ToDecimal(i uint256.Int) decimal.Decimal {
@@ -1422,8 +1657,7 @@ func getUserPosition(state *generated.State, user common.Address, tokenID uint25
 }
 
 func getFixedProductMarketMakerPositionID(fpmm *generated.FixedProductMarketMaker, outcomeIndex uint8) uint256.Int {
-	indexSet := new(big.Int).Lsh(big.NewInt(1), uint(outcomeIndex))
-	collID := getCollectionID(common.Hash{}, fpmm.ConditionID, indexSet)
+	collID := getCollectionID(common.Hash{}, fpmm.ConditionID, indexSetBig[outcomeIndex])
 	return getPositionID(fpmm.CollateralToken, collID)
 }
 
