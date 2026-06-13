@@ -444,7 +444,7 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, `oracle`, `question_id`, `outcome_slot_count`, `resolved`, `payouts`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY `id`", quoteIdent(db), quoteIdent("memory_conditions")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, argMax(`oracle`, (`block_number`, `transaction_index`, `log_index`)) AS `oracle`, argMax(`question_id`, (`block_number`, `transaction_index`, `log_index`)) AS `question_id`, argMax(`outcome_slot_count`, (`block_number`, `transaction_index`, `log_index`)) AS `outcome_slot_count`, argMax(`resolved`, (`block_number`, `transaction_index`, `log_index`)) AS `resolved`, argMax(`payouts`, (`block_number`, `transaction_index`, `log_index`)) AS `payouts`, argMax(`updated_at_block`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at_block`, argMax(`updated_at`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at`, argMax(`block_number`, (`block_number`, `transaction_index`, `log_index`)) AS `block_number`, argMax(`transaction_index`, (`block_number`, `transaction_index`, `log_index`)) AS `transaction_index`, argMax(`log_index`, (`block_number`, `transaction_index`, `log_index`)) AS `log_index` FROM %s.%s GROUP BY `id`", quoteIdent(db), quoteIdent("memory_conditions")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 		for i := 0; i < block.Rows; i++ {
 			item := MemoryCondition{
 				ID:               common.BytesToHash(colID.Row(i)),
@@ -933,7 +933,7 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `user`, `token_id`, `amount`, `avg_price`, `realized_pn_l`, `total_bought`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY `user`, `token_id`", quoteIdent(db), quoteIdent("memory_user_positions")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `user`, `token_id`, argMax(`amount`, (`block_number`, `transaction_index`, `log_index`)) AS `amount`, argMax(`avg_price`, (`block_number`, `transaction_index`, `log_index`)) AS `avg_price`, argMax(`realized_pn_l`, (`block_number`, `transaction_index`, `log_index`)) AS `realized_pn_l`, argMax(`total_bought`, (`block_number`, `transaction_index`, `log_index`)) AS `total_bought`, argMax(`updated_at_block`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at_block`, argMax(`updated_at`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at`, argMax(`block_number`, (`block_number`, `transaction_index`, `log_index`)) AS `block_number`, argMax(`transaction_index`, (`block_number`, `transaction_index`, `log_index`)) AS `transaction_index`, argMax(`log_index`, (`block_number`, `transaction_index`, `log_index`)) AS `log_index` FROM %s.%s GROUP BY `user`, `token_id`", quoteIdent(db), quoteIdent("memory_user_positions")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 		for i := 0; i < block.Rows; i++ {
 			item := MemoryUserPosition{
 				User:           common.BytesToAddress(colUser.Row(i)),
@@ -1453,7 +1453,7 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY `id`", quoteIdent(db), quoteIdent("memory_markets")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, argMax(`question_count`, (`block_number`, `transaction_index`, `log_index`)) AS `question_count`, argMax(`question_ids`, (`block_number`, `transaction_index`, `log_index`)) AS `question_ids`, argMax(`updated_at_block`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at_block`, argMax(`updated_at`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at`, argMax(`block_number`, (`block_number`, `transaction_index`, `log_index`)) AS `block_number`, argMax(`transaction_index`, (`block_number`, `transaction_index`, `log_index`)) AS `transaction_index`, argMax(`log_index`, (`block_number`, `transaction_index`, `log_index`)) AS `log_index` FROM %s.%s GROUP BY `id`", quoteIdent(db), quoteIdent("memory_markets")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 		for i := 0; i < block.Rows; i++ {
 			item := MemoryMarket{
 				ID:             common.BytesToHash(colID.Row(i)),
@@ -1960,7 +1960,7 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY `id`", quoteIdent(db), quoteIdent("memory_neg_risk_events")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, argMax(`question_count`, (`block_number`, `transaction_index`, `log_index`)) AS `question_count`, argMax(`question_ids`, (`block_number`, `transaction_index`, `log_index`)) AS `question_ids`, argMax(`updated_at_block`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at_block`, argMax(`updated_at`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at`, argMax(`block_number`, (`block_number`, `transaction_index`, `log_index`)) AS `block_number`, argMax(`transaction_index`, (`block_number`, `transaction_index`, `log_index`)) AS `transaction_index`, argMax(`log_index`, (`block_number`, `transaction_index`, `log_index`)) AS `log_index` FROM %s.%s GROUP BY `id`", quoteIdent(db), quoteIdent("memory_neg_risk_events")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 		for i := 0; i < block.Rows; i++ {
 			item := MemoryNegRiskEvent{
 				ID:             common.BytesToHash(colID.Row(i)),
@@ -2419,7 +2419,7 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, `condition_id`, `collateral_token`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY `id`", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `id`, argMax(`condition_id`, (`block_number`, `transaction_index`, `log_index`)) AS `condition_id`, argMax(`collateral_token`, (`block_number`, `transaction_index`, `log_index`)) AS `collateral_token`, argMax(`updated_at_block`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at_block`, argMax(`updated_at`, (`block_number`, `transaction_index`, `log_index`)) AS `updated_at`, argMax(`block_number`, (`block_number`, `transaction_index`, `log_index`)) AS `block_number`, argMax(`transaction_index`, (`block_number`, `transaction_index`, `log_index`)) AS `transaction_index`, argMax(`log_index`, (`block_number`, `transaction_index`, `log_index`)) AS `log_index` FROM %s.%s GROUP BY `id`", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 		for i := 0; i < block.Rows; i++ {
 			item := MemoryFixedProductMarketMaker{
 				ID:              common.BytesToAddress(colID.Row(i)),

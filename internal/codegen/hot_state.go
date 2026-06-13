@@ -1482,12 +1482,34 @@ func customInsertColumnList(table customTableSpec) string {
 	return "(" + strings.Join(columns, ", ") + ")"
 }
 
+// recoverQuery returns the latest row per primary key from a ReplacingMergeTree
+// state table. It uses argMax(col, version) ... GROUP BY key — a single-pass hash
+// aggregation — rather than ORDER BY version DESC ... LIMIT 1 BY key, which forces
+// a GLOBAL sort of the entire table. On the live polymarket positions table
+// (134M rows / 129M distinct keys) the LIMIT 1 BY form did not finish in 14 min
+// while the argMax form returned the identical 129M rows in ~29s (~30x). version
+// is the (block_number, transaction_index, log_index) tuple — the same ordering
+// the LIMIT 1 BY used — so the selected row is identical. Key columns are emitted
+// as the GROUP BY key (and thus their own latest value); every other column,
+// including the version columns themselves, takes argMax over the version tuple.
+// Result columns keep their original names via AS, so the columnar decode that
+// maps by name is unchanged.
 func recoverQuery(table customTableSpec) string {
+	version := "(" + strings.Join(quotedColumns([]string{"block_number", "transaction_index", "log_index"}), ", ") + ")"
+	isKey := make(map[string]bool, len(table.PrimaryKey))
+	for _, k := range table.PrimaryKey {
+		isKey[k] = true
+	}
 	selects := make([]string, 0, len(table.Fields))
 	for _, field := range table.Fields {
-		selects = append(selects, quoteSQLIdent(field.ColumnName))
+		col := quoteSQLIdent(field.ColumnName)
+		if isKey[field.ColumnName] {
+			selects = append(selects, col)
+			continue
+		}
+		selects = append(selects, "argMax("+col+", "+version+") AS "+col)
 	}
-	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY " + strings.Join(quotedColumns(table.PrimaryKey), ", ")
+	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s GROUP BY " + strings.Join(quotedColumns(table.PrimaryKey), ", ")
 }
 
 func quotedColumns(columns []string) []string {
