@@ -379,7 +379,7 @@ func coldCacheBytes() int64 {
 			return parsed << 20
 		}
 	}
-	return 8192 << 20
+	return 20480 << 20
 }
 
 func NewState() *State {

@@ -9,7 +9,7 @@ store_raw_logs: false
 # RAM is bounded (one shared block cache); on-disk Pebble grows unbounded.
 # Env SQD_COLDCACHE_MB / SQD_HOTCACHE_CAP override these at runtime.
 cold_cache: true
-cold_cache_mb: 8192          # shared off-heap block cache budget (8 GiB)
+cold_cache_mb: 20480         # shared off-heap block cache budget (20 GiB)
 hot_cache_capacity: 2000000  # hot ring entries per entity; overflow spills to cold
 # include_metadata: # EXCLUDED BY DEFAULT KEEP DISABLED
 #   - chain_id

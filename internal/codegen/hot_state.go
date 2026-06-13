@@ -1495,21 +1495,31 @@ func customInsertColumnList(table customTableSpec) string {
 // Result columns keep their original names via AS, so the columnar decode that
 // maps by name is unchanged.
 func recoverQuery(table customTableSpec) string {
-	version := "(" + strings.Join(quotedColumns([]string{"block_number", "transaction_index", "log_index"}), ", ") + ")"
+	// Every column is qualified with the table alias `t`. argMax aliases its result
+	// to the column's own name (... AS `block_number`); without qualification the
+	// version tuple's bare `block_number` resolves to that aggregate alias instead
+	// of the column, and ClickHouse rejects an aggregate nested in an aggregate
+	// (ILLEGAL_AGGREGATION). `t`.`block_number` always resolves to the column.
+	q := func(col string) string { return "`t`." + quoteSQLIdent(col) }
+	version := "(" + q("block_number") + ", " + q("transaction_index") + ", " + q("log_index") + ")"
 	isKey := make(map[string]bool, len(table.PrimaryKey))
 	for _, k := range table.PrimaryKey {
 		isKey[k] = true
 	}
 	selects := make([]string, 0, len(table.Fields))
 	for _, field := range table.Fields {
-		col := quoteSQLIdent(field.ColumnName)
+		out := quoteSQLIdent(field.ColumnName)
 		if isKey[field.ColumnName] {
-			selects = append(selects, col)
+			selects = append(selects, q(field.ColumnName)+" AS "+out)
 			continue
 		}
-		selects = append(selects, "argMax("+col+", "+version+") AS "+col)
+		selects = append(selects, "argMax("+q(field.ColumnName)+", "+version+") AS "+out)
 	}
-	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s GROUP BY " + strings.Join(quotedColumns(table.PrimaryKey), ", ")
+	groupBy := make([]string, 0, len(table.PrimaryKey))
+	for _, k := range table.PrimaryKey {
+		groupBy = append(groupBy, q(k))
+	}
+	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s AS `t` GROUP BY " + strings.Join(groupBy, ", ")
 }
 
 func quotedColumns(columns []string) []string {
