@@ -158,6 +158,63 @@ func TestFiftyCentsD256Exact(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Overflow / fallback: the conversion helpers must report ok=false past the
+// Decimal256 range (so the handler drops to the shopspring fallback), and the
+// shopspring fallback must produce the correct result for those huge values.
+// ---------------------------------------------------------------------------
+
+// maxU256 is 2^256-1; scaling it by 1e12/1e18 overflows the Decimal256 range.
+func maxU256() uint256.Int {
+	var v uint256.Int
+	v.Not(&v)
+	return v
+}
+
+func TestConversionHelperOverflowReportsFalse(t *testing.T) {
+	big := maxU256()
+	if _, ok := usdcRawToDec18(&big); ok {
+		t.Error("usdcRawToDec18(2^256-1) should overflow")
+	}
+	if _, ok := rawIntToDec18(&big); ok {
+		t.Error("rawIntToDec18(2^256-1) should overflow")
+	}
+	one := u256(1)
+	if _, ok := ratioDec18(&big, &one); ok {
+		t.Error("ratioDec18(2^256-1, 1) should overflow")
+	}
+	// Just under the scale-18 limit must still succeed: max human value is
+	// ~5.78e58 (coeff 2^255-1), so a raw 1e6-scaled value up to ~5.78e64 fits.
+	safe := u256(1_000_000_000_000_000_000)
+	if _, ok := usdcRawToDec18(&safe); !ok {
+		t.Error("usdcRawToDec18(1e18) should fit")
+	}
+}
+
+// TestPositionSplitOverflowFallback drives an Amount large enough to overflow
+// usdcRawToDec18, exercising the otherwise-unreachable shopspring fallback
+// branch, and checks it matches the shop handler directly.
+func TestPositionSplitOverflowFallback(t *testing.T) {
+	condID, collateral, stakeholder := hashByte(0x6C), addrByte(0x6D), addrByte(0x6E)
+	huge := maxU256() // overflows usdcRawToDec18 -> handler must use shopspring
+	if _, ok := usdcRawToDec18(&huge); ok {
+		t.Fatal("test premise: expected overflow")
+	}
+	native, shop := generated.NewState(), generated.NewState()
+	saveCondition(native, condID, false, nil)
+	saveCondition(shop, condID, false, nil)
+	ev := &generated.ConditionalTokensPositionSplit{
+		EventMeta: metaAt(10), Stakeholder: stakeholder, CollateralToken: collateral,
+		ConditionID: condID, Amount: huge,
+	}
+	handlePositionSplit(native, ev)     // takes the fallback internally
+	handlePositionSplitShop(shop, ev)   // the fallback target, directly
+	for i := uint8(0); i < 2; i++ {
+		posID := getPositionID(collateral, getCollectionID(common.Hash{}, condID, indexSetBig[i]))
+		assertPosParity(t, "splitOverflow", native, shop, stakeholder, posID)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Handler parity: native handler vs a shopspring reference, comparing the full
 // resulting position state. The reference mirrors the pre-migration handler.
 // ---------------------------------------------------------------------------
@@ -447,6 +504,53 @@ func TestPayoutRedemptionNRParity(t *testing.T) {
 	refRedemptionNR(shop, ev)
 	for i := uint8(0); i < 2; i++ {
 		assertPosParity(t, "redemptionNR", native, shop, redeemer, getNegRiskPositionIDByCondition(condID, i))
+	}
+}
+
+func TestPositionsConvertedParity(t *testing.T) {
+	marketID := hashByte(0x6A)
+	stakeholder := addrByte(0x6B)
+	// Vary seeded NO avg prices so the averaged yesPrice differs from 0.5 and
+	// the two paths must agree on the derived buy price, not just on a constant.
+	scenarios := []struct {
+		questionCount uint32
+		indexSet      uint64
+		prices        []float64
+		amounts       []int64
+	}{
+		{4, 0b0111, []float64{0.30, 0.45, 0.60}, []int64{100, 200, 150}},
+		{3, 0b0011, []float64{0.50, 0.50}, []int64{1000, 500}},
+		{5, 0b10101, []float64{0.20, 0.70, 0.55}, []int64{300, 100, 250}},
+	}
+	for si, sc := range scenarios {
+		mid := marketID
+		mid[0] = byte(si) // distinct market per scenario to avoid cache cross-talk
+		native, shop := generated.NewState(), generated.NewState()
+		for _, st := range []*generated.State{native, shop} {
+			st.NegRiskEvent.Save(&generated.NegRiskEvent{ID: mid, QuestionCount: sc.questionCount}, metaAt(1))
+			seedIdx := 0
+			for q := uint32(0); q < sc.questionCount; q++ {
+				if sc.indexSet&(1<<q) == 0 {
+					continue // unselected -> yes buy, no seed needed
+				}
+				posID := getNegRiskPositionID(mid, q, 1) // NO outcome
+				updateUserPositionWithBuy(st, stakeholder, posID, decimal.NewFromFloat(sc.prices[seedIdx]), decimal.NewFromInt(sc.amounts[seedIdx]), decimal.Zero, metaAt(5))
+				seedIdx++
+			}
+		}
+		ev := &generated.NegRiskAdapterPositionsConverted{
+			EventMeta: metaAt(10), MarketID: mid, Stakeholder: stakeholder,
+			IndexSet: u256(sc.indexSet), Amount: u256(50_000_000),
+		}
+		handlePositionsConverted(native, ev)
+		handlePositionsConvertedShop(shop, ev)
+		for q := uint32(0); q < sc.questionCount; q++ {
+			outcome := uint8(0) // unselected -> YES buy
+			if sc.indexSet&(1<<q) != 0 {
+				outcome = 1 // selected -> NO sell
+			}
+			assertPosParity(t, "converted", native, shop, stakeholder, getNegRiskPositionID(mid, q, outcome))
+		}
 	}
 }
 

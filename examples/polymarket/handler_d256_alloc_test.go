@@ -94,6 +94,32 @@ func TestFPMMBuyAllocsReduced(t *testing.T) {
 		func() { refFPMMBuy(ss, evS, fpmmS) })
 }
 
+func TestPositionsConvertedAllocsReduced(t *testing.T) {
+	marketID, stakeholder := hashByte(0x90), addrByte(0x8F)
+	mk := func() *generated.State {
+		st := generated.NewState()
+		st.NegRiskEvent.Save(&generated.NegRiskEvent{ID: marketID, QuestionCount: 4}, metaAt(1))
+		for q := uint32(0); q < 3; q++ {
+			posID := getNegRiskPositionID(marketID, q, 1)
+			updateUserPositionWithBuy(st, stakeholder, posID, decimal.NewFromFloat(0.4), decimal.NewFromInt(100), decimal.Zero, metaAt(5))
+		}
+		return st
+	}
+	ns, ss := mk(), mk()
+	mkEv := func() *generated.NegRiskAdapterPositionsConverted {
+		return &generated.NegRiskAdapterPositionsConverted{
+			EventMeta: metaAt(10), MarketID: marketID, Stakeholder: stakeholder,
+			IndexSet: u256(0b0111), Amount: u256(50_000_000),
+		}
+	}
+	evN, evS := mkEv(), mkEv()
+	// noSells/yesBuys slice growth is shared by both paths, so the ratio is
+	// smaller than the single-position handlers — but the decimal math is gone.
+	allocsReduced(t, "positionsConverted", 2,
+		func() { handlePositionsConverted(ns, evN) },
+		func() { handlePositionsConvertedShop(ss, evS) })
+}
+
 func TestFPMMFundingAddedAllocsReduced(t *testing.T) {
 	condID, collateral, fpmmAddr, funder := hashByte(0x9B), addrByte(0x9C), addrByte(0x9D), addrByte(0x9E)
 	ns := generated.NewState()

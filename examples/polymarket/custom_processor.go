@@ -1102,49 +1102,32 @@ func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapt
 		return
 	}
 
-	// Divide by 1e6 to convert to "full stake" units
-	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
+	amount, okA := usdcRawToDec18(&ev.Amount)
+	if !okA {
+		handlePositionsConvertedShop(state, ev)
+		return
+	}
+	scale := protomath.Decimal256Scale18
 	questionCount := nr.QuestionCount
 	indexSet := ev.IndexSet
 
-	resolvePositionID := func(questionIndex uint32, outcomeIndex uint8) (uint256.Int, bool) {
-		return getNegRiskPositionID(ev.MarketID, questionIndex, outcomeIndex), true
-	}
-
-	var noSells []struct {
-		posID uint256.Int
-		price decimal.Decimal
-	}
-	var yesBuys []uint256.Int
-	sumPrice := decimal.Zero
-
+	// Scan (read-only): selected questions' NO positions are sold; the rest are
+	// YES buys. sumPrice accumulates the NO positions' current avg prices, which
+	// are already Decimal256 in state — no toDecimal round-trip.
+	var noSells, yesBuys []uint256.Int
+	var sumPrice protomath.Decimal256
 	for i := uint32(0); i < questionCount; i++ {
-		selected := getBit(&indexSet, int(i)) == 1
-
-		posID, ok := resolvePositionID(i, 0) // YES outcome
-		if !selected {
-			if !ok {
-				continue
-			}
-			yesBuys = append(yesBuys, posID)
+		if getBit(&indexSet, int(i)) != 1 {
+			yesBuys = append(yesBuys, getNegRiskPositionID(ev.MarketID, i, 0))
 			continue
 		}
-
-		posID, ok = resolvePositionID(i, 1) // NO outcome
-		if !ok {
-			return
+		posID := getNegRiskPositionID(ev.MarketID, i, 1)
+		if up := getUserPosition(state, ev.Stakeholder, posID); up != nil {
+			if v, ok := sumPrice.Add(up.AvgPrice); ok {
+				sumPrice = v
+			}
 		}
-
-		var currentAvg decimal.Decimal
-		up := getUserPosition(state, ev.Stakeholder, posID)
-		if up != nil {
-			currentAvg = toDecimal(up.AvgPrice)
-		}
-		noSells = append(noSells, struct {
-			posID uint256.Int
-			price decimal.Decimal
-		}{posID, currentAvg})
-		sumPrice = sumPrice.Add(currentAvg)
+		noSells = append(noSells, posID)
 	}
 
 	noCount := uint32(len(noSells))
@@ -1152,10 +1135,59 @@ func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapt
 		return
 	}
 
-	for _, sell := range noSells {
-		// Sell NO tokens at fiftyCents (0.5), not at user's avgPrice
-		// This generates PnL when avgPrice differs from 0.5
-		updateUserPositionWithSell(state, ev.Stakeholder, sell.posID, fiftyCents, amount, ev.EventMeta)
+	// Sell NO tokens at fiftyCents (0.5), not at user's avgPrice — this generates
+	// PnL when avgPrice differs from 0.5.
+	for _, posID := range noSells {
+		updateUserPositionWithSellD256(state, ev.Stakeholder, posID, fiftyCentsD256, amount, ev.EventMeta)
+	}
+
+	if len(yesBuys) == 0 {
+		return
+	}
+
+	noCountD, _ := protomath.FromInt64(int64(noCount), scale)
+	avgPrice, _ := sumPrice.Div(noCountD, scale)
+	yesPrice, _ := computeNegRiskYesPriceD256(avgPrice, noCount, questionCount)
+	for _, posID := range yesBuys {
+		updateUserPositionWithBuyD256(state, ev.Stakeholder, posID, yesPrice, amount, protomath.Decimal256{}, ev.EventMeta)
+	}
+}
+
+// handlePositionsConvertedShop is the legacy shopspring implementation, kept as
+// the unreachable-overflow fallback.
+func handlePositionsConvertedShop(state *generated.State, ev *generated.NegRiskAdapterPositionsConverted) {
+	nr, ok := state.NegRiskEvent.Get(ev.MarketID)
+	if !ok || nr.QuestionCount == 0 {
+		return
+	}
+
+	amount := Uint256ToDecimal(ev.Amount).Div(decimal.NewFromInt(1e6))
+	questionCount := nr.QuestionCount
+	indexSet := ev.IndexSet
+
+	var noSells []uint256.Int
+	var yesBuys []uint256.Int
+	sumPrice := decimal.Zero
+
+	for i := uint32(0); i < questionCount; i++ {
+		if getBit(&indexSet, int(i)) != 1 {
+			yesBuys = append(yesBuys, getNegRiskPositionID(ev.MarketID, i, 0))
+			continue
+		}
+		posID := getNegRiskPositionID(ev.MarketID, i, 1)
+		if up := getUserPosition(state, ev.Stakeholder, posID); up != nil {
+			sumPrice = sumPrice.Add(toDecimal(up.AvgPrice))
+		}
+		noSells = append(noSells, posID)
+	}
+
+	noCount := uint32(len(noSells))
+	if noCount == 0 {
+		return
+	}
+
+	for _, posID := range noSells {
+		updateUserPositionWithSell(state, ev.Stakeholder, posID, fiftyCents, amount, ev.EventMeta)
 	}
 
 	if len(yesBuys) == 0 {
@@ -1164,10 +1196,8 @@ func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapt
 
 	avgPrice := sumPrice.Div(decimal.NewFromInt(int64(noCount)))
 	yesPrice := computeNegRiskYesPriceDecimal(avgPrice, noCount, questionCount)
-	pnlAdjustment := decimal.Zero
-
 	for _, posID := range yesBuys {
-		updateUserPositionWithBuy(state, ev.Stakeholder, posID, yesPrice, amount, pnlAdjustment, ev.EventMeta)
+		updateUserPositionWithBuy(state, ev.Stakeholder, posID, yesPrice, amount, decimal.Zero, ev.EventMeta)
 	}
 }
 
@@ -1421,6 +1451,29 @@ func computeFpmmPriceD256(amounts []uint256.Int, outcomeIndex uint8) (protomath.
 	denom.Add(&amounts[0], &amounts[1])
 	num := amounts[1-outcomeIndex]
 	return ratioDec18(&num, &denom)
+}
+
+// computeNegRiskYesPriceD256 is the native equivalent of
+// computeNegRiskYesPriceDecimal: yes = (noPrice*noCount - (noCount-1)) / yesCount.
+// Inputs are small bounded prices and counts, so it never overflows in practice.
+func computeNegRiskYesPriceD256(noPrice protomath.Decimal256, noCount, questionCount uint32) (protomath.Decimal256, bool) {
+	if noCount == 0 || questionCount <= noCount {
+		return protomath.Decimal256{}, true
+	}
+	scale := protomath.Decimal256Scale18
+	noCountD, _ := protomath.FromInt64(int64(noCount), scale)
+	yesCountD, _ := protomath.FromInt64(int64(questionCount-noCount), scale)
+	oneD, _ := protomath.FromInt64(1, scale)
+	left, ok1 := noPrice.Mul(noCountD, scale)
+	right, ok2 := noCountD.Sub(oneD)
+	if !ok1 || !ok2 {
+		return protomath.Decimal256{}, false
+	}
+	numer, ok3 := left.Sub(right)
+	if !ok3 {
+		return protomath.Decimal256{}, false
+	}
+	return numer.Div(yesCountD, scale)
 }
 
 // updateUserPositionWithBuyD256 is the native-Decimal256 equivalent of
