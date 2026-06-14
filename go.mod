@@ -8,6 +8,7 @@ require (
 	github.com/ethereum/go-ethereum v1.17.3
 	github.com/holiman/uint256 v1.3.2
 	github.com/klauspost/compress v1.18.6
+	github.com/shopspring/decimal v1.4.0
 	github.com/valyala/fastjson v1.6.10
 	gopkg.in/yaml.v3 v3.0.1
 )
