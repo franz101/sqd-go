@@ -1,0 +1,121 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["clickhouse", "sqd-go"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "ClickHouse Server",
+  "uid": "sqd-ch-server",
+  "version": 1,
+  "weekStart": "",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Resident Memory",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 8000000000 }, { "color": "red", "value": 24000000000 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT value FROM system.asynchronous_metrics WHERE metric = 'MemoryResident'" } ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Active Parts (MergeTree)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 3000 }, { "color": "red", "value": 10000 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT value FROM system.asynchronous_metrics WHERE metric = 'TotalPartsOfMergeTreeTables'" } ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Tables",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT value FROM system.asynchronous_metrics WHERE metric = 'NumberOfTables'" } ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT value FROM system.asynchronous_metrics WHERE metric = 'Uptime'" } ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Memory",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(event_time) AS time, avg(if(metric = 'MemoryResident', value, NULL)) AS \"RSS\", avg(if(metric = 'jemalloc.resident', value, NULL)) AS \"jemalloc resident\" FROM system.asynchronous_metric_log WHERE metric IN ('MemoryResident', 'jemalloc.resident') AND $__timeFilter(event_time) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "CPU (cores, normalized)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 15, "showPoints": "never", "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(event_time) AS time, avg(if(metric = 'OSUserTimeNormalized', value, NULL)) AS \"User\", avg(if(metric = 'OSSystemTimeNormalized', value, NULL)) AS \"System\" FROM system.asynchronous_metric_log WHERE metric IN ('OSUserTimeNormalized', 'OSSystemTimeNormalized') AND $__timeFilter(event_time) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Query Throughput",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "qps", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(event_time) AS time, avg(ProfileEvent_Query) AS \"Queries/s\", avg(ProfileEvent_FailedQuery) AS \"Failed/s\" FROM system.metric_log WHERE $__timeFilter(event_time) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Rows In / Out",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "rps", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(event_time) AS time, avg(ProfileEvent_InsertedRows) AS \"Inserted rows/s\", avg(ProfileEvent_SelectedRows) AS \"Selected rows/s\", avg(ProfileEvent_MergedRows) AS \"Merged rows/s\" FROM system.metric_log WHERE $__timeFilter(event_time) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Bytes In / Out",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(event_time) AS time, avg(ProfileEvent_InsertedBytes) AS \"Inserted bytes/s\", avg(ProfileEvent_SelectedBytes) AS \"Selected bytes/s\" FROM system.metric_log WHERE $__timeFilter(event_time) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Concurrency (current)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(event_time) AS time, max(CurrentMetric_Query) AS \"Queries\", max(CurrentMetric_Merge) AS \"Merges\", max(CurrentMetric_TCPConnection) AS \"TCP connections\" FROM system.metric_log WHERE $__timeFilter(event_time) GROUP BY time ORDER BY time" } ]
+    }
+  ]
+}

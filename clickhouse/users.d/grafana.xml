@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!--
+  Read-only ClickHouse user for Grafana.
+
+  Per the ClickHouse Grafana data-source docs: Grafana does not validate that
+  queries are safe, so the data source should connect as a read-only user.
+  readonly=1 (not 2) keeps SELECT-only access while the changeable_in_readonly
+  constraint still lets the clickhouse-go client set max_execution_time.
+
+  Credentials are intentionally static and local-only. Override the password by
+  editing this file and GRAFANA_CH_PASSWORD in .env / compose to match.
+-->
+<clickhouse>
+    <profiles>
+        <grafana_readonly>
+            <readonly>1</readonly>
+            <constraints>
+                <max_execution_time>
+                    <changeable_in_readonly/>
+                </max_execution_time>
+            </constraints>
+        </grafana_readonly>
+    </profiles>
+
+    <users>
+        <grafana>
+            <password>grafana_ro</password>
+            <profile>grafana_readonly</profile>
+            <quota>default</quota>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+        </grafana>
+    </users>
+</clickhouse>

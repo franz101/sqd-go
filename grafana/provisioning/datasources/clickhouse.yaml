@@ -1,0 +1,22 @@
+apiVersion: 1
+
+# Provisions the ClickHouse data source. Env vars (CH_HOST/CH_PORT/CH_USER/
+# CH_PASSWORD) are injected by the grafana service in compose.yml.
+datasources:
+  - name: ClickHouse
+    uid: clickhouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      host: ${CH_HOST}
+      port: ${CH_PORT}
+      protocol: native
+      secure: false
+      username: ${CH_USER}
+      # Dashboards qualify tables explicitly (system.*, monitoring.*), so the
+      # default database is just a connection default.
+      defaultDatabase: default
+    secureJsonData:
+      password: ${CH_PASSWORD}
+    editable: false
