@@ -17,6 +17,7 @@ import (
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/database"
+	"github.com/franz101/sqd-go/internal/monitoring"
 	"github.com/franz101/sqd-go/internal/parser"
 	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 )
@@ -111,6 +112,16 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		return fmt.Errorf("clickhouse: %w", err)
 	}
 	defer store.Close()
+
+	// Optional Grafana metrics writer (SQD_METRICS_CH). Off the hot path: it owns
+	// its own connection and the ingestion loop only feeds it counters via Observe.
+	monitoring.Start(ctx, monitoring.Config{
+		Host:     opts.ClickHouseHost,
+		Port:     opts.ClickHousePort,
+		User:     opts.ClickHouseUser,
+		Password: opts.ClickHousePassword,
+	})
+	defer monitoring.Stop()
 
 	forkMode := opts.ForkMode
 	if forkMode == "" {
@@ -658,6 +669,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		lastStatsTime = now
 		lastStatsBlocks = totalBlockCount
 		lastStatsEvents = totalEventCount
+		monitoring.Observe(chain.ID, totalBlockCount, totalEventCount, currentConsumerBlockVal, lastCheckpoint)
 	}
 
 	var batchBlockRows []database.BlockRow

@@ -1,0 +1,141 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["sqd-go", "indexer", "runtime"],
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Indexer Runtime",
+  "uid": "sqd-indexer-runtime",
+  "version": 1,
+  "weekStart": "",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Blocks/s",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "green", "value": 5000 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT sum(blocks_per_sec) AS v FROM monitoring.indexer_metrics WHERE ts = (SELECT max(ts) FROM monitoring.indexer_metrics)" } ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Events/s",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT sum(events_per_sec) AS v FROM monitoring.indexer_metrics WHERE ts = (SELECT max(ts) FROM monitoring.indexer_metrics)" } ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "CPU Cores",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 2, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 4 }, { "color": "red", "value": 8 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT avg(cpu_cores_used) AS v FROM monitoring.indexer_metrics WHERE ts = (SELECT max(ts) FROM monitoring.indexer_metrics)" } ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Goroutines",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 500 }, { "color": "red", "value": 5000 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT avg(num_goroutine) AS v FROM monitoring.indexer_metrics WHERE ts = (SELECT max(ts) FROM monitoring.indexer_metrics)" } ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Heap Alloc",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 2000000000 }, { "color": "red", "value": 8000000000 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT avg(heap_alloc_bytes) AS v FROM monitoring.indexer_metrics WHERE ts = (SELECT max(ts) FROM monitoring.indexer_metrics)" } ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Checkpoint Lag",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "red", "value": 50000 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "textMode": "auto" },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "table", "format": 2, "rawSql": "SELECT max(checkpoint_lag) AS v FROM monitoring.indexer_metrics WHERE ts = (SELECT max(ts) FROM monitoring.indexer_metrics)" } ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Throughput",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2, "axisPlacement": "left" } }, "overrides": [ { "matcher": { "id": "byName", "options": "Events/s" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, sum(blocks_per_sec) AS \"Blocks/s\", sum(events_per_sec) AS \"Events/s\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Heap Memory",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, avg(heap_alloc_bytes) AS \"Heap Alloc\", avg(heap_sys_bytes) AS \"Heap Sys\", avg(sys_bytes) AS \"Total Sys\", avg(next_gc_bytes) AS \"Next GC target\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Allocation Rate",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, avg(mallocs_per_sec) AS \"Mallocs/s\", avg(frees_per_sec) AS \"Frees/s\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Garbage Collector",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2, "axisPlacement": "left" } }, "overrides": [ { "matcher": { "id": "byName", "options": "Last pause (ms)" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "ms" } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, avg(gc_cpu_fraction) * 100 AS \"GC CPU %\", avg(gc_pause_last_ns) / 1e6 AS \"Last pause (ms)\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Goroutines & CPU",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2, "axisPlacement": "left" } }, "overrides": [ { "matcher": { "id": "byName", "options": "CPU cores" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, avg(num_goroutine) AS \"Goroutines\", avg(cpu_cores_used) AS \"CPU cores\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time" } ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Live Heap Objects & Checkpoint Lag",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2, "axisPlacement": "left" } }, "overrides": [ { "matcher": { "id": "byName", "options": "Checkpoint lag (blocks)" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, avg(heap_objects) AS \"Live heap objects\", max(checkpoint_lag) AS \"Checkpoint lag (blocks)\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time" } ]
+    }
+  ]
+}
