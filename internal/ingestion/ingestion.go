@@ -574,7 +574,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 
 				batchStartBlock := pBlock
-				var lastBlockNumber uint64
 				for idx, db := range decodedBlocks {
 					// Backpressure check: wait if producer is too far ahead of consumer
 					for {
@@ -595,7 +594,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 					isLastInBatch := (idx == len(decodedBlocks)-1)
 					replayBuf.Write(chain.ID, db.number, db.hash, db.timestamp, db.events, db.logs, db.typedEvents, response.Head.Finalized, isLastInBatch, rangeLabel, batchStartBlock, db.raw)
-					lastBlockNumber = db.number
 					pHash = db.hash
 				}
 
@@ -606,7 +604,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				if len(decodedBlocks) > 0 {
 					select {
 					case next := <-advance:
-						log.Printf("[CURSOR DEBUG] pBlock: %d -> lastBlockNumber: %d -> consumer next: %d (blocks in batch: %d)", pBlock, lastBlockNumber, next.nextBlock, len(decodedBlocks))
 						pBlock = next.nextBlock
 						pHash = next.parentHash
 					case <-pCtx.Done():

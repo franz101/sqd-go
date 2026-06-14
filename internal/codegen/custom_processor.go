@@ -473,10 +473,6 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 	if p == nil || len(logs) == 0 {
 		return nil
 	}
-	// DEBUG: Log processor state
-	logProcessorStateOnce.Do(func() {
-		fmt.Printf("[PROCESSOR DEBUG] p.ProtoMode=%v, p.protoRing=%v, p.ring=%v\n", p.ProtoMode, p.protoRing != nil, p.ring != nil)
-	})
 	if p.ProtoMode {
 		if p.protoRing == nil {
 			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
@@ -600,25 +596,12 @@ func (p *Processor) Process(ctx context.Context, store *database.Store, logs []i
 	return nil
 }
 
-var (
-	logProtoModeOnce      sync.Once
-	logCustomFnOnce       sync.Once
-	logProcessorStateOnce sync.Once
-)
-
 // processProtoBlocks handles proto mode processing.
 func (p *Processor) processProtoBlocks(ctx context.Context, store Store, blocks []*ProtoEventBlock) error {
-	// DEBUG: Log that we're in proto mode
-	logProtoModeOnce.Do(func() {
-		fmt.Println("[PROTO MODE] processProtoBlocks called with", len(blocks), "blocks")
-	})
 	if len(blocks) == 0 {
 		return nil
 	}
 	if CustomProcessProtoFn == nil {
-		logCustomFnOnce.Do(func() {
-			fmt.Println("[PROTO MODE] CustomProcessProtoFn is nil, skipping custom proto processing")
-		})
 		return nil
 	}
 	for _, protoBlock := range blocks {
