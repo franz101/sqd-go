@@ -419,17 +419,26 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	var producerAdvanceChan chan producerAdvance
 
 	// Parallel fetch concurrently pulls the finalized backfill range with N range
-	// workers. It only engages in cursor mode: the consumer requires every block
-	// (includeAllBlocks=true), and only blocks at/below the finalized head are
-	// immutable enough to fetch out of order without parent-hash fork detection.
+	// workers, paced by a shared rate limiter (the portal caps ~5 req/s). It only
+	// engages in cursor mode, and only for blocks at/below the finalized head:
+	// those are immutable, so workers fetch disjoint pages out of order without
+	// parent-hash fork detection and a reorder buffer re-serializes them.
 	// parallelBound is the highest block the prefetcher will produce; the consumer
 	// drops the (unused) advance handshake for blocks at or below it, since the
 	// producer self-advances across the parallel region (see sendProducerAdvance).
+	//
+	// parallelSkipEmpties fetches with includeAllBlocks=false (sparse: matching
+	// blocks + the portal's marker), which transfers far less data but leaves
+	// block-number gaps. The consumer skips those gaps (see CeilBlock below). It is
+	// only safe when the project does not need every block — i.e. it stores neither
+	// the raw blocks table nor the raw logs table; otherwise we fetch every block.
 	parallelEnabled := parallelFetch && cursorMode
 	if parallelFetch && !cursorMode {
 		log.Printf("Chain %d: --parallel-fetch requires cursor mode; using sequential fetch", chain.ID)
 	}
-	parallelWorkers, parallelPageSize := ParallelFetchSettings()
+	parallelWorkers, parallelPageSize, parallelRPS := ParallelFetchSettings()
+	parallelLimiter := newRateLimiter(parallelRPS, defaultParallelBurst)
+	parallelSkipEmpties := parallelEnabled && !storeBlocks && !cfg.ShouldStoreRawLogs()
 	parallelEndpoint := chainEndpoint(chain.ID, false)
 	var parallelBound atomic.Uint64
 
@@ -503,10 +512,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					bound, ok := parallelFinalizedBound(cursorMode, pBlock, lastFinalized, effectiveEndBlock)
 					switch {
 					case ok && bound >= pBlock+parallelMinSpan(parallelPageSize, parallelWorkers):
-						prefetch = newParallelPrefetcher(parallelEndpoint, filters, cursorMode, pBlock, bound, parallelPageSize, parallelWorkers)
+						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, parallelPageSize, parallelWorkers, parallelLimiter)
 						parallelBound.Store(bound)
 						prefetch.launch(pCtx)
-						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, page %d)", chain.ID, pBlock, bound, parallelWorkers, prefetch.pageSize)
+						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, page %d, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, prefetch.pageSize, parallelRPS, parallelSkipEmpties)
 					case cursorMode && lastFinalized == 0:
 						// Finalized head not learned yet — the first sequential fetch
 						// will populate it. Retry on the next iteration; don't latch.
@@ -1283,6 +1292,23 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				break
 			}
 			continue
+		}
+
+		// Sparse parallel backfill (includeAllBlocks=false) leaves block-number
+		// gaps: blocks with no matching logs are absent. When the missing block is
+		// within the parallel region and at or below the scanned high-water mark
+		// (latestBlock — the portal returns a marker block at the end of every
+		// scanned response), the gap is confirmed-empty and was never fetched, so
+		// jump to the next present block instead of waiting forever for it.
+		if parallelSkipEmpties {
+			c := currentConsumerBlockVal
+			if pb := parallelBound.Load(); pb != 0 && c <= pb && c <= replayBuf.LatestBlock() {
+				if next, ok := replayBuf.CeilBlock(c); ok {
+					currentConsumerBlockVal = next
+					currentConsumerBlock.Store(currentConsumerBlockVal)
+					continue
+				}
+			}
 		}
 
 		if producerDone {

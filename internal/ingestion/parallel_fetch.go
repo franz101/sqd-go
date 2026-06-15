@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,14 +14,18 @@ import (
 	"time"
 
 	"github.com/franz101/sqd-go/internal/client"
-	"github.com/valyala/fastjson"
 )
+
+// headerNumberRe pulls the "number" out of a block-header JSONL line. With the
+// portal's EVM field set, "number" appears only in the block header, and it is
+// the first field, so the first match on a single line is the header number.
+var headerNumberRe = regexp.MustCompile(`"number":\s*(\d+)`)
 
 const (
 	// defaultParallelFetchers is the worker count when --parallel-fetch is on and
-	// SQD_PARALLEL_FETCHERS is unset. Six was the empirical sweet spot against the
-	// portal: more workers tripped its request-rate limiter (429s) and collapsed
-	// aggregate throughput below the serial baseline.
+	// SQD_PARALLEL_FETCHERS is unset. The shared rate limiter is the real throughput
+	// lever (the portal caps ~5 req/s); workers only need to keep that budget
+	// saturated despite per-request latency, so a handful suffices.
 	defaultParallelFetchers = 6
 	maxParallelFetchers     = 32
 	// defaultParallelPageSize is the grid-page width (blocks) each worker claims
@@ -28,16 +33,77 @@ const (
 	// how work is partitioned and how much raw JSONL is buffered ahead.
 	defaultParallelPageSize = 10000
 	minParallelPageSize     = 1000
+	// defaultParallelRPS / defaultParallelBurst encode the portal's measured budget
+	// of ~50 requests per 10s (≈5 req/s sustained, burst ~50). This is the backfill
+	// ceiling — the per-request range cap (~1600 blocks) is fixed, so throughput is
+	// rate × range, not worker count.
+	defaultParallelRPS   = 5.0
+	defaultParallelBurst = 50
 
-	parallelWorkerStagger = 150 * time.Millisecond
-	parallelMaxAttempts   = 24
+	parallelMaxAttempts = 24
 )
+
+// rateLimiter is a shared token bucket: every concurrent worker draws from one
+// instance so the aggregate request rate to the portal stays under its limit,
+// regardless of worker count. Tokens refill continuously at ratePerSec up to
+// burst. Plain wall-clock time is fine here (this is not a workflow script).
+type rateLimiter struct {
+	mu       sync.Mutex
+	tokens   float64
+	burst    float64
+	ratePerS float64
+	last     time.Time
+}
+
+func newRateLimiter(ratePerSec float64, burst int) *rateLimiter {
+	if ratePerSec <= 0 {
+		ratePerSec = defaultParallelRPS
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	return &rateLimiter{
+		tokens:   float64(burst),
+		burst:    float64(burst),
+		ratePerS: ratePerSec,
+		last:     time.Now(),
+	}
+}
+
+// wait blocks until a token is available (or ctx is cancelled), then consumes it.
+func (r *rateLimiter) wait(ctx context.Context) error {
+	for {
+		r.mu.Lock()
+		now := time.Now()
+		r.tokens = min(r.burst, r.tokens+now.Sub(r.last).Seconds()*r.ratePerS)
+		r.last = now
+		if r.tokens >= 1 {
+			r.tokens--
+			r.mu.Unlock()
+			return nil
+		}
+		deficit := 1 - r.tokens
+		wait := time.Duration(deficit / r.ratePerS * float64(time.Second))
+		r.mu.Unlock()
+		if wait <= 0 {
+			wait = time.Millisecond
+		}
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
 
 // prefetchPage is one fixed-size grid page [from, to] of the finalized backfill
 // range, fetched ahead of the consumer. raw is the newline-joined concatenation
 // of every portal response that covered the page, copied out of the worker
-// client's reused decode buffer (the next Fetch overwrites it). head carries the
-// last response's head (finalized/latest) for the downstream pipeline.
+// parser's view. head carries the last response's head (finalized/latest) for
+// the downstream pipeline. With includeAllBlocks=false the raw is sparse
+// (matching blocks + the portal's marker block at the scanned high-water mark).
 type prefetchPage struct {
 	idx  uint64
 	from uint64
@@ -48,18 +114,18 @@ type prefetchPage struct {
 }
 
 // parallelPrefetcher fetches a bounded, fully-finalized block range using N
-// concurrent workers and hands fixed-size pages to a single consumer in strict
-// ascending block order. It exists because the sequential producer is bound by
-// per-page HTTP round-trip latency to the portal, not by data, so a deep
-// backfill is round-trip bound; running N cursor loops concurrently scales
-// throughput ~N x until the portal rate-limits or the NIC saturates.
+// concurrent workers (paced by one shared rate limiter) and hands fixed-size
+// pages to a single consumer in strict ascending block order. It exists because
+// the sequential producer is bound by per-page HTTP round-trip latency to the
+// portal, not by data, so a deep backfill is round-trip bound; running N cursor
+// loops concurrently keeps the portal's request budget saturated.
 //
 // Correctness rests on the range being at or below the finalized head: those
 // blocks are immutable, so workers skip the parent-hash fork-detection handshake
 // (parentBlockHash="") and fetch disjoint grid pages out of order. The reorder
-// buffer (the ready map + nextEmit) re-serializes them so the in-order, gap-free
-// consumer is unaffected. Pages are fetched with the same includeAllBlocks shape
-// the consumer requires, so every block number is present.
+// buffer (the ready map + nextEmit) re-serializes them so the in-order consumer
+// is unaffected. With includeAllBlocks=false the pages are sparse and the
+// consumer skips the empty block-number gaps (see ReplayBuffer.CeilBlock).
 type parallelPrefetcher struct {
 	endpoint         string
 	filters          []client.LogFilter
@@ -69,6 +135,7 @@ type parallelPrefetcher struct {
 	pageSize         uint64
 	workers          int
 	maxAhead         uint64 // bounded look-ahead window, in pages
+	limiter          *rateLimiter
 
 	totalPages uint64
 	nextClaim  atomic.Uint64
@@ -81,12 +148,15 @@ type parallelPrefetcher struct {
 	doneWG    bool // all workers have exited
 }
 
-func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeAllBlocks bool, start, end, pageSize uint64, workers int) *parallelPrefetcher {
+func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeAllBlocks bool, start, end, pageSize uint64, workers int, limiter *rateLimiter) *parallelPrefetcher {
 	if pageSize == 0 {
 		pageSize = defaultParallelPageSize
 	}
 	if workers < 1 {
 		workers = 1
+	}
+	if limiter == nil {
+		limiter = newRateLimiter(defaultParallelRPS, defaultParallelBurst)
 	}
 	p := &parallelPrefetcher{
 		endpoint:         endpoint,
@@ -97,6 +167,7 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 		pageSize:         pageSize,
 		workers:          workers,
 		maxAhead:         uint64(workers) + 2,
+		limiter:          limiter,
 		totalPages:       (end - start + pageSize) / pageSize, // ceil((end-start+1)/pageSize)
 		ready:            make(map[uint64]*prefetchPage),
 	}
@@ -109,12 +180,8 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 // look-ahead window and a consumer blocked in Next wake to observe ctx.Err().
 func (p *parallelPrefetcher) launch(ctx context.Context) {
 	var wg sync.WaitGroup
-	for w := 0; w < p.workers; w++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			p.worker(ctx, id)
-		}(w)
+	for range p.workers {
+		wg.Go(func() { p.worker(ctx) })
 	}
 	go func() {
 		wg.Wait()
@@ -161,18 +228,9 @@ func (p *parallelPrefetcher) Next(ctx context.Context) (*prefetchPage, bool) {
 	}
 }
 
-func (p *parallelPrefetcher) worker(ctx context.Context, id int) {
+func (p *parallelPrefetcher) worker(ctx context.Context) {
 	cl := client.New(p.endpoint)
 	defer cl.Close()
-	var jp fastjson.Parser
-
-	// Stagger worker starts so N workers don't fire in lockstep and drain the
-	// portal's burst bucket simultaneously.
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(time.Duration(id) * parallelWorkerStagger):
-	}
 
 	for {
 		if ctx.Err() != nil {
@@ -191,7 +249,7 @@ func (p *parallelPrefetcher) worker(ctx context.Context, id int) {
 		if !p.waitForWindow(ctx, idx) {
 			return
 		}
-		page := p.fetchPage(ctx, cl, &jp, idx)
+		page := p.fetchPage(ctx, cl, idx)
 		p.deliver(page)
 		if page.err != nil {
 			return
@@ -227,9 +285,10 @@ func (p *parallelPrefetcher) deliver(page *prefetchPage) {
 
 // fetchPage cursors through the grid page [from, to], pinning toBlock to the
 // page boundary so a worker never crosses into another worker's range. The
-// portal caps each response by data scanned, so a page is typically several
-// round-trips. Raw bytes are copied out of the client's reused decode buffer.
-func (p *parallelPrefetcher) fetchPage(ctx context.Context, cl *client.Client, jp *fastjson.Parser, idx uint64) *prefetchPage {
+// portal caps each response by range scanned (~1600 blocks), so a page is
+// typically several round-trips, each gated by the shared rate limiter. Raw
+// bytes are copied out of the client's reused decode buffer.
+func (p *parallelPrefetcher) fetchPage(ctx context.Context, cl *client.Client, idx uint64) *prefetchPage {
 	from := p.startBlock + idx*p.pageSize
 	to := min(from+p.pageSize-1, p.endBlock)
 	page := &prefetchPage{idx: idx, from: from, to: to}
@@ -237,8 +296,8 @@ func (p *parallelPrefetcher) fetchPage(ctx context.Context, cl *client.Client, j
 	cur := from
 	attempt := 0
 	for cur <= to {
-		if ctx.Err() != nil {
-			page.err = ctx.Err()
+		if err := p.limiter.wait(ctx); err != nil {
+			page.err = err
 			return page
 		}
 		toPin := to
@@ -248,8 +307,8 @@ func (p *parallelPrefetcher) fetchPage(ctx context.Context, cl *client.Client, j
 				page.err = ctx.Err()
 				return page
 			}
-			// Finalized region: no ForkError is possible, so every error (incl.
-			// 429 rate-limit, which the client surfaces as a generic status error)
+			// Finalized region: no ForkError is possible, so every error (incl. a
+			// 429 that slips past the limiter, surfaced as a generic status error)
 			// is transient. Back off with jitter so workers that throttle together
 			// desynchronize, and give up only after a generous cap.
 			attempt++
@@ -265,7 +324,7 @@ func (p *parallelPrefetcher) fetchPage(ctx context.Context, cl *client.Client, j
 		if len(resp.Raw) == 0 {
 			break // NoContent: no data left at/after cur within this page
 		}
-		last, lerr := lastBlockNumber(jp, resp.Raw)
+		last, lerr := lastBlockNumber(resp.Raw)
 		if lerr != nil {
 			page.err = fmt.Errorf("parallel fetch [%d-%d] last block: %w", cur, to, lerr)
 			return page
@@ -302,19 +361,22 @@ func appendRawJSONL(dst, src []byte) []byte {
 	return dst
 }
 
-// lastBlockNumber reads the block number of the last non-empty JSONL line. The
-// fastjson.Parser is owned by the calling worker (it is not goroutine-safe).
-func lastBlockNumber(jp *fastjson.Parser, raw []byte) (uint64, error) {
+// lastBlockNumber returns the highest block number in a raw JSONL response. The
+// portal emits blocks in ascending order, so the last non-empty line is the
+// highest — which for includeAllBlocks=false is the portal's marker block (the
+// scanned high-water mark). It reverse-scans to that line and regexes the header
+// number out of it: O(tail) and no full parse of every block (and no fastjson).
+func lastBlockNumber(raw []byte) (uint64, error) {
 	end := len(raw)
 	for end > 0 {
 		nl := bytes.LastIndexByte(raw[:end], '\n')
 		line := bytes.TrimSpace(raw[nl+1 : end]) // nl == -1 -> raw[0:end]
 		if len(line) > 0 {
-			v, err := jp.ParseBytes(line)
-			if err != nil {
-				return 0, err
+			m := headerNumberRe.FindSubmatch(line)
+			if m == nil {
+				return 0, fmt.Errorf("no header number in last JSONL line")
 			}
-			return v.Get("header").GetUint64("number"), nil
+			return strconv.ParseUint(string(m[1]), 10, 64)
 		}
 		if nl < 0 {
 			break
@@ -364,10 +426,10 @@ func parallelMinSpan(pageSize uint64, workers int) uint64 {
 	return pageSize * uint64(workers)
 }
 
-// ParallelFetchSettings resolves the worker count and grid-page width from the
-// environment (SQD_PARALLEL_FETCHERS, SQD_PARALLEL_PAGE), falling back to the
-// tuned defaults.
-func ParallelFetchSettings() (workers int, pageSize uint64) {
+// ParallelFetchSettings resolves the worker count, grid-page width, and request
+// rate from the environment (SQD_PARALLEL_FETCHERS, SQD_PARALLEL_PAGE,
+// SQD_PARALLEL_RPS), falling back to the tuned defaults.
+func ParallelFetchSettings() (workers int, pageSize uint64, rps float64) {
 	workers = defaultParallelFetchers
 	if v := strings.TrimSpace(os.Getenv("SQD_PARALLEL_FETCHERS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -383,5 +445,11 @@ func ParallelFetchSettings() (workers int, pageSize uint64) {
 			pageSize = n
 		}
 	}
-	return workers, pageSize
+	rps = defaultParallelRPS
+	if v := strings.TrimSpace(os.Getenv("SQD_PARALLEL_RPS")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			rps = f
+		}
+	}
+	return workers, pageSize, rps
 }

@@ -77,7 +77,7 @@ func TestParallelPrefetcherInOrderComplete(t *testing.T) {
 	srv := fakePortal(137, 0, 0, 0) // small cap forces multi-round-trip pages
 	defer srv.Close()
 
-	p := newParallelPrefetcher(srv.URL, nil, true, start, end, 500, 6)
+	p := newParallelPrefetcher(srv.URL, nil, true, start, end, 500, 6, noRateLimit())
 	p.launch(context.Background())
 
 	var pages []*prefetchPage
@@ -124,7 +124,7 @@ func TestParallelPrefetcherErrorSurfacedInOrder(t *testing.T) {
 	srv := fakePortal(137, 1500, 1999, 0)
 	defer srv.Close()
 
-	p := newParallelPrefetcher(srv.URL, nil, true, 1000, 5000, 500, 4)
+	p := newParallelPrefetcher(srv.URL, nil, true, 1000, 5000, 500, 4, noRateLimit())
 	p.launch(context.Background())
 
 	pg0, ok := p.Next(context.Background())
@@ -142,7 +142,7 @@ func TestParallelPrefetcherCancel(t *testing.T) {
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	p := newParallelPrefetcher(srv.URL, nil, true, 0, 1_000_000, 1000, 4)
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 1_000_000, 1000, 4, noRateLimit())
 	p.launch(ctx)
 
 	if _, ok := p.Next(ctx); !ok {
@@ -209,7 +209,7 @@ func TestParallelPrefetcherLivePortal(t *testing.T) {
 	const start, end uint64 = 20_540_854, 20_540_854 + 20_000 - 1 // 20k finalized blocks (LBTC era)
 
 	run := func(workers int) (uint64, time.Duration) {
-		p := newParallelPrefetcher(endpoint, nil, true /*includeAllBlocks*/, start, end, 5000, workers)
+		p := newParallelPrefetcher(endpoint, nil, true /*includeAllBlocks*/, start, end, 5000, workers, newRateLimiter(defaultParallelRPS, defaultParallelBurst))
 		t0 := time.Now()
 		p.launch(context.Background())
 		var blocks uint64
@@ -241,4 +241,96 @@ func errOf(pg *prefetchPage) error {
 		return nil
 	}
 	return pg.err
+}
+
+// noRateLimit returns a limiter that never throttles, so hermetic tests don't
+// pay the ~5 req/s production pacing.
+func noRateLimit() *rateLimiter { return newRateLimiter(1e9, 1_000_000) }
+
+func TestLastBlockNumber(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    uint64
+		wantErr bool
+	}{
+		{"single header", `{"header":{"number":15001611,"hash":"0xabc","timestamp":1}}`, 15001611, false},
+		{"multi ascending picks last", "{\"header\":{\"number\":100}}\n{\"header\":{\"number\":250}}\n", 250, false},
+		{"trailing blank lines", "{\"header\":{\"number\":7}}\n\n\n", 7, false},
+		{"header with logs", `{"header":{"number":42,"hash":"0x1"},"logs":[{"address":"0xdead","topics":["0x1"],"data":"0x"}]}`, 42, false},
+		{"no trailing newline", "{\"header\":{\"number\":1}}\n{\"header\":{\"number\":2}}", 2, false},
+		{"empty", "", 0, true},
+		{"garbage", "not json at all\n", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := lastBlockNumber([]byte(tc.raw))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("lastBlockNumber = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReplayBufferCeilBlockAndLatest(t *testing.T) {
+	rb := NewReplayBuffer(8)
+	// Sparse stream: present blocks 10, 25, 26, 100 with empty gaps between.
+	for _, n := range []uint64{10, 25, 26, 100} {
+		rb.Write(1, n, "h", time.Time{}, nil, nil, nil, nil, false, "", n, nil)
+	}
+	if got := rb.LatestBlock(); got != 100 {
+		t.Fatalf("LatestBlock = %d, want 100", got)
+	}
+	check := func(n, want uint64, wantOK bool) {
+		t.Helper()
+		got, ok := rb.CeilBlock(n)
+		if ok != wantOK || (ok && got != want) {
+			t.Fatalf("CeilBlock(%d) = %d,%v want %d,%v", n, got, ok, want, wantOK)
+		}
+	}
+	check(0, 10, true)
+	check(10, 10, true)
+	check(11, 25, true)  // gap 11..24 -> next present is 25
+	check(26, 26, true)
+	check(27, 100, true) // gap 27..99 -> next present is 100
+	check(100, 100, true)
+	check(101, 0, false) // nothing present beyond the high-water mark
+}
+
+func TestRateLimiterPacesAndCancels(t *testing.T) {
+	// burst 2 then 50/s: the 3rd token must wait ~20ms (1/50s) after the burst.
+	rl := newRateLimiter(50, 2)
+	ctx := context.Background()
+	for i := range 2 {
+		if err := rl.wait(ctx); err != nil {
+			t.Fatalf("burst token %d: %v", i, err)
+		}
+	}
+	t0 := time.Now()
+	if err := rl.wait(ctx); err != nil {
+		t.Fatalf("paced token: %v", err)
+	}
+	if d := time.Since(t0); d < 10*time.Millisecond {
+		t.Fatalf("3rd token arrived in %v; expected pacing (~20ms)", d)
+	}
+
+	// A cancelled context unblocks a waiting acquire.
+	cctx, cancel := context.WithCancel(context.Background())
+	slow := newRateLimiter(0.001, 1) // ~never refills
+	if err := slow.wait(cctx); err != nil {
+		t.Fatalf("first token: %v", err)
+	}
+	cancel()
+	if err := slow.wait(cctx); err == nil {
+		t.Fatal("expected ctx error after cancel, got nil")
+	}
 }

@@ -282,6 +282,35 @@ func (rb *ReplayBuffer) GetBlock(blockNumber uint64) (blockEntry, bool) {
 	return blockEntry{}, false
 }
 
+// LatestBlock returns the highest block number written to the buffer so far. For
+// sparse (includeAllBlocks=false) fetching this is the scanned high-water mark:
+// every block number at or below it has been fetched, so any absent one is empty.
+func (rb *ReplayBuffer) LatestBlock() uint64 {
+	return rb.latestBlock.Load()
+}
+
+// CeilBlock returns the smallest present block number >= n, and whether one
+// exists in the buffer. It lets the consumer skip confirmed-empty gaps in a
+// sparse stream by jumping straight to the next block that was actually fetched.
+// O(buffered entries); the index may hold stale keys for overwritten slots, so
+// each candidate is validated against its slot.
+func (rb *ReplayBuffer) CeilBlock(n uint64) (uint64, bool) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	var best uint64
+	found := false
+	for num, pos := range rb.index {
+		if num < n || pos < 0 || pos >= rb.capacity || rb.slots[pos].number != num {
+			continue
+		}
+		if !found || num < best {
+			best = num
+			found = true
+		}
+	}
+	return best, found
+}
+
 // WaitBlock blocks until the requested blockNumber is present in the buffer, or the context is cancelled.
 func (rb *ReplayBuffer) WaitBlock(ctx context.Context, blockNumber uint64) (blockEntry, error) {
 	for {

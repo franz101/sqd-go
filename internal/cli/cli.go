@@ -331,9 +331,11 @@ Flags:
   --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default; config: cold_cache: false)
   --cold-cache-mb       (start/dev) Cold-tier block-cache budget in MiB; overrides config cold_cache_mb
                        (0/unset = auto-size to RAM/8). Sets SQD_COLDCACHE_MB.
-  --parallel-fetch      (start/dev) Fetch the finalized backfill range with concurrent range workers
-                       (round-trip-bound full syncs only). Worker count via SQD_PARALLEL_FETCHERS
-                       (default 6), grid-page width via SQD_PARALLEL_PAGE (default 10000).
+  --parallel-fetch      (start/dev) Fetch the finalized backfill range with concurrent range workers,
+                       paced by a shared rate limiter (the portal caps ~5 req/s). Skips empty blocks
+                       (includeAllBlocks=false) unless the project stores raw blocks/logs. Tune via
+                       SQD_PARALLEL_FETCHERS (default 6), SQD_PARALLEL_PAGE (default 10000),
+                       SQD_PARALLEL_RPS (default 5).
 
 Examples:
   sqd-go
