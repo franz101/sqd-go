@@ -59,6 +59,10 @@ type ReplayBuffer struct {
 	// GetBlock uses it as a lock-free fast-reject: if the requested block
 	// exceeds this value it can't be in the buffer yet and the mutex is skipped.
 	latestBlock atomic.Uint64
+	// lenAtomic mirrors count, stored under mu at every mutation. It lets the
+	// periodic stats logger read the buffer depth without taking the mutex, so
+	// the 5s log tick never contends with the producer's Write path.
+	lenAtomic atomic.Int64
 
 	// Seek point for replay — when set, ReadFrom returns the first block > seekBlock.
 	seekBlock uint64
@@ -122,6 +126,7 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 	if rb.count < rb.capacity {
 		rb.count++
 	}
+	rb.lenAtomic.Store(int64(rb.count))
 
 	select {
 	case rb.notifyCh <- struct{}{}:
@@ -167,6 +172,7 @@ func (rb *ReplayBuffer) WriteParsed(chainID uint64, b BatchParsedBlock, finalize
 	if rb.count < rb.capacity {
 		rb.count++
 	}
+	rb.lenAtomic.Store(int64(rb.count))
 
 	select {
 	case rb.notifyCh <- struct{}{}:
@@ -332,6 +338,7 @@ func (rb *ReplayBuffer) PruneBefore(finalizedBlock uint64) int {
 		rb.count--
 		pruned++
 	}
+	rb.lenAtomic.Store(int64(rb.count))
 	return pruned
 }
 
@@ -361,6 +368,7 @@ func (rb *ReplayBuffer) PruneAfter(blockNumber uint64) {
 		}
 	}
 	rb.count = newCount
+	rb.lenAtomic.Store(int64(rb.count))
 	rb.writePos = (oldestPos + newCount) % rb.capacity
 	rb.rebuildIndexLocked()
 	if rb.count > 0 {
@@ -371,11 +379,11 @@ func (rb *ReplayBuffer) PruneAfter(blockNumber uint64) {
 	}
 }
 
-// Len returns the number of blocks currently in the buffer.
+// Len returns the number of blocks currently in the buffer. It reads the atomic
+// mirror of count, so it never takes the mutex — the periodic stats logger can
+// call it on its 5s tick without contending with the producer's Write path.
 func (rb *ReplayBuffer) Len() int {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	return rb.count
+	return int(rb.lenAtomic.Load())
 }
 
 func (rb *ReplayBuffer) rebuildIndexLocked() {
