@@ -183,8 +183,8 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 		ParallelFetch:      parallelFetch,
 	}
 	if parallelFetch {
-		workers, pageBlocks := ingestion.ParallelFetchSettings()
-		log.Printf("PARALLEL FETCH ENABLED: finalized backfill via %d concurrent range workers (page %d blocks)", workers, pageBlocks)
+		workers, pageBlocks, rps := ingestion.ParallelFetchSettings()
+		log.Printf("PARALLEL FETCH ENABLED: finalized backfill via %d concurrent range workers (page %d blocks, ~%.0f req/s shared)", workers, pageBlocks, rps)
 	}
 	if opts.ColdCache {
 		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")
