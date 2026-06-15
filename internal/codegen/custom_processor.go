@@ -629,7 +629,7 @@ func (p *Processor) RestoreToBlock(blockNumber uint64) (uint64, error) {
 }
 
 
-func (p *Processor) LoadFromDatabase(blockNumber uint64) error {
+func (p *Processor) LoadFromDatabase(ctx context.Context, blockNumber uint64) error {
 	if p == nil {
 		return nil
 	}
@@ -643,7 +643,7 @@ func (p *Processor) LoadFromDatabase(blockNumber uint64) error {
 		p.State = NewState()
 	}
 
-	if err := p.State.LoadFromClickHouse(context.Background(), blockNumber); err != nil {
+	if err := p.State.LoadFromClickHouse(ctx, blockNumber); err != nil {
 		return fmt.Errorf("failed to load state from ClickHouse: %w", err)
 	}
 

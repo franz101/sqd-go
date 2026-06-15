@@ -23,7 +23,9 @@ type Processor interface {
 	// LoadFromDatabase restores processor state from persistent storage at the
 	// given block height. Called on startup when a saved checkpoint exists.
 	// A nil return is valid if loading is not supported or not configured.
-	LoadFromDatabase(blockNumber uint64) error
+	// The context must be honored so a slow load (e.g. a large ClickHouse
+	// recover) can be aborted by SIGINT instead of blocking shutdown.
+	LoadFromDatabase(ctx context.Context, blockNumber uint64) error
 }
 
 // FastJSONLProcessor is implemented by processors that support parsing and
@@ -85,7 +87,7 @@ type ColdNegativeFilterProcessor interface {
 type ProcessorFunc struct {
 	ProcessFn        CustomProcessor
 	RestoreToBlockFn func(blockNumber uint64) (uint64, error)
-	LoadFromDBFn     func(blockNumber uint64) error
+	LoadFromDBFn     func(ctx context.Context, blockNumber uint64) error
 }
 
 func (p ProcessorFunc) Process(ctx context.Context, store *database.Store, logs []CustomLog) error {
@@ -102,9 +104,9 @@ func (p ProcessorFunc) RestoreToBlock(blockNumber uint64) (uint64, error) {
 	return p.RestoreToBlockFn(blockNumber)
 }
 
-func (p ProcessorFunc) LoadFromDatabase(blockNumber uint64) error {
+func (p ProcessorFunc) LoadFromDatabase(ctx context.Context, blockNumber uint64) error {
 	if p.LoadFromDBFn == nil {
 		return nil
 	}
-	return p.LoadFromDBFn(blockNumber)
+	return p.LoadFromDBFn(ctx, blockNumber)
 }
