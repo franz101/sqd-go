@@ -265,7 +265,7 @@ func processChainWithProcessor(ctx context.Context, store *database.Store, cfg *
 		StartBlock:         startBlock,
 		BlockCount:         blockCount,
 		CursorMode:         true,
-		NoResume:           true,
+		Restart:            true,
 		GeneratedSQLDir:    filepath.Join("..", "examples", "polymarket", "generated"),
 		Processor:          proc,
 	})
