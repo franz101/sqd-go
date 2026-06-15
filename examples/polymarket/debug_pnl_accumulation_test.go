@@ -314,7 +314,7 @@ func TestLoadFromDatabaseInTestMode(t *testing.T) {
 	// (this should load from ClickHouse, but if TEST_MODE is set, it skips and just saves snapshot)
 	t.Setenv("TEST_MODE", "1")
 
-	err = proc.LoadFromDatabase(blockNumber)
+	err = proc.LoadFromDatabase(t.Context(), blockNumber)
 	if err != nil {
 		t.Fatalf("LoadFromDatabase failed: %v", err)
 	}
