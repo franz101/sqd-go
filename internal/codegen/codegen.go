@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/format"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -229,27 +230,76 @@ func GenerateProject(project *config.Project) (string, error) {
 		return "", err
 	}
 
-	// Generate events_easyjson.go using easyjson CLI (runs after all other generated files are written so package compiles)
-	easyjsonCmd := exec.Command("easyjson", "-all", "events.go")
-	easyjsonCmd.Dir = goOutDir
-	var easyjsonStderr bytes.Buffer
-	easyjsonCmd.Stderr = &easyjsonStderr
-	if err := easyjsonCmd.Run(); err != nil {
-		// Fallback to /home/dev/go/bin/easyjson
-		fallbackCmd := exec.Command("/home/dev/go/bin/easyjson", "-all", "events.go")
-		fallbackCmd.Dir = goOutDir
-		fallbackCmd.Stderr = &easyjsonStderr
-		if err2 := fallbackCmd.Run(); err2 != nil {
-			if _, statErr := os.Stat(filepath.Join(project.Root, "go.mod")); os.IsNotExist(statErr) {
-				// Log warning instead of returning error if go.mod is missing (e.g. in tests)
-				fmt.Printf("WARNING: easyjson failed in non-module directory: %v (stderr: %s)\n", err2, easyjsonStderr.String())
-			} else {
-				return "", fmt.Errorf("easyjson failed: %w (stderr: %s)", err2, easyjsonStderr.String())
-			}
+	// Generate events_easyjson.go with the easyjson CLI (runs last so the rest of
+	// the package is already on disk and compiles). easyjson resolves the target
+	// package through the Go module graph (or legacy GOPATH), so it only works
+	// when goOutDir lives inside a module. When it does not — e.g. codegen running
+	// against a throwaway temp dir in tests, where the generated Go is never
+	// compiled — skip it cleanly rather than emitting a noisy failure.
+	if inGoModule(goOutDir) {
+		if err := runEasyJSON(goOutDir); err != nil {
+			return "", fmt.Errorf("easyjson failed (install with `go install github.com/mailru/easyjson/...@latest`): %w", err)
 		}
+	} else {
+		log.Printf("codegen: %s is not inside a Go module; skipping easyjson (events_easyjson.go not generated)", goOutDir)
 	}
 
 	return outPath, nil
+}
+
+// runEasyJSON invokes the easyjson CLI on events.go in dir. The binary is
+// resolved from PATH first, then from $GOPATH/bin, so it works regardless of
+// where the user installed it.
+func runEasyJSON(dir string) error {
+	cmd := exec.Command(easyjsonBin(), "-all", "events.go")
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("%w (stderr: %s)", err, msg)
+		}
+		return err
+	}
+	return nil
+}
+
+// easyjsonBin resolves the easyjson CLI path: PATH first, then $GOPATH/bin
+// (falling back to `go env GOPATH`). Returns "easyjson" if nothing resolves so
+// the caller still produces a meaningful "not found" error.
+func easyjsonBin() string {
+	if p, err := exec.LookPath("easyjson"); err == nil {
+		return p
+	}
+	gopath := os.Getenv("GOPATH")
+	if gopath == "" {
+		if out, err := exec.Command("go", "env", "GOPATH").Output(); err == nil {
+			gopath = strings.TrimSpace(string(out))
+		}
+	}
+	if entries := filepath.SplitList(gopath); len(entries) > 0 && entries[0] != "" {
+		return filepath.Join(entries[0], "bin", "easyjson")
+	}
+	return "easyjson"
+}
+
+// inGoModule reports whether dir is inside a Go module, i.e. a go.mod exists in
+// dir or any of its ancestors.
+func inGoModule(dir string) bool {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(abs, "go.mod")); err == nil {
+			return true
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			return false
+		}
+		abs = parent
+	}
 }
 
 func buildHotStateTables(customTables []customTableSpec, cfg *config.Config, events []eventSpec) []customTableSpec {
