@@ -69,6 +69,44 @@ func DecodeTopicAddress(topic string) common.Address {
 	return common.HexToAddress(topic)
 }
 
+// AddressFromHex decodes a 20-byte hex address string (with optional 0x
+// prefix) into a common.Address without allocating. It is byte-identical to
+// common.HexToAddress for canonical 40-hex-digit input and falls back to it
+// for anything irregular (wrong length, non-hex), so it is a drop-in
+// replacement that only removes the intermediate []byte that HexToAddress
+// allocates.
+func AddressFromHex(s string) common.Address {
+	var address common.Address
+	if decodeCanonicalAddress(s, address[:]) {
+		return address
+	}
+	return common.HexToAddress(s)
+}
+
+func decodeCanonicalAddress(s string, dst []byte) bool {
+	if len(dst) != common.AddressLength {
+		return false
+	}
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		s = s[2:]
+	}
+	if len(s) != common.AddressLength*2 {
+		return false
+	}
+	for i := 0; i < common.AddressLength; i++ {
+		hi, ok := fromHexChar(s[i*2])
+		if !ok {
+			return false
+		}
+		lo, ok := fromHexChar(s[i*2+1])
+		if !ok {
+			return false
+		}
+		dst[i] = hi<<4 | lo
+	}
+	return true
+}
+
 // DecodeTopicUint256 decodes a topic into a uint256.Int.
 func DecodeTopicUint256(topic string, dst *uint256.Int) {
 	hash := DecodeTopicHash(topic)

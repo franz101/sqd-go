@@ -14,6 +14,7 @@ import (
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/internal/parser"
+	"github.com/franz101/sqd-go/internal/parser/abiunpack"
 	"github.com/holiman/uint256"
 )
 
@@ -333,7 +334,7 @@ func (in *Inserter) InsertLogs(ctx context.Context, events []parser.DecodedEvent
 				in.colTxHash.Append(common.HexToHash(ev.TxHash).Bytes())
 				in.colTxIdx.Append(ev.TxIndex)
 				in.colLogIdx.Append(ev.LogIndex)
-				in.colAddr.Append(common.HexToAddress(ev.Address).Bytes())
+				in.colAddr.Append(abiunpack.AddressFromHex(ev.Address).Bytes())
 				in.colName.Append(ev.EventName)
 				in.colTopic0.Append(common.HexToHash(ev.Topic0).Bytes())
 				in.colParams.Append(string(paramsJSON))
@@ -476,7 +477,7 @@ func (in *TypedInserter) Insert(ctx context.Context, events []parser.DecodedEven
 				in.colBlock.Append(ev.BlockNumber)
 				in.colTime.Append(ev.BlockTimestamp)
 				in.colBHash.Append(common.HexToHash(ev.BlockHash).Bytes())
-				in.colAddr.Append(common.HexToAddress(ev.Address).Bytes())
+				in.colAddr.Append(abiunpack.AddressFromHex(ev.Address).Bytes())
 				in.colTxHash.Append(common.HexToHash(ev.TxHash).Bytes())
 				in.colTxIdx.Append(ev.TxIndex)
 				in.colLogIdx.Append(ev.LogIndex)
