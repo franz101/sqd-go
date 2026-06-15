@@ -23,6 +23,7 @@ import (
 )
 
 const DefaultClockCacheCapacity uint64 = 100000
+const initialClockCapacity uint64 = 1 << 16
 const recoveryBucketCount = 8
 const recoveryConcurrency = 8
 
@@ -219,13 +220,14 @@ type ConditionsClockEntry struct {
 }
 
 type ConditionsClockCache struct {
-	buckets  []int32
-	next     []int32
-	ring     []ConditionsClockEntry
-	mask     uint32
-	capacity uint64
-	hand     uint64
-	size     uint64
+	buckets     []int32
+	next        []int32
+	ring        []ConditionsClockEntry
+	mask        uint32
+	capacity    uint64
+	maxCapacity uint64
+	hand        uint64
+	size        uint64
 	// evictions counts entries overwritten by CLOCK replacement. While zero,
 	// the hot ring still holds everything ever Set — so under an authoritative
 	// (from-genesis) run, hot contents are a superset of the entity's
@@ -241,20 +243,25 @@ func (c *ConditionsClockCache) Evictions() uint64 {
 	return atomic.LoadUint64(&c.evictions)
 }
 
-func NewConditionsClockCache(capacity uint64) *ConditionsClockCache {
-	if capacity == 0 {
-		capacity = DefaultClockCacheCapacity
+func NewConditionsClockCache(maxCapacity uint64) *ConditionsClockCache {
+	if maxCapacity == 0 {
+		maxCapacity = DefaultClockCacheCapacity
+	}
+	capacity := initialClockCapacity
+	if capacity > maxCapacity {
+		capacity = maxCapacity
 	}
 	bucketCount := uint64(8)
 	for bucketCount < capacity*2 {
 		bucketCount <<= 1
 	}
 	c := &ConditionsClockCache{
-		ring:     make([]ConditionsClockEntry, capacity),
-		buckets:  make([]int32, bucketCount),
-		next:     make([]int32, capacity),
-		mask:     uint32(bucketCount - 1),
-		capacity: capacity,
+		ring:        make([]ConditionsClockEntry, capacity),
+		buckets:     make([]int32, bucketCount),
+		next:        make([]int32, capacity),
+		mask:        uint32(bucketCount - 1),
+		capacity:    capacity,
+		maxCapacity: maxCapacity,
 	}
 	for i := range c.buckets {
 		c.buckets[i] = -1
@@ -303,6 +310,40 @@ func (c *ConditionsClockCache) idxUnlink(key ConditionsClockKey) {
 	}
 }
 
+func (c *ConditionsClockCache) grow() {
+	newCap := c.capacity * 2
+	if newCap > c.maxCapacity {
+		newCap = c.maxCapacity
+	}
+	if newCap <= c.capacity {
+		return
+	}
+	ring := make([]ConditionsClockEntry, newCap)
+	copy(ring, c.ring)
+	c.ring = ring
+	next := make([]int32, newCap)
+	for i := range next {
+		next[i] = -1
+	}
+	c.next = next
+	bucketCount := uint64(8)
+	for bucketCount < newCap*2 {
+		bucketCount <<= 1
+	}
+	c.buckets = make([]int32, bucketCount)
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	c.mask = uint32(bucketCount - 1)
+	old := c.capacity
+	c.capacity = newCap
+	for i := uint64(0); i < old; i++ {
+		if atomic.LoadUint32(&c.ring[i].inUse) == 1 {
+			c.idxInsert(c.ring[i].key, uint32(i))
+		}
+	}
+}
+
 func (c *ConditionsClockCache) Set(value MemoryCondition) {
 	c.SetByKey(NewConditionsClockKey(value), value)
 }
@@ -315,6 +356,9 @@ func (c *ConditionsClockCache) SetByKey(key ConditionsClockKey, value MemoryCond
 			atomic.StoreUint32(&e.referenced, 1)
 			return
 		}
+	}
+	if c.size >= c.capacity && c.capacity < c.maxCapacity {
+		c.grow()
 	}
 	for {
 		hand := atomic.AddUint64(&c.hand, 1)
@@ -631,8 +675,9 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 }
 
 type MemoryConditionBatchResolver struct {
-	cache  *ConditionsClockCache
-	misses []ConditionsClockKey
+	cache                                       *ConditionsClockCache
+	misses                                      []ConditionsClockKey
+	hotHit, hotMiss, coldHit, coldMiss, batches int64
 }
 
 func NewMemoryConditionBatchResolver(cache *ConditionsClockCache) *MemoryConditionBatchResolver {
@@ -642,9 +687,15 @@ func NewMemoryConditionBatchResolver(cache *ConditionsClockCache) *MemoryConditi
 }
 
 func (r *MemoryConditionBatchResolver) Queue(key ConditionsClockKey) {
-	if _, ok := r.cache.Get(key); !ok {
-		r.misses = append(r.misses, key)
+	if idx, ok := r.cache.idxLookup(key); ok {
+		if e := &r.cache.ring[idx]; atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			r.hotHit++
+			return
+		}
 	}
+	r.hotMiss++
+	r.misses = append(r.misses, key)
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
@@ -669,6 +720,57 @@ func (r *MemoryConditionBatchResolver) Resolve(ctx context.Context, conn *ch.Cli
 
 	if len(uniqueList) == 0 {
 		return nil
+	}
+
+	if r.cache.cold != nil {
+		vals := make([]MemoryCondition, len(uniqueList))
+		found := make([]bool, len(uniqueList))
+		const coldReadWorkers = 8
+		var wg sync.WaitGroup
+		chunk := (len(uniqueList) + coldReadWorkers - 1) / coldReadWorkers
+		for w := 0; w < coldReadWorkers; w++ {
+			lo := w * chunk
+			hi := lo + chunk
+			if hi > len(uniqueList) {
+				hi = len(uniqueList)
+			}
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(lo, hi int) {
+				defer wg.Done()
+				for i := lo; i < hi; i++ {
+					k := uniqueList[i]
+					kb := unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))
+					if r.cache.cold.MightContain(kb) {
+						if raw, ok, _ := r.cache.cold.Get(kb); ok {
+							vals[i] = coldDecodeMemoryCondition(raw)
+							found[i] = true
+						}
+					}
+				}
+			}(lo, hi)
+		}
+		wg.Wait()
+		remaining := uniqueList[:0]
+		for i := range uniqueList {
+			if found[i] {
+				r.coldHit++
+				r.cache.SetByKey(uniqueList[i], vals[i])
+			} else {
+				r.coldMiss++
+				remaining = append(remaining, uniqueList[i])
+			}
+		}
+		r.batches++
+		if r.batches%10 == 0 && os.Getenv("SQD_CACHE_STATS") == "1" {
+			fmt.Printf("[CACHE MemoryCondition] hotHit=%d hotMiss=%d missPct=%.1f coldHit=%d coldMissNew=%d\n", r.hotHit, r.hotMiss, 100*float64(r.hotMiss)/float64(r.hotHit+r.hotMiss+1), r.coldHit, r.coldMiss)
+		}
+		uniqueList = remaining
+		if len(uniqueList) == 0 {
+			return nil
+		}
 	}
 
 	foundKeys := make(map[ConditionsClockKey]struct{})
@@ -790,13 +892,14 @@ type UserPositionsClockEntry struct {
 }
 
 type UserPositionsClockCache struct {
-	buckets  []int32
-	next     []int32
-	ring     []UserPositionsClockEntry
-	mask     uint32
-	capacity uint64
-	hand     uint64
-	size     uint64
+	buckets     []int32
+	next        []int32
+	ring        []UserPositionsClockEntry
+	mask        uint32
+	capacity    uint64
+	maxCapacity uint64
+	hand        uint64
+	size        uint64
 	// evictions counts entries overwritten by CLOCK replacement. While zero,
 	// the hot ring still holds everything ever Set — so under an authoritative
 	// (from-genesis) run, hot contents are a superset of the entity's
@@ -812,20 +915,25 @@ func (c *UserPositionsClockCache) Evictions() uint64 {
 	return atomic.LoadUint64(&c.evictions)
 }
 
-func NewUserPositionsClockCache(capacity uint64) *UserPositionsClockCache {
-	if capacity == 0 {
-		capacity = DefaultClockCacheCapacity
+func NewUserPositionsClockCache(maxCapacity uint64) *UserPositionsClockCache {
+	if maxCapacity == 0 {
+		maxCapacity = DefaultClockCacheCapacity
+	}
+	capacity := initialClockCapacity
+	if capacity > maxCapacity {
+		capacity = maxCapacity
 	}
 	bucketCount := uint64(8)
 	for bucketCount < capacity*2 {
 		bucketCount <<= 1
 	}
 	c := &UserPositionsClockCache{
-		ring:     make([]UserPositionsClockEntry, capacity),
-		buckets:  make([]int32, bucketCount),
-		next:     make([]int32, capacity),
-		mask:     uint32(bucketCount - 1),
-		capacity: capacity,
+		ring:        make([]UserPositionsClockEntry, capacity),
+		buckets:     make([]int32, bucketCount),
+		next:        make([]int32, capacity),
+		mask:        uint32(bucketCount - 1),
+		capacity:    capacity,
+		maxCapacity: maxCapacity,
 	}
 	for i := range c.buckets {
 		c.buckets[i] = -1
@@ -875,6 +983,40 @@ func (c *UserPositionsClockCache) idxUnlink(key UserPositionsClockKey) {
 	}
 }
 
+func (c *UserPositionsClockCache) grow() {
+	newCap := c.capacity * 2
+	if newCap > c.maxCapacity {
+		newCap = c.maxCapacity
+	}
+	if newCap <= c.capacity {
+		return
+	}
+	ring := make([]UserPositionsClockEntry, newCap)
+	copy(ring, c.ring)
+	c.ring = ring
+	next := make([]int32, newCap)
+	for i := range next {
+		next[i] = -1
+	}
+	c.next = next
+	bucketCount := uint64(8)
+	for bucketCount < newCap*2 {
+		bucketCount <<= 1
+	}
+	c.buckets = make([]int32, bucketCount)
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	c.mask = uint32(bucketCount - 1)
+	old := c.capacity
+	c.capacity = newCap
+	for i := uint64(0); i < old; i++ {
+		if atomic.LoadUint32(&c.ring[i].inUse) == 1 {
+			c.idxInsert(c.ring[i].key, uint32(i))
+		}
+	}
+}
+
 func (c *UserPositionsClockCache) Set(value MemoryUserPosition) {
 	c.SetByKey(NewUserPositionsClockKey(value), value)
 }
@@ -887,6 +1029,9 @@ func (c *UserPositionsClockCache) SetByKey(key UserPositionsClockKey, value Memo
 			atomic.StoreUint32(&e.referenced, 1)
 			return
 		}
+	}
+	if c.size >= c.capacity && c.capacity < c.maxCapacity {
+		c.grow()
 	}
 	for {
 		hand := atomic.AddUint64(&c.hand, 1)
@@ -1143,8 +1288,9 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 }
 
 type MemoryUserPositionBatchResolver struct {
-	cache  *UserPositionsClockCache
-	misses []UserPositionsClockKey
+	cache                                       *UserPositionsClockCache
+	misses                                      []UserPositionsClockKey
+	hotHit, hotMiss, coldHit, coldMiss, batches int64
 }
 
 func NewMemoryUserPositionBatchResolver(cache *UserPositionsClockCache) *MemoryUserPositionBatchResolver {
@@ -1154,9 +1300,15 @@ func NewMemoryUserPositionBatchResolver(cache *UserPositionsClockCache) *MemoryU
 }
 
 func (r *MemoryUserPositionBatchResolver) Queue(key UserPositionsClockKey) {
-	if _, ok := r.cache.Get(key); !ok {
-		r.misses = append(r.misses, key)
+	if idx, ok := r.cache.idxLookup(key); ok {
+		if e := &r.cache.ring[idx]; atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			r.hotHit++
+			return
+		}
 	}
+	r.hotMiss++
+	r.misses = append(r.misses, key)
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
@@ -1181,6 +1333,58 @@ func (r *MemoryUserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.
 
 	if len(uniqueList) == 0 {
 		return nil
+	}
+
+	if r.cache.cold != nil {
+		vals := make([]MemoryUserPosition, len(uniqueList))
+		found := make([]bool, len(uniqueList))
+		const coldReadWorkers = 8
+		var wg sync.WaitGroup
+		chunk := (len(uniqueList) + coldReadWorkers - 1) / coldReadWorkers
+		for w := 0; w < coldReadWorkers; w++ {
+			lo := w * chunk
+			hi := lo + chunk
+			if hi > len(uniqueList) {
+				hi = len(uniqueList)
+			}
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(lo, hi int) {
+				defer wg.Done()
+				for i := lo; i < hi; i++ {
+					k := uniqueList[i]
+					kb := unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))
+					if r.cache.cold.MightContain(kb) {
+						var v MemoryUserPosition
+						if ok, _ := r.cache.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), kb); ok {
+							vals[i] = v
+							found[i] = true
+						}
+					}
+				}
+			}(lo, hi)
+		}
+		wg.Wait()
+		remaining := uniqueList[:0]
+		for i := range uniqueList {
+			if found[i] {
+				r.coldHit++
+				r.cache.SetByKey(uniqueList[i], vals[i])
+			} else {
+				r.coldMiss++
+				remaining = append(remaining, uniqueList[i])
+			}
+		}
+		r.batches++
+		if r.batches%10 == 0 && os.Getenv("SQD_CACHE_STATS") == "1" {
+			fmt.Printf("[CACHE MemoryUserPosition] hotHit=%d hotMiss=%d missPct=%.1f coldHit=%d coldMissNew=%d\n", r.hotHit, r.hotMiss, 100*float64(r.hotMiss)/float64(r.hotHit+r.hotMiss+1), r.coldHit, r.coldMiss)
+		}
+		uniqueList = remaining
+		if len(uniqueList) == 0 {
+			return nil
+		}
 	}
 
 	foundKeys := make(map[UserPositionsClockKey]struct{})
@@ -1306,13 +1510,14 @@ type MarketsClockEntry struct {
 }
 
 type MarketsClockCache struct {
-	buckets  []int32
-	next     []int32
-	ring     []MarketsClockEntry
-	mask     uint32
-	capacity uint64
-	hand     uint64
-	size     uint64
+	buckets     []int32
+	next        []int32
+	ring        []MarketsClockEntry
+	mask        uint32
+	capacity    uint64
+	maxCapacity uint64
+	hand        uint64
+	size        uint64
 	// evictions counts entries overwritten by CLOCK replacement. While zero,
 	// the hot ring still holds everything ever Set — so under an authoritative
 	// (from-genesis) run, hot contents are a superset of the entity's
@@ -1328,20 +1533,25 @@ func (c *MarketsClockCache) Evictions() uint64 {
 	return atomic.LoadUint64(&c.evictions)
 }
 
-func NewMarketsClockCache(capacity uint64) *MarketsClockCache {
-	if capacity == 0 {
-		capacity = DefaultClockCacheCapacity
+func NewMarketsClockCache(maxCapacity uint64) *MarketsClockCache {
+	if maxCapacity == 0 {
+		maxCapacity = DefaultClockCacheCapacity
+	}
+	capacity := initialClockCapacity
+	if capacity > maxCapacity {
+		capacity = maxCapacity
 	}
 	bucketCount := uint64(8)
 	for bucketCount < capacity*2 {
 		bucketCount <<= 1
 	}
 	c := &MarketsClockCache{
-		ring:     make([]MarketsClockEntry, capacity),
-		buckets:  make([]int32, bucketCount),
-		next:     make([]int32, capacity),
-		mask:     uint32(bucketCount - 1),
-		capacity: capacity,
+		ring:        make([]MarketsClockEntry, capacity),
+		buckets:     make([]int32, bucketCount),
+		next:        make([]int32, capacity),
+		mask:        uint32(bucketCount - 1),
+		capacity:    capacity,
+		maxCapacity: maxCapacity,
 	}
 	for i := range c.buckets {
 		c.buckets[i] = -1
@@ -1390,6 +1600,40 @@ func (c *MarketsClockCache) idxUnlink(key MarketsClockKey) {
 	}
 }
 
+func (c *MarketsClockCache) grow() {
+	newCap := c.capacity * 2
+	if newCap > c.maxCapacity {
+		newCap = c.maxCapacity
+	}
+	if newCap <= c.capacity {
+		return
+	}
+	ring := make([]MarketsClockEntry, newCap)
+	copy(ring, c.ring)
+	c.ring = ring
+	next := make([]int32, newCap)
+	for i := range next {
+		next[i] = -1
+	}
+	c.next = next
+	bucketCount := uint64(8)
+	for bucketCount < newCap*2 {
+		bucketCount <<= 1
+	}
+	c.buckets = make([]int32, bucketCount)
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	c.mask = uint32(bucketCount - 1)
+	old := c.capacity
+	c.capacity = newCap
+	for i := uint64(0); i < old; i++ {
+		if atomic.LoadUint32(&c.ring[i].inUse) == 1 {
+			c.idxInsert(c.ring[i].key, uint32(i))
+		}
+	}
+}
+
 func (c *MarketsClockCache) Set(value MemoryMarket) {
 	c.SetByKey(NewMarketsClockKey(value), value)
 }
@@ -1402,6 +1646,9 @@ func (c *MarketsClockCache) SetByKey(key MarketsClockKey, value MemoryMarket) {
 			atomic.StoreUint32(&e.referenced, 1)
 			return
 		}
+	}
+	if c.size >= c.capacity && c.capacity < c.maxCapacity {
+		c.grow()
 	}
 	for {
 		hand := atomic.AddUint64(&c.hand, 1)
@@ -1686,8 +1933,9 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 }
 
 type MemoryMarketBatchResolver struct {
-	cache  *MarketsClockCache
-	misses []MarketsClockKey
+	cache                                       *MarketsClockCache
+	misses                                      []MarketsClockKey
+	hotHit, hotMiss, coldHit, coldMiss, batches int64
 }
 
 func NewMemoryMarketBatchResolver(cache *MarketsClockCache) *MemoryMarketBatchResolver {
@@ -1697,9 +1945,15 @@ func NewMemoryMarketBatchResolver(cache *MarketsClockCache) *MemoryMarketBatchRe
 }
 
 func (r *MemoryMarketBatchResolver) Queue(key MarketsClockKey) {
-	if _, ok := r.cache.Get(key); !ok {
-		r.misses = append(r.misses, key)
+	if idx, ok := r.cache.idxLookup(key); ok {
+		if e := &r.cache.ring[idx]; atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			r.hotHit++
+			return
+		}
 	}
+	r.hotMiss++
+	r.misses = append(r.misses, key)
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
@@ -1724,6 +1978,57 @@ func (r *MemoryMarketBatchResolver) Resolve(ctx context.Context, conn *ch.Client
 
 	if len(uniqueList) == 0 {
 		return nil
+	}
+
+	if r.cache.cold != nil {
+		vals := make([]MemoryMarket, len(uniqueList))
+		found := make([]bool, len(uniqueList))
+		const coldReadWorkers = 8
+		var wg sync.WaitGroup
+		chunk := (len(uniqueList) + coldReadWorkers - 1) / coldReadWorkers
+		for w := 0; w < coldReadWorkers; w++ {
+			lo := w * chunk
+			hi := lo + chunk
+			if hi > len(uniqueList) {
+				hi = len(uniqueList)
+			}
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(lo, hi int) {
+				defer wg.Done()
+				for i := lo; i < hi; i++ {
+					k := uniqueList[i]
+					kb := unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))
+					if r.cache.cold.MightContain(kb) {
+						if raw, ok, _ := r.cache.cold.Get(kb); ok {
+							vals[i] = coldDecodeMemoryMarket(raw)
+							found[i] = true
+						}
+					}
+				}
+			}(lo, hi)
+		}
+		wg.Wait()
+		remaining := uniqueList[:0]
+		for i := range uniqueList {
+			if found[i] {
+				r.coldHit++
+				r.cache.SetByKey(uniqueList[i], vals[i])
+			} else {
+				r.coldMiss++
+				remaining = append(remaining, uniqueList[i])
+			}
+		}
+		r.batches++
+		if r.batches%10 == 0 && os.Getenv("SQD_CACHE_STATS") == "1" {
+			fmt.Printf("[CACHE MemoryMarket] hotHit=%d hotMiss=%d missPct=%.1f coldHit=%d coldMissNew=%d\n", r.hotHit, r.hotMiss, 100*float64(r.hotMiss)/float64(r.hotHit+r.hotMiss+1), r.coldHit, r.coldMiss)
+		}
+		uniqueList = remaining
+		if len(uniqueList) == 0 {
+			return nil
+		}
 	}
 
 	foundKeys := make(map[MarketsClockKey]struct{})
@@ -1830,13 +2135,14 @@ type NegRiskEventsClockEntry struct {
 }
 
 type NegRiskEventsClockCache struct {
-	buckets  []int32
-	next     []int32
-	ring     []NegRiskEventsClockEntry
-	mask     uint32
-	capacity uint64
-	hand     uint64
-	size     uint64
+	buckets     []int32
+	next        []int32
+	ring        []NegRiskEventsClockEntry
+	mask        uint32
+	capacity    uint64
+	maxCapacity uint64
+	hand        uint64
+	size        uint64
 	// evictions counts entries overwritten by CLOCK replacement. While zero,
 	// the hot ring still holds everything ever Set — so under an authoritative
 	// (from-genesis) run, hot contents are a superset of the entity's
@@ -1852,20 +2158,25 @@ func (c *NegRiskEventsClockCache) Evictions() uint64 {
 	return atomic.LoadUint64(&c.evictions)
 }
 
-func NewNegRiskEventsClockCache(capacity uint64) *NegRiskEventsClockCache {
-	if capacity == 0 {
-		capacity = DefaultClockCacheCapacity
+func NewNegRiskEventsClockCache(maxCapacity uint64) *NegRiskEventsClockCache {
+	if maxCapacity == 0 {
+		maxCapacity = DefaultClockCacheCapacity
+	}
+	capacity := initialClockCapacity
+	if capacity > maxCapacity {
+		capacity = maxCapacity
 	}
 	bucketCount := uint64(8)
 	for bucketCount < capacity*2 {
 		bucketCount <<= 1
 	}
 	c := &NegRiskEventsClockCache{
-		ring:     make([]NegRiskEventsClockEntry, capacity),
-		buckets:  make([]int32, bucketCount),
-		next:     make([]int32, capacity),
-		mask:     uint32(bucketCount - 1),
-		capacity: capacity,
+		ring:        make([]NegRiskEventsClockEntry, capacity),
+		buckets:     make([]int32, bucketCount),
+		next:        make([]int32, capacity),
+		mask:        uint32(bucketCount - 1),
+		capacity:    capacity,
+		maxCapacity: maxCapacity,
 	}
 	for i := range c.buckets {
 		c.buckets[i] = -1
@@ -1914,6 +2225,40 @@ func (c *NegRiskEventsClockCache) idxUnlink(key NegRiskEventsClockKey) {
 	}
 }
 
+func (c *NegRiskEventsClockCache) grow() {
+	newCap := c.capacity * 2
+	if newCap > c.maxCapacity {
+		newCap = c.maxCapacity
+	}
+	if newCap <= c.capacity {
+		return
+	}
+	ring := make([]NegRiskEventsClockEntry, newCap)
+	copy(ring, c.ring)
+	c.ring = ring
+	next := make([]int32, newCap)
+	for i := range next {
+		next[i] = -1
+	}
+	c.next = next
+	bucketCount := uint64(8)
+	for bucketCount < newCap*2 {
+		bucketCount <<= 1
+	}
+	c.buckets = make([]int32, bucketCount)
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	c.mask = uint32(bucketCount - 1)
+	old := c.capacity
+	c.capacity = newCap
+	for i := uint64(0); i < old; i++ {
+		if atomic.LoadUint32(&c.ring[i].inUse) == 1 {
+			c.idxInsert(c.ring[i].key, uint32(i))
+		}
+	}
+}
+
 func (c *NegRiskEventsClockCache) Set(value MemoryNegRiskEvent) {
 	c.SetByKey(NewNegRiskEventsClockKey(value), value)
 }
@@ -1926,6 +2271,9 @@ func (c *NegRiskEventsClockCache) SetByKey(key NegRiskEventsClockKey, value Memo
 			atomic.StoreUint32(&e.referenced, 1)
 			return
 		}
+	}
+	if c.size >= c.capacity && c.capacity < c.maxCapacity {
+		c.grow()
 	}
 	for {
 		hand := atomic.AddUint64(&c.hand, 1)
@@ -2210,8 +2558,9 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 }
 
 type MemoryNegRiskEventBatchResolver struct {
-	cache  *NegRiskEventsClockCache
-	misses []NegRiskEventsClockKey
+	cache                                       *NegRiskEventsClockCache
+	misses                                      []NegRiskEventsClockKey
+	hotHit, hotMiss, coldHit, coldMiss, batches int64
 }
 
 func NewMemoryNegRiskEventBatchResolver(cache *NegRiskEventsClockCache) *MemoryNegRiskEventBatchResolver {
@@ -2221,9 +2570,15 @@ func NewMemoryNegRiskEventBatchResolver(cache *NegRiskEventsClockCache) *MemoryN
 }
 
 func (r *MemoryNegRiskEventBatchResolver) Queue(key NegRiskEventsClockKey) {
-	if _, ok := r.cache.Get(key); !ok {
-		r.misses = append(r.misses, key)
+	if idx, ok := r.cache.idxLookup(key); ok {
+		if e := &r.cache.ring[idx]; atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			r.hotHit++
+			return
+		}
 	}
+	r.hotMiss++
+	r.misses = append(r.misses, key)
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
@@ -2248,6 +2603,57 @@ func (r *MemoryNegRiskEventBatchResolver) Resolve(ctx context.Context, conn *ch.
 
 	if len(uniqueList) == 0 {
 		return nil
+	}
+
+	if r.cache.cold != nil {
+		vals := make([]MemoryNegRiskEvent, len(uniqueList))
+		found := make([]bool, len(uniqueList))
+		const coldReadWorkers = 8
+		var wg sync.WaitGroup
+		chunk := (len(uniqueList) + coldReadWorkers - 1) / coldReadWorkers
+		for w := 0; w < coldReadWorkers; w++ {
+			lo := w * chunk
+			hi := lo + chunk
+			if hi > len(uniqueList) {
+				hi = len(uniqueList)
+			}
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(lo, hi int) {
+				defer wg.Done()
+				for i := lo; i < hi; i++ {
+					k := uniqueList[i]
+					kb := unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))
+					if r.cache.cold.MightContain(kb) {
+						if raw, ok, _ := r.cache.cold.Get(kb); ok {
+							vals[i] = coldDecodeMemoryNegRiskEvent(raw)
+							found[i] = true
+						}
+					}
+				}
+			}(lo, hi)
+		}
+		wg.Wait()
+		remaining := uniqueList[:0]
+		for i := range uniqueList {
+			if found[i] {
+				r.coldHit++
+				r.cache.SetByKey(uniqueList[i], vals[i])
+			} else {
+				r.coldMiss++
+				remaining = append(remaining, uniqueList[i])
+			}
+		}
+		r.batches++
+		if r.batches%10 == 0 && os.Getenv("SQD_CACHE_STATS") == "1" {
+			fmt.Printf("[CACHE MemoryNegRiskEvent] hotHit=%d hotMiss=%d missPct=%.1f coldHit=%d coldMissNew=%d\n", r.hotHit, r.hotMiss, 100*float64(r.hotMiss)/float64(r.hotHit+r.hotMiss+1), r.coldHit, r.coldMiss)
+		}
+		uniqueList = remaining
+		if len(uniqueList) == 0 {
+			return nil
+		}
 	}
 
 	foundKeys := make(map[NegRiskEventsClockKey]struct{})
@@ -2354,13 +2760,14 @@ type FixedProductMarketMakersClockEntry struct {
 }
 
 type FixedProductMarketMakersClockCache struct {
-	buckets  []int32
-	next     []int32
-	ring     []FixedProductMarketMakersClockEntry
-	mask     uint32
-	capacity uint64
-	hand     uint64
-	size     uint64
+	buckets     []int32
+	next        []int32
+	ring        []FixedProductMarketMakersClockEntry
+	mask        uint32
+	capacity    uint64
+	maxCapacity uint64
+	hand        uint64
+	size        uint64
 	// evictions counts entries overwritten by CLOCK replacement. While zero,
 	// the hot ring still holds everything ever Set — so under an authoritative
 	// (from-genesis) run, hot contents are a superset of the entity's
@@ -2376,20 +2783,25 @@ func (c *FixedProductMarketMakersClockCache) Evictions() uint64 {
 	return atomic.LoadUint64(&c.evictions)
 }
 
-func NewFixedProductMarketMakersClockCache(capacity uint64) *FixedProductMarketMakersClockCache {
-	if capacity == 0 {
-		capacity = DefaultClockCacheCapacity
+func NewFixedProductMarketMakersClockCache(maxCapacity uint64) *FixedProductMarketMakersClockCache {
+	if maxCapacity == 0 {
+		maxCapacity = DefaultClockCacheCapacity
+	}
+	capacity := initialClockCapacity
+	if capacity > maxCapacity {
+		capacity = maxCapacity
 	}
 	bucketCount := uint64(8)
 	for bucketCount < capacity*2 {
 		bucketCount <<= 1
 	}
 	c := &FixedProductMarketMakersClockCache{
-		ring:     make([]FixedProductMarketMakersClockEntry, capacity),
-		buckets:  make([]int32, bucketCount),
-		next:     make([]int32, capacity),
-		mask:     uint32(bucketCount - 1),
-		capacity: capacity,
+		ring:        make([]FixedProductMarketMakersClockEntry, capacity),
+		buckets:     make([]int32, bucketCount),
+		next:        make([]int32, capacity),
+		mask:        uint32(bucketCount - 1),
+		capacity:    capacity,
+		maxCapacity: maxCapacity,
 	}
 	for i := range c.buckets {
 		c.buckets[i] = -1
@@ -2438,6 +2850,40 @@ func (c *FixedProductMarketMakersClockCache) idxUnlink(key FixedProductMarketMak
 	}
 }
 
+func (c *FixedProductMarketMakersClockCache) grow() {
+	newCap := c.capacity * 2
+	if newCap > c.maxCapacity {
+		newCap = c.maxCapacity
+	}
+	if newCap <= c.capacity {
+		return
+	}
+	ring := make([]FixedProductMarketMakersClockEntry, newCap)
+	copy(ring, c.ring)
+	c.ring = ring
+	next := make([]int32, newCap)
+	for i := range next {
+		next[i] = -1
+	}
+	c.next = next
+	bucketCount := uint64(8)
+	for bucketCount < newCap*2 {
+		bucketCount <<= 1
+	}
+	c.buckets = make([]int32, bucketCount)
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	c.mask = uint32(bucketCount - 1)
+	old := c.capacity
+	c.capacity = newCap
+	for i := uint64(0); i < old; i++ {
+		if atomic.LoadUint32(&c.ring[i].inUse) == 1 {
+			c.idxInsert(c.ring[i].key, uint32(i))
+		}
+	}
+}
+
 func (c *FixedProductMarketMakersClockCache) Set(value MemoryFixedProductMarketMaker) {
 	c.SetByKey(NewFixedProductMarketMakersClockKey(value), value)
 }
@@ -2450,6 +2896,9 @@ func (c *FixedProductMarketMakersClockCache) SetByKey(key FixedProductMarketMake
 			atomic.StoreUint32(&e.referenced, 1)
 			return
 		}
+	}
+	if c.size >= c.capacity && c.capacity < c.maxCapacity {
+		c.grow()
 	}
 	for {
 		hand := atomic.AddUint64(&c.hand, 1)
@@ -2692,8 +3141,9 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 }
 
 type MemoryFixedProductMarketMakerBatchResolver struct {
-	cache  *FixedProductMarketMakersClockCache
-	misses []FixedProductMarketMakersClockKey
+	cache                                       *FixedProductMarketMakersClockCache
+	misses                                      []FixedProductMarketMakersClockKey
+	hotHit, hotMiss, coldHit, coldMiss, batches int64
 }
 
 func NewMemoryFixedProductMarketMakerBatchResolver(cache *FixedProductMarketMakersClockCache) *MemoryFixedProductMarketMakerBatchResolver {
@@ -2703,9 +3153,15 @@ func NewMemoryFixedProductMarketMakerBatchResolver(cache *FixedProductMarketMake
 }
 
 func (r *MemoryFixedProductMarketMakerBatchResolver) Queue(key FixedProductMarketMakersClockKey) {
-	if _, ok := r.cache.Get(key); !ok {
-		r.misses = append(r.misses, key)
+	if idx, ok := r.cache.idxLookup(key); ok {
+		if e := &r.cache.ring[idx]; atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			r.hotHit++
+			return
+		}
 	}
+	r.hotMiss++
+	r.misses = append(r.misses, key)
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
@@ -2730,6 +3186,58 @@ func (r *MemoryFixedProductMarketMakerBatchResolver) Resolve(ctx context.Context
 
 	if len(uniqueList) == 0 {
 		return nil
+	}
+
+	if r.cache.cold != nil {
+		vals := make([]MemoryFixedProductMarketMaker, len(uniqueList))
+		found := make([]bool, len(uniqueList))
+		const coldReadWorkers = 8
+		var wg sync.WaitGroup
+		chunk := (len(uniqueList) + coldReadWorkers - 1) / coldReadWorkers
+		for w := 0; w < coldReadWorkers; w++ {
+			lo := w * chunk
+			hi := lo + chunk
+			if hi > len(uniqueList) {
+				hi = len(uniqueList)
+			}
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(lo, hi int) {
+				defer wg.Done()
+				for i := lo; i < hi; i++ {
+					k := uniqueList[i]
+					kb := unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))
+					if r.cache.cold.MightContain(kb) {
+						var v MemoryFixedProductMarketMaker
+						if ok, _ := r.cache.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), kb); ok {
+							vals[i] = v
+							found[i] = true
+						}
+					}
+				}
+			}(lo, hi)
+		}
+		wg.Wait()
+		remaining := uniqueList[:0]
+		for i := range uniqueList {
+			if found[i] {
+				r.coldHit++
+				r.cache.SetByKey(uniqueList[i], vals[i])
+			} else {
+				r.coldMiss++
+				remaining = append(remaining, uniqueList[i])
+			}
+		}
+		r.batches++
+		if r.batches%10 == 0 && os.Getenv("SQD_CACHE_STATS") == "1" {
+			fmt.Printf("[CACHE MemoryFixedProductMarketMaker] hotHit=%d hotMiss=%d missPct=%.1f coldHit=%d coldMissNew=%d\n", r.hotHit, r.hotMiss, 100*float64(r.hotMiss)/float64(r.hotHit+r.hotMiss+1), r.coldHit, r.coldMiss)
+		}
+		uniqueList = remaining
+		if len(uniqueList) == 0 {
+			return nil
+		}
 	}
 
 	foundKeys := make(map[FixedProductMarketMakersClockKey]struct{})
@@ -2825,13 +3333,14 @@ type ConditionPreparationsClockEntry struct {
 }
 
 type ConditionPreparationsClockCache struct {
-	buckets  []int32
-	next     []int32
-	ring     []ConditionPreparationsClockEntry
-	mask     uint32
-	capacity uint64
-	hand     uint64
-	size     uint64
+	buckets     []int32
+	next        []int32
+	ring        []ConditionPreparationsClockEntry
+	mask        uint32
+	capacity    uint64
+	maxCapacity uint64
+	hand        uint64
+	size        uint64
 	// evictions counts entries overwritten by CLOCK replacement. While zero,
 	// the hot ring still holds everything ever Set — so under an authoritative
 	// (from-genesis) run, hot contents are a superset of the entity's
@@ -2847,20 +3356,25 @@ func (c *ConditionPreparationsClockCache) Evictions() uint64 {
 	return atomic.LoadUint64(&c.evictions)
 }
 
-func NewConditionPreparationsClockCache(capacity uint64) *ConditionPreparationsClockCache {
-	if capacity == 0 {
-		capacity = DefaultClockCacheCapacity
+func NewConditionPreparationsClockCache(maxCapacity uint64) *ConditionPreparationsClockCache {
+	if maxCapacity == 0 {
+		maxCapacity = DefaultClockCacheCapacity
+	}
+	capacity := initialClockCapacity
+	if capacity > maxCapacity {
+		capacity = maxCapacity
 	}
 	bucketCount := uint64(8)
 	for bucketCount < capacity*2 {
 		bucketCount <<= 1
 	}
 	c := &ConditionPreparationsClockCache{
-		ring:     make([]ConditionPreparationsClockEntry, capacity),
-		buckets:  make([]int32, bucketCount),
-		next:     make([]int32, capacity),
-		mask:     uint32(bucketCount - 1),
-		capacity: capacity,
+		ring:        make([]ConditionPreparationsClockEntry, capacity),
+		buckets:     make([]int32, bucketCount),
+		next:        make([]int32, capacity),
+		mask:        uint32(bucketCount - 1),
+		capacity:    capacity,
+		maxCapacity: maxCapacity,
 	}
 	for i := range c.buckets {
 		c.buckets[i] = -1
@@ -2909,6 +3423,40 @@ func (c *ConditionPreparationsClockCache) idxUnlink(key ConditionPreparationsClo
 	}
 }
 
+func (c *ConditionPreparationsClockCache) grow() {
+	newCap := c.capacity * 2
+	if newCap > c.maxCapacity {
+		newCap = c.maxCapacity
+	}
+	if newCap <= c.capacity {
+		return
+	}
+	ring := make([]ConditionPreparationsClockEntry, newCap)
+	copy(ring, c.ring)
+	c.ring = ring
+	next := make([]int32, newCap)
+	for i := range next {
+		next[i] = -1
+	}
+	c.next = next
+	bucketCount := uint64(8)
+	for bucketCount < newCap*2 {
+		bucketCount <<= 1
+	}
+	c.buckets = make([]int32, bucketCount)
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	c.mask = uint32(bucketCount - 1)
+	old := c.capacity
+	c.capacity = newCap
+	for i := uint64(0); i < old; i++ {
+		if atomic.LoadUint32(&c.ring[i].inUse) == 1 {
+			c.idxInsert(c.ring[i].key, uint32(i))
+		}
+	}
+}
+
 func (c *ConditionPreparationsClockCache) Set(value ConditionalTokensConditionPreparation) {
 	c.SetByKey(NewConditionPreparationsClockKey(value), value)
 }
@@ -2921,6 +3469,9 @@ func (c *ConditionPreparationsClockCache) SetByKey(key ConditionPreparationsCloc
 			atomic.StoreUint32(&e.referenced, 1)
 			return
 		}
+	}
+	if c.size >= c.capacity && c.capacity < c.maxCapacity {
+		c.grow()
 	}
 	for {
 		hand := atomic.AddUint64(&c.hand, 1)
@@ -3035,8 +3586,9 @@ func (c *ConditionPreparationsClockCache) Len() uint64 {
 }
 
 type ConditionalTokensConditionPreparationBatchResolver struct {
-	cache  *ConditionPreparationsClockCache
-	misses []ConditionPreparationsClockKey
+	cache                                       *ConditionPreparationsClockCache
+	misses                                      []ConditionPreparationsClockKey
+	hotHit, hotMiss, coldHit, coldMiss, batches int64
 }
 
 func NewConditionalTokensConditionPreparationBatchResolver(cache *ConditionPreparationsClockCache) *ConditionalTokensConditionPreparationBatchResolver {
@@ -3046,9 +3598,15 @@ func NewConditionalTokensConditionPreparationBatchResolver(cache *ConditionPrepa
 }
 
 func (r *ConditionalTokensConditionPreparationBatchResolver) Queue(key ConditionPreparationsClockKey) {
-	if _, ok := r.cache.Get(key); !ok {
-		r.misses = append(r.misses, key)
+	if idx, ok := r.cache.idxLookup(key); ok {
+		if e := &r.cache.ring[idx]; atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			r.hotHit++
+			return
+		}
 	}
+	r.hotMiss++
+	r.misses = append(r.misses, key)
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.

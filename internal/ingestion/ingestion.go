@@ -445,7 +445,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				if pageSize != 0 || !cursorMode || returnedBlocks == 0 {
 					return
 				}
-				next := adjustAdaptivePageSize(adaptivePageSize, returnedBlocks, producerDur, replayBuf.Len(), replayBuf.capacity)
+				// Binary-search controller: converge the page on the portal's cursor cap
+			// (largest span returned per response; varies with data density). Comparing
+			// the span just served to the page we requested says whether we under-asked
+			// (probe up) or hit the cap (track it). Replaces the old adjustAdaptivePageSize,
+			// which read replayBuf.Len() — saturated at capacity, pinning the page at 200.
+			next := nextPageSize(adaptivePageSize, adaptivePageSize, returnedBlocks, false, minAdaptivePageSize, maxAdaptivePageSize)
 				if next == adaptivePageSize {
 					return
 				}
@@ -453,8 +458,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				adaptivePageSize = next
 				currentAdaptivePageSize.Store(next)
 				if time.Since(lastAdaptiveLog) >= 30*time.Second || next == minAdaptivePageSize || next == maxAdaptivePageSize {
-					log.Printf("Chain %d: adaptive page size %d -> %d (returned=%d producer=%s buffered=%d)",
-						chain.ID, old, next, returnedBlocks, producerDur.Round(time.Millisecond), replayBuf.Len())
+					log.Printf("Chain %d: adaptive page size %d -> %d (span=%d producer=%s)",
+						chain.ID, old, next, returnedBlocks, producerDur.Round(time.Millisecond))
 					lastAdaptiveLog = time.Now()
 				}
 			}
@@ -531,6 +536,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						return
 					}
 					log.Printf("Chain %d: fetch %s error: %v, retrying...", chain.ID, rangeLabel, err)
+					if pageSize == 0 && cursorMode {
+						// Binary-search backoff: the range may be too large for the
+						// server (reject/timeout) — halve the page before retrying.
+						adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, 0, true, minAdaptivePageSize, maxAdaptivePageSize)
+						currentAdaptivePageSize.Store(adaptivePageSize)
+					}
 					select {
 					case <-pCtx.Done():
 						return

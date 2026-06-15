@@ -32,6 +32,10 @@ package generated
 	renderHotStateImports(&b, tables, events)
 
 	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n")
+	// Lazy-grow: rings start at this size and double on demand up to the per-entity
+	// cap, so tiny entities never preallocate a huge ring (the global-cap waste that
+	// inflated the heap and caused GC-assist stalls). 1<<16 entries ≈ a few MB.
+	b.WriteString("const initialClockCapacity uint64 = 1 << 16\n")
 	b.WriteString("const recoveryBucketCount = 8\n")
 	// recoveryConcurrency bounds how many bucket queries run at once during
 	// Recover. Beyond ~8 the latest-per-key scan is decompression-bound, so 8
@@ -362,10 +366,11 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	buckets  []int32
 	next     []int32
 	ring     []%[2]s
-	mask     uint32
-	capacity uint64
-	hand     uint64
-	size     uint64
+	mask        uint32
+	capacity    uint64
+	maxCapacity uint64
+	hand        uint64
+	size        uint64
 	// evictions counts entries overwritten by CLOCK replacement. While zero,
 	// the hot ring still holds everything ever Set — so under an authoritative
 	// (from-genesis) run, hot contents are a superset of the entity's
@@ -381,20 +386,25 @@ func (c *%[1]s) Evictions() uint64 {
 	return atomic.LoadUint64(&c.evictions)
 }
 
-func New%[1]s(capacity uint64) *%[1]s {
-	if capacity == 0 {
-		capacity = DefaultClockCacheCapacity
+func New%[1]s(maxCapacity uint64) *%[1]s {
+	if maxCapacity == 0 {
+		maxCapacity = DefaultClockCacheCapacity
+	}
+	capacity := initialClockCapacity
+	if capacity > maxCapacity {
+		capacity = maxCapacity
 	}
 	bucketCount := uint64(8)
 	for bucketCount < capacity*2 {
 		bucketCount <<= 1
 	}
 	c := &%[1]s{
-		ring:     make([]%[2]s, capacity),
-		buckets:  make([]int32, bucketCount),
-		next:     make([]int32, capacity),
-		mask:     uint32(bucketCount - 1),
-		capacity: capacity,
+		ring:        make([]%[2]s, capacity),
+		buckets:     make([]int32, bucketCount),
+		next:        make([]int32, capacity),
+		mask:        uint32(bucketCount - 1),
+		capacity:    capacity,
+		maxCapacity: maxCapacity,
 	}
 	for i := range c.buckets {
 		c.buckets[i] = -1
@@ -449,6 +459,46 @@ func (c *%[1]s) idxUnlink(key %[2]s) {
 
 `, spec.cacheType, spec.keyType)
 
+	// grow doubles the ring (up to maxCapacity) when it fills, so the working set
+	// stays hot instead of spilling to cold. Entries keep their ring positions —
+	// only the pointer-free bucket index is rebuilt — so it is O(size), amortized
+	// O(1) over the doublings. Single-writer (called from SetByKey only).
+	fmt.Fprintf(b, `func (c *%[1]s) grow() {
+	newCap := c.capacity * 2
+	if newCap > c.maxCapacity {
+		newCap = c.maxCapacity
+	}
+	if newCap <= c.capacity {
+		return
+	}
+	ring := make([]%[2]s, newCap)
+	copy(ring, c.ring)
+	c.ring = ring
+	next := make([]int32, newCap)
+	for i := range next {
+		next[i] = -1
+	}
+	c.next = next
+	bucketCount := uint64(8)
+	for bucketCount < newCap*2 {
+		bucketCount <<= 1
+	}
+	c.buckets = make([]int32, bucketCount)
+	for i := range c.buckets {
+		c.buckets[i] = -1
+	}
+	c.mask = uint32(bucketCount - 1)
+	old := c.capacity
+	c.capacity = newCap
+	for i := uint64(0); i < old; i++ {
+		if atomic.LoadUint32(&c.ring[i].inUse) == 1 {
+			c.idxInsert(c.ring[i].key, uint32(i))
+		}
+	}
+}
+
+`, spec.cacheType, spec.entryType)
+
 	coldOn := entityUsesCold(spec.table)
 	serializedCold := entityUsesSerializedCold(spec.table)
 	// spill: on CLOCK eviction, write the victim (value or tombstone) to the cold
@@ -477,6 +527,9 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 			atomic.StoreUint32(&e.referenced, 1)
 			return
 		}
+	}
+	if c.size >= c.capacity && c.capacity < c.maxCapacity {
+		c.grow()
 	}
 	for {
 		hand := atomic.AddUint64(&c.hand, 1)
@@ -1922,6 +1975,8 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	cacheType := spec.cacheType
 	keyType := spec.keyType
 	valueType := spec.table.GoTypeName
+	coldOn := entityUsesCold(spec.table)
+	serializedCold := entityUsesSerializedCold(spec.table)
 
 	b.WriteString("type ")
 	b.WriteString(resolverType)
@@ -1929,7 +1984,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(cacheType)
 	b.WriteString("\n\tmisses []")
 	b.WriteString(keyType)
-	b.WriteString("\n}\n\n")
+	b.WriteString("\n\thotHit, hotMiss, coldHit, coldMiss, batches int64\n}\n\n")
 
 	b.WriteString("func New")
 	b.WriteString(resolverType)
@@ -1945,7 +2000,10 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(resolverType)
 	b.WriteString(") Queue(key ")
 	b.WriteString(keyType)
-	b.WriteString(") {\n\tif _, ok := r.cache.Get(key); !ok {\n\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
+	// Queue does a HOT-ONLY check (no cold consult) and collects misses, so Resolve
+	// can do the cold reads for the whole batch in PARALLEL instead of one serial
+	// Pebble Get per key (the dominant consumer cost).
+	b.WriteString(") {\n\tif idx, ok := r.cache.idxLookup(key); ok {\n\t\tif e := &r.cache.ring[idx]; atomic.LoadUint32(&e.inUse) == 1 && e.key == key {\n\t\t\tatomic.StoreUint32(&e.referenced, 1)\n\t\t\tr.hotHit++\n\t\t\treturn\n\t\t}\n\t}\n\tr.hotMiss++\n\tr.misses = append(r.misses, key)\n}\n\n")
 
 	b.WriteString("// Pending reports how many missed keys are queued for the next Resolve.\n")
 	b.WriteString("func (r *")
@@ -1969,6 +2027,77 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\t}\n")
 	b.WriteString("\tr.misses = nil\n\n")
 	b.WriteString("\tif len(uniqueList) == 0 {\n\t\treturn nil\n\t}\n\n")
+
+	if coldOn {
+		// Bloom short-circuit: skip the ~11µs Pebble Get for keys the cold tier
+		// provably never stored (≈83% of misses are new positions). Only the
+		// "maybe present" survivors hit Pebble.
+		var coldRead string
+		if serializedCold {
+			coldRead = "\t\t\t\t\tkb := unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))\n" +
+				"\t\t\t\t\tif r.cache.cold.MightContain(kb) {\n" +
+				"\t\t\t\t\t\tif raw, ok, _ := r.cache.cold.Get(kb); ok {\n" +
+				"\t\t\t\t\t\t\tvals[i] = coldDecode" + valueType + "(raw)\n\t\t\t\t\t\t\tfound[i] = true\n\t\t\t\t\t\t}\n" +
+				"\t\t\t\t\t}\n"
+		} else {
+			coldRead = "\t\t\t\t\tkb := unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))\n" +
+				"\t\t\t\t\tif r.cache.cold.MightContain(kb) {\n" +
+				"\t\t\t\t\t\tvar v " + valueType + "\n" +
+				"\t\t\t\t\t\tif ok, _ := r.cache.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), kb); ok {\n" +
+				"\t\t\t\t\t\t\tvals[i] = v\n\t\t\t\t\t\t\tfound[i] = true\n\t\t\t\t\t\t}\n" +
+				"\t\t\t\t\t}\n"
+		}
+		// Cold-authoritative fast path: the Pebble cold tier holds every prior key,
+		// so resolve misses with PARALLEL cold reads (Pebble Get is concurrency-safe)
+		// and promote into the single-writer hot ring serially — parallelizing the
+		// dominant consumer cost (cold getIter.Next), no ClickHouse round-trip.
+		fmt.Fprintf(b, `	if r.cache.cold != nil {
+		vals := make([]%[1]s, len(uniqueList))
+		found := make([]bool, len(uniqueList))
+		const coldReadWorkers = 8
+		var wg sync.WaitGroup
+		chunk := (len(uniqueList) + coldReadWorkers - 1) / coldReadWorkers
+		for w := 0; w < coldReadWorkers; w++ {
+			lo := w * chunk
+			hi := lo + chunk
+			if hi > len(uniqueList) {
+				hi = len(uniqueList)
+			}
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(lo, hi int) {
+				defer wg.Done()
+				for i := lo; i < hi; i++ {
+					k := uniqueList[i]
+%[2]s				}
+			}(lo, hi)
+		}
+		wg.Wait()
+		remaining := uniqueList[:0]
+		for i := range uniqueList {
+			if found[i] {
+				r.coldHit++
+				r.cache.SetByKey(uniqueList[i], vals[i])
+			} else {
+				r.coldMiss++
+				remaining = append(remaining, uniqueList[i])
+			}
+		}
+		r.batches++
+		if r.batches%%10 == 0 && os.Getenv("SQD_CACHE_STATS") == "1" {
+			fmt.Printf("[CACHE %[1]s] hotHit=%%d hotMiss=%%d missPct=%%.1f coldHit=%%d coldMissNew=%%d\n", r.hotHit, r.hotMiss, 100*float64(r.hotMiss)/float64(r.hotHit+r.hotMiss+1), r.coldHit, r.coldMiss)
+		}
+		uniqueList = remaining
+		if len(uniqueList) == 0 {
+			return nil
+		}
+	}
+
+`, valueType, coldRead)
+	}
+
 	b.WriteString("\tfoundKeys := make(map[")
 	b.WriteString(keyType)
 	b.WriteString("]struct{})\n")
