@@ -82,8 +82,9 @@ func CustomProcessing(ctx context.Context, store Store, state *State, block *Par
 		return nil
 	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily
-	// (GetUserPosition/GetCondition/...) from durable ClickHouse state.
+	if err := prefetchBlocksState(ctx, store, state, []*ParsedBlock{block}); err != nil {
+		return err
+	}
 
 	// Process block
 	if CustomProcessFn != nil {
@@ -100,8 +101,13 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 	if state == nil || block == nil {
 		return nil
 	}
+	if len(block.Sequence) == 0 {
+		return nil
+	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily.
+	if err := prefetchProtoBlocksState(ctx, store, state, []*ProtoEventBlock{block}); err != nil {
+		return err
+	}
 
 	if CustomProcessProtoFn != nil {
 		if err := CustomProcessProtoFn(state, block); err != nil {
@@ -458,6 +464,32 @@ func (p *Processor) ProcessParsedBlock(ctx context.Context, store *database.Stor
 	return CustomProcessingProto(ctx, stateStore, p.State, pb)
 }
 
+// PrefetchParsedBlocks implements ingestion.BatchParsedBlockPrefetcher for the
+// producer-parse path. It resolves state keys once for the whole fetched page
+// instead of issuing one batch resolver query per block.
+func (p *Processor) PrefetchParsedBlocks(ctx context.Context, store *database.Store, blocks []any) error {
+	if p == nil || len(blocks) == 0 {
+		return nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	protoBlocks := make([]*ProtoEventBlock, 0, len(blocks))
+	for _, block := range blocks {
+		pb, ok := block.(*ProtoEventBlock)
+		if !ok || pb == nil || len(pb.Sequence) == 0 {
+			continue
+		}
+		protoBlocks = append(protoBlocks, pb)
+	}
+	return prefetchProtoBlocksState(ctx, stateStore, p.State, protoBlocks)
+}
+
 func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {
 	if p == nil || len(logs) == 0 {
 		return nil
@@ -720,4 +752,147 @@ func (p *Processor) CloseColdCache() error {
 	return p.State.HotState.CloseColdCache()
 }
 
+func prefetchBlocksState(ctx context.Context, store Store, state *State, blocks []*ParsedBlock) error {
+	if state == nil || state.HotState == nil || len(blocks) == 0 {
+		return nil
+	}
+	// Safe nil check: store may be a non-nil interface wrapping a nil *database.Store.
+	// store.Conn() panics on nil receiver, so check the concrete value first.
+	if store == nil {
+		return nil
+	}
+	if store.Conn() == nil {
+		return nil
+	}
+	hot := state.HotState
+
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		// Custom prefetch for Position on OrderFilled events
+		for _, ev := range block.ExchangeOrderFilleds {
+			var tokenID common.Hash
+			if ev.MakerAssetID.IsZero() {
+				ev.TakerAssetID.WriteToSlice(tokenID[:])
+			} else {
+				ev.MakerAssetID.WriteToSlice(tokenID[:])
+			}
+			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker, TokenID: tokenID})
+		}
+		for _, ev := range block.NegRiskExchangeOrderFilleds {
+			var tokenID common.Hash
+			if ev.MakerAssetID.IsZero() {
+				ev.TakerAssetID.WriteToSlice(tokenID[:])
+			} else {
+				ev.MakerAssetID.WriteToSlice(tokenID[:])
+			}
+			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker, TokenID: tokenID})
+		}
+		for _, ev := range block.ConditionalTokensConditionPreparations {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+		for _, ev := range block.ConditionalTokensConditionResolutions {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+		for _, ev := range block.ConditionalTokensPositionSplits {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+		for _, ev := range block.ConditionalTokensPositionsMerges {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+		for _, ev := range block.ConditionalTokensPayoutRedemptions {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+		for _, ev := range block.NegRiskAdapterPositionSplits {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+		for _, ev := range block.NegRiskAdapterPositionsMerges {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+		for _, ev := range block.NegRiskAdapterPayoutRedemptions {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID})
+		}
+	}
+
+	if err := hot.UserPositionsResolver.Resolve(ctx, store.Conn(), store.DB()); err != nil {
+		return fmt.Errorf("prefetch Position: %w", err)
+	}
+	if err := hot.ConditionPreparationsResolver.Resolve(ctx, store.Conn(), store.DB()); err != nil {
+		return fmt.Errorf("prefetch ConditionPreparation: %w", err)
+	}
+	return nil
+}
+func prefetchProtoBlocksState(ctx context.Context, store Store, state *State, blocks []*ProtoEventBlock) error {
+	if state == nil || state.HotState == nil || len(blocks) == 0 {
+		return nil
+	}
+	if store == nil {
+		return nil
+	}
+	if store.Conn() == nil {
+		return nil
+	}
+	hot := state.HotState
+
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		block.QueryExchangeOrderFilled().Map(func(ev ExchangeOrderFilledProtoView) {
+			var tokenID common.Hash
+			makerAssetID := ev.MakerAssetID()
+			takerAssetID := ev.TakerAssetID()
+			if makerAssetID.IsZero() {
+				takerAssetID.WriteToSlice(tokenID[:])
+			} else {
+				makerAssetID.WriteToSlice(tokenID[:])
+			}
+			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker(), TokenID: tokenID})
+		})
+		block.QueryNegRiskExchangeOrderFilled().Map(func(ev NegRiskExchangeOrderFilledProtoView) {
+			var tokenID common.Hash
+			makerAssetID := ev.MakerAssetID()
+			takerAssetID := ev.TakerAssetID()
+			if makerAssetID.IsZero() {
+				takerAssetID.WriteToSlice(tokenID[:])
+			} else {
+				makerAssetID.WriteToSlice(tokenID[:])
+			}
+			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker(), TokenID: tokenID})
+		})
+		block.QueryConditionalTokensConditionPreparation().Map(func(ev ConditionalTokensConditionPreparationProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+		block.QueryConditionalTokensConditionResolution().Map(func(ev ConditionalTokensConditionResolutionProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+		block.QueryConditionalTokensPositionSplit().Map(func(ev ConditionalTokensPositionSplitProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+		block.QueryConditionalTokensPositionsMerge().Map(func(ev ConditionalTokensPositionsMergeProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+		block.QueryConditionalTokensPayoutRedemption().Map(func(ev ConditionalTokensPayoutRedemptionProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+		block.QueryNegRiskAdapterPositionSplit().Map(func(ev NegRiskAdapterPositionSplitProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+		block.QueryNegRiskAdapterPositionsMerge().Map(func(ev NegRiskAdapterPositionsMergeProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+		block.QueryNegRiskAdapterPayoutRedemption().Map(func(ev NegRiskAdapterPayoutRedemptionProtoView) {
+			hot.ConditionPreparationsResolver.Queue(ConditionPreparationsClockKey{ConditionID: ev.ConditionID()})
+		})
+	}
+
+	if err := hot.UserPositionsResolver.Resolve(ctx, store.Conn(), store.DB()); err != nil {
+		return fmt.Errorf("prefetch Position: %w", err)
+	}
+	if err := hot.ConditionPreparationsResolver.Resolve(ctx, store.Conn(), store.DB()); err != nil {
+		return fmt.Errorf("prefetch ConditionPreparation: %w", err)
+	}
+	return nil
+}
 func PrintPnLSummary(state *State, blockNumber uint64) {}

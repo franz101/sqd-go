@@ -9,6 +9,7 @@ type recoveryBase struct {
 	Number        uint64
 	Hash          string
 	FromFinalized bool
+	NeedsRollback bool
 
 	TrackerCurrent       *client.BlockRef
 	TrackerFinalized     *client.BlockRef
@@ -21,10 +22,12 @@ func selectRecoveryBase(saved *database.SyncState, hasSaved bool) (recoveryBase,
 	}
 
 	if finalized := syncCursorPtrToBlockRef(saved.Finalized); finalized != nil {
+		unfinalized := filterUnfinalizedRollbackChain(syncCursorsToBlockRefs(saved.RollbackChain), finalized)
 		return recoveryBase{
 			Number:               finalized.Number,
 			Hash:                 finalized.Hash,
 			FromFinalized:        true,
+			NeedsRollback:        saved.Current.Number > finalized.Number || len(unfinalized) > 0,
 			TrackerCurrent:       finalized,
 			TrackerFinalized:     finalized,
 			TrackerRollbackChain: nil,
@@ -36,6 +39,7 @@ func selectRecoveryBase(saved *database.SyncState, hasSaved bool) (recoveryBase,
 	return recoveryBase{
 		Number:               saved.Current.Number,
 		Hash:                 saved.Current.Hash,
+		NeedsRollback:        true,
 		TrackerCurrent:       current,
 		TrackerFinalized:     nil,
 		TrackerRollbackChain: rollbackChain,

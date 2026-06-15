@@ -15,8 +15,9 @@ import (
 
 // TestBenchHeadRange replays a fixed head-density block range (fixture files,
 // no portal variance) against a clone of the live state tables — i.e. the
-// resumed-run scenario where hot state starts empty, the cold tier is
-// non-authoritative, and every first-touch key may fall through to ClickHouse.
+// resumed-run scenario where hot state starts empty, the cold tier starts
+// non-authoritative, and first-touch keys are prefetched from ClickHouse in
+// batches instead of forcing a full historical cold-cache rebuild.
 //
 // Fetch the fixture once:
 //
@@ -65,21 +66,22 @@ func TestBenchHeadRange(t *testing.T) {
 		}
 	}
 
-	// Real resume flow: enable the cold tier first, then rebuild state from
-	// ClickHouse. LoadFromDatabase re-opens the tier fresh, runs Recover with it
-	// attached (rows past the hot ring capacity spill to Pebble), and marks it
-	// authoritative — steady state then never point-SELECTs ClickHouse.
+	// Real sparse resume flow: enable the cold tier first, then load only the
+	// checkpoint horizon. The run hydrates the working set from ClickHouse via
+	// generated state prefetch instead of rebuilding every historical position
+	// into Pebble before the benchmark starts.
 	coldDir := filepath.Join(t.TempDir(), "cold")
 	if err := proc.EnableColdCache(coldDir, false); err != nil {
 		t.Fatalf("enable cold cache: %v", err)
 	}
 	defer func() { _ = proc.CloseColdCache() }()
 	proc.State.SetSnapshotsEnabled(false)
+	t.Setenv("SQD_SPARSE_RESUME", "1")
 	loadStart := time.Now()
 	if err := proc.LoadFromDatabase(60444591); err != nil {
 		t.Fatalf("load state from clickhouse: %v", err)
 	}
-	t.Logf("state rebuild from ClickHouse (recovery path): %s, authoritative=%v",
+	t.Logf("state sparse resume from ClickHouse: %s, authoritative=%v",
 		time.Since(loadStart).Round(time.Millisecond), proc.State.HotState.ColdAuthoritative())
 
 	started := time.Now()

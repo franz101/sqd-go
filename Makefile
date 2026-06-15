@@ -84,7 +84,7 @@ dev-v2: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 3664531 $(POLYMARKET_ARGS)
 
 dev-v2-live: codegen-polymarket build
-	SQD_PARSE_DECODE_V2=1 CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23364531 $(POLYMARKET_ARGS)
+	SQD_PARSE_DECODE_V2=1 SQD_SPARSE_RESUME=1 CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 23364531 $(POLYMARKET_ARGS)
 
 # dev-fast: clean V2 fast-path run from block 23M. Every speed setting is now a
 # codegen/config default (V2 proto, cold cache on, 20k commit interval,

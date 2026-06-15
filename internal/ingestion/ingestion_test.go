@@ -59,6 +59,20 @@ func TestNextProducerRequestRangeStopsPastLocalEnd(t *testing.T) {
 	}
 }
 
+func TestAdjustAdaptivePageSizeGrowsForFastProducer(t *testing.T) {
+	got := adjustAdaptivePageSize(5000, 5000, 250*time.Millisecond, 0, 8192)
+	if got <= 5000 {
+		t.Fatalf("adaptive page size = %d, want growth", got)
+	}
+}
+
+func TestAdjustAdaptivePageSizeShrinksOnBackpressure(t *testing.T) {
+	got := adjustAdaptivePageSize(40000, 40000, time.Second, 7000, 8192)
+	if got >= 40000 {
+		t.Fatalf("adaptive page size = %d, want shrink", got)
+	}
+}
+
 func TestNextRequestRangeBoundedUsesPageSizeAndEnd(t *testing.T) {
 	end := uint64(20)
 

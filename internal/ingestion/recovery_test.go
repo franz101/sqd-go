@@ -28,6 +28,9 @@ func TestSelectRecoveryBasePrefersFinalizedCheckpoint(t *testing.T) {
 	if !recovery.FromFinalized {
 		t.Fatal("expected finalized recovery base")
 	}
+	if !recovery.NeedsRollback {
+		t.Fatal("expected rollback when current checkpoint is ahead of finalized")
+	}
 	if recovery.Number != 10 || recovery.Hash != "0x10" {
 		t.Fatalf("recovery cursor = %d/%s, want 10/0x10", recovery.Number, recovery.Hash)
 	}
@@ -39,6 +42,25 @@ func TestSelectRecoveryBasePrefersFinalizedCheckpoint(t *testing.T) {
 	}
 	if len(recovery.TrackerRollbackChain) != 0 {
 		t.Fatalf("rollback chain = %#v, want empty when recovering from finalized", recovery.TrackerRollbackChain)
+	}
+}
+
+func TestSelectRecoveryBaseSkipsRollbackForCleanFinalizedCheckpoint(t *testing.T) {
+	saved := &database.SyncState{
+		Current:   database.SyncCursor{Number: 10, Hash: "0x10"},
+		Finalized: &database.SyncCursor{Number: 10, Hash: "0x10"},
+	}
+
+	recovery, ok := selectRecoveryBase(saved, true)
+
+	if !ok {
+		t.Fatal("expected recovery base")
+	}
+	if !recovery.FromFinalized {
+		t.Fatal("expected finalized recovery base")
+	}
+	if recovery.NeedsRollback {
+		t.Fatal("did not expect rollback for current==finalized with empty rollback chain")
 	}
 }
 
@@ -58,6 +80,9 @@ func TestSelectRecoveryBaseFallsBackToCurrentCheckpoint(t *testing.T) {
 	}
 	if recovery.FromFinalized {
 		t.Fatal("did not expect finalized recovery base")
+	}
+	if !recovery.NeedsRollback {
+		t.Fatal("expected rollback for current recovery")
 	}
 	if recovery.Number != 12 || recovery.Hash != "0x12" {
 		t.Fatalf("recovery cursor = %d/%s, want 12/0x12", recovery.Number, recovery.Hash)

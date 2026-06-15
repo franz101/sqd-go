@@ -21,6 +21,7 @@ import (
 )
 
 const DefaultClockCacheCapacity uint64 = 100000
+const recoveryBucketCount = 8
 
 // coldBoolByte packs a bool for the cold-tier value codec.
 func coldBoolByte(x bool) byte {
@@ -28,6 +29,23 @@ func coldBoolByte(x bool) byte {
 		return 1
 	}
 	return 0
+}
+
+func recoveryFixedStringRange(column string, bucket int, size int) string {
+	if recoveryBucketCount <= 1 {
+		return "1"
+	}
+	width := 256 / recoveryBucketCount
+	lower := bucket * width
+	lowerHex := fmt.Sprintf("%02x%s", lower, strings.Repeat("00", size-1))
+	lowerExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", lowerHex, size)
+	if bucket >= recoveryBucketCount-1 {
+		return fmt.Sprintf("%s >= %s", column, lowerExpr)
+	}
+	upper := (bucket + 1) * width
+	upperHex := fmt.Sprintf("%02x%s", upper, strings.Repeat("00", size-1))
+	upperExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", upperHex, size)
+	return fmt.Sprintf("%s >= %s AND %s < %s", column, lowerExpr, column, upperExpr)
 }
 
 type MemoryCondition struct {
@@ -412,57 +430,65 @@ func (b *MemoryConditionBatch) Insert(ctx context.Context, conn *ch.Client, db s
 }
 
 func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	var (
-		colID               proto.ColFixedStr
-		colOracle           proto.ColFixedStr
-		colQuestionID       proto.ColFixedStr
-		colOutcomeSlotCount proto.ColUInt8
-		colResolved         proto.ColUInt8
-		colPayouts          *proto.ColArr[proto.UInt256]
-		colUpdatedAtBlock   proto.ColUInt64
-		colUpdatedAt        proto.ColDateTime64
-		colBlockNumber      proto.ColUInt64
-		colTxIndex          proto.ColUInt64
-		colLogIndex         proto.ColUInt64
-	)
-	colID.SetSize(32)
-	colOracle.SetSize(20)
-	colQuestionID.SetSize(32)
-	colPayouts = new(proto.ColUInt256).Array()
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "oracle", Data: &colOracle},
-		{Name: "question_id", Data: &colQuestionID},
-		{Name: "outcome_slot_count", Data: &colOutcomeSlotCount},
-		{Name: "resolved", Data: &colResolved},
-		{Name: "payouts", Data: colPayouts},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, argMax(`t`.`oracle`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `oracle`, argMax(`t`.`question_id`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `question_id`, argMax(`t`.`outcome_slot_count`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `outcome_slot_count`, argMax(`t`.`resolved`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `resolved`, argMax(`t`.`payouts`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `payouts`, argMax(`t`.`updated_at_block`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at_block`, argMax(`t`.`updated_at`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at`, argMax(`t`.`block_number`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `block_number`, argMax(`t`.`transaction_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `transaction_index`, argMax(`t`.`log_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `log_index` FROM %s.%s AS `t` GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_conditions")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
-		for i := 0; i < block.Rows; i++ {
-			item := MemoryCondition{
-				ID:               common.BytesToHash(colID.Row(i)),
-				Oracle:           common.BytesToAddress(colOracle.Row(i)),
-				QuestionID:       common.BytesToHash(colQuestionID.Row(i)),
-				OutcomeSlotCount: colOutcomeSlotCount.Row(i),
-				Resolved:         colResolved.Row(i) != 0,
-				Payouts:          hotStateUint256Slice(colPayouts.Row(i)),
-				UpdatedAtBlock:   colUpdatedAtBlock.Row(i),
-				UpdatedAt:        colUpdatedAt.Row(i).UnixMilli(),
-				BlockNumber:      colBlockNumber.Row(i),
-				TxIndex:          colTxIndex.Row(i),
-				LogIndex:         colLogIndex.Row(i),
-			}
-			c.Set(item)
+	runBucket := func(bucket int) error {
+		var (
+			colID               proto.ColFixedStr
+			colOracle           proto.ColFixedStr
+			colQuestionID       proto.ColFixedStr
+			colOutcomeSlotCount proto.ColUInt8
+			colResolved         proto.ColUInt8
+			colPayouts          *proto.ColArr[proto.UInt256]
+			colUpdatedAtBlock   proto.ColUInt64
+			colUpdatedAt        proto.ColDateTime64
+			colBlockNumber      proto.ColUInt64
+			colTxIndex          proto.ColUInt64
+			colLogIndex         proto.ColUInt64
+		)
+		colID.SetSize(32)
+		colOracle.SetSize(20)
+		colQuestionID.SetSize(32)
+		colPayouts = new(proto.ColUInt256).Array()
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "oracle", Data: &colOracle},
+			{Name: "question_id", Data: &colQuestionID},
+			{Name: "outcome_slot_count", Data: &colOutcomeSlotCount},
+			{Name: "resolved", Data: &colResolved},
+			{Name: "payouts", Data: colPayouts},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
 		}
-		return nil
-	}})
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`oracle` AS `oracle`, `t`.`question_id` AS `question_id`, `t`.`outcome_slot_count` AS `outcome_slot_count`, `t`.`resolved` AS `resolved`, `t`.`payouts` AS `payouts`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_conditions"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			for i := 0; i < block.Rows; i++ {
+				item := MemoryCondition{
+					ID:               common.BytesToHash(colID.Row(i)),
+					Oracle:           common.BytesToAddress(colOracle.Row(i)),
+					QuestionID:       common.BytesToHash(colQuestionID.Row(i)),
+					OutcomeSlotCount: colOutcomeSlotCount.Row(i),
+					Resolved:         colResolved.Row(i) != 0,
+					Payouts:          hotStateUint256Slice(colPayouts.Row(i)),
+					UpdatedAtBlock:   colUpdatedAtBlock.Row(i),
+					UpdatedAt:        colUpdatedAt.Row(i).UnixMilli(),
+					BlockNumber:      colBlockNumber.Row(i),
+					TxIndex:          colTxIndex.Row(i),
+					LogIndex:         colLogIndex.Row(i),
+				}
+				c.Set(item)
+			}
+			return nil
+		}})
+	}
+	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
+		if err := runBucket(bucket); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type MemoryConditionBatchResolver struct {
@@ -506,72 +532,82 @@ func (r *MemoryConditionBatchResolver) Resolve(ctx context.Context, conn *ch.Cli
 		return nil
 	}
 
-	var values []string
-	for _, key := range uniqueList {
-		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
-	}
-
-	queryStr := fmt.Sprintf("SELECT `id`, `oracle`, `question_id`, `outcome_slot_count`, `resolved`, `payouts`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_conditions WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
-
-	var (
-		colID               proto.ColFixedStr
-		colOracle           proto.ColFixedStr
-		colQuestionID       proto.ColFixedStr
-		colOutcomeSlotCount proto.ColUInt8
-		colResolved         proto.ColUInt8
-		colPayouts          *proto.ColArr[proto.UInt256]
-		colUpdatedAtBlock   proto.ColUInt64
-		colUpdatedAt        proto.ColDateTime64
-		colBlockNumber      proto.ColUInt64
-		colTxIndex          proto.ColUInt64
-		colLogIndex         proto.ColUInt64
-	)
-	colID.SetSize(32)
-	colOracle.SetSize(20)
-	colQuestionID.SetSize(32)
-	colPayouts = new(proto.ColUInt256).Array()
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "oracle", Data: &colOracle},
-		{Name: "question_id", Data: &colQuestionID},
-		{Name: "outcome_slot_count", Data: &colOutcomeSlotCount},
-		{Name: "resolved", Data: &colResolved},
-		{Name: "payouts", Data: colPayouts},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
 	foundKeys := make(map[ConditionsClockKey]struct{})
-	q := ch.Query{
-		Body:   queryStr,
-		Result: results,
-		OnResult: func(ctx context.Context, block proto.Block) error {
-			for i := 0; i < block.Rows; i++ {
-				item := MemoryCondition{
-					ID:               common.BytesToHash(colID.Row(i)),
-					Oracle:           common.BytesToAddress(colOracle.Row(i)),
-					QuestionID:       common.BytesToHash(colQuestionID.Row(i)),
-					OutcomeSlotCount: colOutcomeSlotCount.Row(i),
-					Resolved:         colResolved.Row(i) != 0,
-					Payouts:          hotStateUint256Slice(colPayouts.Row(i)),
-					UpdatedAtBlock:   colUpdatedAtBlock.Row(i),
-					UpdatedAt:        colUpdatedAt.Row(i).UnixMilli(),
-					BlockNumber:      colBlockNumber.Row(i),
-					TxIndex:          colTxIndex.Row(i),
-					LogIndex:         colLogIndex.Row(i),
+	const resolverChunkSize = 4000
+	for chunkStart := 0; chunkStart < len(uniqueList); chunkStart += resolverChunkSize {
+		chunkEnd := chunkStart + resolverChunkSize
+		if chunkEnd > len(uniqueList) {
+			chunkEnd = len(uniqueList)
+		}
+		chunk := uniqueList[chunkStart:chunkEnd]
+
+		var values []string
+		for _, key := range chunk {
+			values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
+		}
+
+		queryStr := fmt.Sprintf("SELECT `id`, `oracle`, `question_id`, `outcome_slot_count`, `resolved`, `payouts`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_conditions WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+
+		var (
+			colID               proto.ColFixedStr
+			colOracle           proto.ColFixedStr
+			colQuestionID       proto.ColFixedStr
+			colOutcomeSlotCount proto.ColUInt8
+			colResolved         proto.ColUInt8
+			colPayouts          *proto.ColArr[proto.UInt256]
+			colUpdatedAtBlock   proto.ColUInt64
+			colUpdatedAt        proto.ColDateTime64
+			colBlockNumber      proto.ColUInt64
+			colTxIndex          proto.ColUInt64
+			colLogIndex         proto.ColUInt64
+		)
+		colID.SetSize(32)
+		colOracle.SetSize(20)
+		colQuestionID.SetSize(32)
+		colPayouts = new(proto.ColUInt256).Array()
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "oracle", Data: &colOracle},
+			{Name: "question_id", Data: &colQuestionID},
+			{Name: "outcome_slot_count", Data: &colOutcomeSlotCount},
+			{Name: "resolved", Data: &colResolved},
+			{Name: "payouts", Data: colPayouts},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
+		}
+		q := ch.Query{
+			Body:     queryStr,
+			Result:   results,
+			Settings: []ch.Setting{{Key: "max_query_size", Value: "10485760"}},
+			OnResult: func(ctx context.Context, block proto.Block) error {
+				for i := 0; i < block.Rows; i++ {
+					item := MemoryCondition{
+						ID:               common.BytesToHash(colID.Row(i)),
+						Oracle:           common.BytesToAddress(colOracle.Row(i)),
+						QuestionID:       common.BytesToHash(colQuestionID.Row(i)),
+						OutcomeSlotCount: colOutcomeSlotCount.Row(i),
+						Resolved:         colResolved.Row(i) != 0,
+						Payouts:          hotStateUint256Slice(colPayouts.Row(i)),
+						UpdatedAtBlock:   colUpdatedAtBlock.Row(i),
+						UpdatedAt:        colUpdatedAt.Row(i).UnixMilli(),
+						BlockNumber:      colBlockNumber.Row(i),
+						TxIndex:          colTxIndex.Row(i),
+						LogIndex:         colLogIndex.Row(i),
+					}
+					r.cache.Set(item)
+					foundKeys[NewConditionsClockKey(item)] = struct{}{}
 				}
-				r.cache.Set(item)
-				foundKeys[NewConditionsClockKey(item)] = struct{}{}
-			}
-			return nil
-		},
-	}
-	if err := conn.Do(ctx, q); err != nil {
-		return err
+				return nil
+			},
+		}
+		if err := conn.Do(ctx, q); err != nil {
+			return err
+		}
 	}
 	for _, key := range uniqueList {
 		if _, found := foundKeys[key]; !found {
@@ -903,55 +939,63 @@ func (b *MemoryUserPositionBatch) Insert(ctx context.Context, conn *ch.Client, d
 }
 
 func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	var (
-		colUser           proto.ColFixedStr
-		colTokenID        proto.ColFixedStr
-		colAmount         decimal256Col
-		colAvgPrice       decimal256Col
-		colRealizedPnL    decimal256Col
-		colTotalBought    decimal256Col
-		colUpdatedAtBlock proto.ColUInt64
-		colUpdatedAt      proto.ColDateTime64
-		colBlockNumber    proto.ColUInt64
-		colTxIndex        proto.ColUInt64
-		colLogIndex       proto.ColUInt64
-	)
-	colUser.SetSize(20)
-	colTokenID.SetSize(32)
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "user", Data: &colUser},
-		{Name: "token_id", Data: &colTokenID},
-		{Name: "amount", Data: &colAmount},
-		{Name: "avg_price", Data: &colAvgPrice},
-		{Name: "realized_pn_l", Data: &colRealizedPnL},
-		{Name: "total_bought", Data: &colTotalBought},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, argMax(`t`.`amount`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `amount`, argMax(`t`.`avg_price`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `avg_price`, argMax(`t`.`realized_pn_l`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `realized_pn_l`, argMax(`t`.`total_bought`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `total_bought`, argMax(`t`.`updated_at_block`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at_block`, argMax(`t`.`updated_at`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at`, argMax(`t`.`block_number`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `block_number`, argMax(`t`.`transaction_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `transaction_index`, argMax(`t`.`log_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `log_index` FROM %s.%s AS `t` GROUP BY `t`.`user`, `t`.`token_id`", quoteIdent(db), quoteIdent("memory_user_positions")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
-		for i := 0; i < block.Rows; i++ {
-			item := MemoryUserPosition{
-				User:           common.BytesToAddress(colUser.Row(i)),
-				TokenID:        common.BytesToHash(colTokenID.Row(i)),
-				Amount:         protomath.Decimal256(colAmount.Row(i)),
-				AvgPrice:       protomath.Decimal256(colAvgPrice.Row(i)),
-				RealizedPnL:    protomath.Decimal256(colRealizedPnL.Row(i)),
-				TotalBought:    protomath.Decimal256(colTotalBought.Row(i)),
-				UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-				UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
-				BlockNumber:    colBlockNumber.Row(i),
-				TxIndex:        colTxIndex.Row(i),
-				LogIndex:       colLogIndex.Row(i),
-			}
-			c.Set(item)
+	runBucket := func(bucket int) error {
+		var (
+			colUser           proto.ColFixedStr
+			colTokenID        proto.ColFixedStr
+			colAmount         decimal256Col
+			colAvgPrice       decimal256Col
+			colRealizedPnL    decimal256Col
+			colTotalBought    decimal256Col
+			colUpdatedAtBlock proto.ColUInt64
+			colUpdatedAt      proto.ColDateTime64
+			colBlockNumber    proto.ColUInt64
+			colTxIndex        proto.ColUInt64
+			colLogIndex       proto.ColUInt64
+		)
+		colUser.SetSize(20)
+		colTokenID.SetSize(32)
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "user", Data: &colUser},
+			{Name: "token_id", Data: &colTokenID},
+			{Name: "amount", Data: &colAmount},
+			{Name: "avg_price", Data: &colAvgPrice},
+			{Name: "realized_pn_l", Data: &colRealizedPnL},
+			{Name: "total_bought", Data: &colTotalBought},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
 		}
-		return nil
-	}})
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`user` DESC, `t`.`token_id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_user_positions"), recoveryFixedStringRange("`t`.`user`", bucket, 20)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			for i := 0; i < block.Rows; i++ {
+				item := MemoryUserPosition{
+					User:           common.BytesToAddress(colUser.Row(i)),
+					TokenID:        common.BytesToHash(colTokenID.Row(i)),
+					Amount:         protomath.Decimal256(colAmount.Row(i)),
+					AvgPrice:       protomath.Decimal256(colAvgPrice.Row(i)),
+					RealizedPnL:    protomath.Decimal256(colRealizedPnL.Row(i)),
+					TotalBought:    protomath.Decimal256(colTotalBought.Row(i)),
+					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
+					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
+					BlockNumber:    colBlockNumber.Row(i),
+					TxIndex:        colTxIndex.Row(i),
+					LogIndex:       colLogIndex.Row(i),
+				}
+				c.Set(item)
+			}
+			return nil
+		}})
+	}
+	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
+		if err := runBucket(bucket); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type MemoryUserPositionBatchResolver struct {
@@ -995,70 +1039,89 @@ func (r *MemoryUserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.
 		return nil
 	}
 
-	var values []string
-	for _, key := range uniqueList {
-		values = append(values, "("+fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.User.Hex(), "0x"))+", "+fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.TokenID.Hex(), "0x"))+")")
-	}
-
-	queryStr := fmt.Sprintf("SELECT `user`, `token_id`, `amount`, `avg_price`, `realized_pn_l`, `total_bought`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_user_positions WHERE (`user`, `token_id`) IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `user`, `token_id`", quoteIdent(db), strings.Join(values, ", "))
-
-	var (
-		colUser           proto.ColFixedStr
-		colTokenID        proto.ColFixedStr
-		colAmount         decimal256Col
-		colAvgPrice       decimal256Col
-		colRealizedPnL    decimal256Col
-		colTotalBought    decimal256Col
-		colUpdatedAtBlock proto.ColUInt64
-		colUpdatedAt      proto.ColDateTime64
-		colBlockNumber    proto.ColUInt64
-		colTxIndex        proto.ColUInt64
-		colLogIndex       proto.ColUInt64
-	)
-	colUser.SetSize(20)
-	colTokenID.SetSize(32)
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "user", Data: &colUser},
-		{Name: "token_id", Data: &colTokenID},
-		{Name: "amount", Data: &colAmount},
-		{Name: "avg_price", Data: &colAvgPrice},
-		{Name: "realized_pn_l", Data: &colRealizedPnL},
-		{Name: "total_bought", Data: &colTotalBought},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
 	foundKeys := make(map[UserPositionsClockKey]struct{})
-	q := ch.Query{
-		Body:   queryStr,
-		Result: results,
-		OnResult: func(ctx context.Context, block proto.Block) error {
-			for i := 0; i < block.Rows; i++ {
-				item := MemoryUserPosition{
-					User:           common.BytesToAddress(colUser.Row(i)),
-					TokenID:        common.BytesToHash(colTokenID.Row(i)),
-					Amount:         protomath.Decimal256(colAmount.Row(i)),
-					AvgPrice:       protomath.Decimal256(colAvgPrice.Row(i)),
-					RealizedPnL:    protomath.Decimal256(colRealizedPnL.Row(i)),
-					TotalBought:    protomath.Decimal256(colTotalBought.Row(i)),
-					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
-					BlockNumber:    colBlockNumber.Row(i),
-					TxIndex:        colTxIndex.Row(i),
-					LogIndex:       colLogIndex.Row(i),
+	const resolverChunkSize = 4000
+	for chunkStart := 0; chunkStart < len(uniqueList); chunkStart += resolverChunkSize {
+		chunkEnd := chunkStart + resolverChunkSize
+		if chunkEnd > len(uniqueList) {
+			chunkEnd = len(uniqueList)
+		}
+		chunk := uniqueList[chunkStart:chunkEnd]
+
+		var keyColUser proto.ColFixedStr
+		keyColUser.SetSize(20)
+		var keyColTokenID proto.ColFixedStr
+		keyColTokenID.SetSize(32)
+		for _, key := range chunk {
+			keyColUser.Append(key.User.Bytes())
+			keyColTokenID.Append(key.TokenID.Bytes())
+		}
+
+		queryStr := fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.memory_user_positions AS `t` INNER JOIN _resolver_keys AS `k` ON `t`.`user` = `k`.`user` AND `t`.`token_id` = `k`.`token_id` ORDER BY `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id`", quoteIdent(db))
+
+		var (
+			colUser           proto.ColFixedStr
+			colTokenID        proto.ColFixedStr
+			colAmount         decimal256Col
+			colAvgPrice       decimal256Col
+			colRealizedPnL    decimal256Col
+			colTotalBought    decimal256Col
+			colUpdatedAtBlock proto.ColUInt64
+			colUpdatedAt      proto.ColDateTime64
+			colBlockNumber    proto.ColUInt64
+			colTxIndex        proto.ColUInt64
+			colLogIndex       proto.ColUInt64
+		)
+		colUser.SetSize(20)
+		colTokenID.SetSize(32)
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "user", Data: &colUser},
+			{Name: "token_id", Data: &colTokenID},
+			{Name: "amount", Data: &colAmount},
+			{Name: "avg_price", Data: &colAvgPrice},
+			{Name: "realized_pn_l", Data: &colRealizedPnL},
+			{Name: "total_bought", Data: &colTotalBought},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
+		}
+		q := ch.Query{
+			Body:          queryStr,
+			Result:        results,
+			Settings:      []ch.Setting{{Key: "max_query_size", Value: "10485760"}},
+			ExternalTable: "_resolver_keys",
+			ExternalData: []proto.InputColumn{
+				{Name: "user", Data: keyColUser},
+				{Name: "token_id", Data: keyColTokenID},
+			},
+			OnResult: func(ctx context.Context, block proto.Block) error {
+				for i := 0; i < block.Rows; i++ {
+					item := MemoryUserPosition{
+						User:           common.BytesToAddress(colUser.Row(i)),
+						TokenID:        common.BytesToHash(colTokenID.Row(i)),
+						Amount:         protomath.Decimal256(colAmount.Row(i)),
+						AvgPrice:       protomath.Decimal256(colAvgPrice.Row(i)),
+						RealizedPnL:    protomath.Decimal256(colRealizedPnL.Row(i)),
+						TotalBought:    protomath.Decimal256(colTotalBought.Row(i)),
+						UpdatedAtBlock: colUpdatedAtBlock.Row(i),
+						UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
+						BlockNumber:    colBlockNumber.Row(i),
+						TxIndex:        colTxIndex.Row(i),
+						LogIndex:       colLogIndex.Row(i),
+					}
+					r.cache.Set(item)
+					foundKeys[NewUserPositionsClockKey(item)] = struct{}{}
 				}
-				r.cache.Set(item)
-				foundKeys[NewUserPositionsClockKey(item)] = struct{}{}
-			}
-			return nil
-		},
-	}
-	if err := conn.Do(ctx, q); err != nil {
-		return err
+				return nil
+			},
+		}
+		if err := conn.Do(ctx, q); err != nil {
+			return err
+		}
 	}
 	for _, key := range uniqueList {
 		if _, found := foundKeys[key]; !found {
@@ -1429,46 +1492,54 @@ func (b *MemoryMarketBatch) Insert(ctx context.Context, conn *ch.Client, db stri
 }
 
 func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	var (
-		colID             proto.ColFixedStr
-		colQuestionCount  proto.ColUInt32
-		colQuestionIDs    *proto.ColArr[[]byte]
-		colUpdatedAtBlock proto.ColUInt64
-		colUpdatedAt      proto.ColDateTime64
-		colBlockNumber    proto.ColUInt64
-		colTxIndex        proto.ColUInt64
-		colLogIndex       proto.ColUInt64
-	)
-	colID.SetSize(32)
-	colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "question_count", Data: &colQuestionCount},
-		{Name: "question_ids", Data: colQuestionIDs},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, argMax(`t`.`question_count`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `question_count`, argMax(`t`.`question_ids`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `question_ids`, argMax(`t`.`updated_at_block`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at_block`, argMax(`t`.`updated_at`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at`, argMax(`t`.`block_number`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `block_number`, argMax(`t`.`transaction_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `transaction_index`, argMax(`t`.`log_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `log_index` FROM %s.%s AS `t` GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_markets")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
-		for i := 0; i < block.Rows; i++ {
-			item := MemoryMarket{
-				ID:             common.BytesToHash(colID.Row(i)),
-				QuestionCount:  colQuestionCount.Row(i),
-				QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
-				UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-				UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
-				BlockNumber:    colBlockNumber.Row(i),
-				TxIndex:        colTxIndex.Row(i),
-				LogIndex:       colLogIndex.Row(i),
-			}
-			c.Set(item)
+	runBucket := func(bucket int) error {
+		var (
+			colID             proto.ColFixedStr
+			colQuestionCount  proto.ColUInt32
+			colQuestionIDs    *proto.ColArr[[]byte]
+			colUpdatedAtBlock proto.ColUInt64
+			colUpdatedAt      proto.ColDateTime64
+			colBlockNumber    proto.ColUInt64
+			colTxIndex        proto.ColUInt64
+			colLogIndex       proto.ColUInt64
+		)
+		colID.SetSize(32)
+		colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "question_count", Data: &colQuestionCount},
+			{Name: "question_ids", Data: colQuestionIDs},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
 		}
-		return nil
-	}})
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_markets"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			for i := 0; i < block.Rows; i++ {
+				item := MemoryMarket{
+					ID:             common.BytesToHash(colID.Row(i)),
+					QuestionCount:  colQuestionCount.Row(i),
+					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
+					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
+					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
+					BlockNumber:    colBlockNumber.Row(i),
+					TxIndex:        colTxIndex.Row(i),
+					LogIndex:       colLogIndex.Row(i),
+				}
+				c.Set(item)
+			}
+			return nil
+		}})
+	}
+	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
+		if err := runBucket(bucket); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type MemoryMarketBatchResolver struct {
@@ -1512,61 +1583,71 @@ func (r *MemoryMarketBatchResolver) Resolve(ctx context.Context, conn *ch.Client
 		return nil
 	}
 
-	var values []string
-	for _, key := range uniqueList {
-		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
-	}
-
-	queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_markets WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
-
-	var (
-		colID             proto.ColFixedStr
-		colQuestionCount  proto.ColUInt32
-		colQuestionIDs    *proto.ColArr[[]byte]
-		colUpdatedAtBlock proto.ColUInt64
-		colUpdatedAt      proto.ColDateTime64
-		colBlockNumber    proto.ColUInt64
-		colTxIndex        proto.ColUInt64
-		colLogIndex       proto.ColUInt64
-	)
-	colID.SetSize(32)
-	colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "question_count", Data: &colQuestionCount},
-		{Name: "question_ids", Data: colQuestionIDs},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
 	foundKeys := make(map[MarketsClockKey]struct{})
-	q := ch.Query{
-		Body:   queryStr,
-		Result: results,
-		OnResult: func(ctx context.Context, block proto.Block) error {
-			for i := 0; i < block.Rows; i++ {
-				item := MemoryMarket{
-					ID:             common.BytesToHash(colID.Row(i)),
-					QuestionCount:  colQuestionCount.Row(i),
-					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
-					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
-					BlockNumber:    colBlockNumber.Row(i),
-					TxIndex:        colTxIndex.Row(i),
-					LogIndex:       colLogIndex.Row(i),
+	const resolverChunkSize = 4000
+	for chunkStart := 0; chunkStart < len(uniqueList); chunkStart += resolverChunkSize {
+		chunkEnd := chunkStart + resolverChunkSize
+		if chunkEnd > len(uniqueList) {
+			chunkEnd = len(uniqueList)
+		}
+		chunk := uniqueList[chunkStart:chunkEnd]
+
+		var values []string
+		for _, key := range chunk {
+			values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
+		}
+
+		queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_markets WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+
+		var (
+			colID             proto.ColFixedStr
+			colQuestionCount  proto.ColUInt32
+			colQuestionIDs    *proto.ColArr[[]byte]
+			colUpdatedAtBlock proto.ColUInt64
+			colUpdatedAt      proto.ColDateTime64
+			colBlockNumber    proto.ColUInt64
+			colTxIndex        proto.ColUInt64
+			colLogIndex       proto.ColUInt64
+		)
+		colID.SetSize(32)
+		colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "question_count", Data: &colQuestionCount},
+			{Name: "question_ids", Data: colQuestionIDs},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
+		}
+		q := ch.Query{
+			Body:     queryStr,
+			Result:   results,
+			Settings: []ch.Setting{{Key: "max_query_size", Value: "10485760"}},
+			OnResult: func(ctx context.Context, block proto.Block) error {
+				for i := 0; i < block.Rows; i++ {
+					item := MemoryMarket{
+						ID:             common.BytesToHash(colID.Row(i)),
+						QuestionCount:  colQuestionCount.Row(i),
+						QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
+						UpdatedAtBlock: colUpdatedAtBlock.Row(i),
+						UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
+						BlockNumber:    colBlockNumber.Row(i),
+						TxIndex:        colTxIndex.Row(i),
+						LogIndex:       colLogIndex.Row(i),
+					}
+					r.cache.Set(item)
+					foundKeys[NewMarketsClockKey(item)] = struct{}{}
 				}
-				r.cache.Set(item)
-				foundKeys[NewMarketsClockKey(item)] = struct{}{}
-			}
-			return nil
-		},
-	}
-	if err := conn.Do(ctx, q); err != nil {
-		return err
+				return nil
+			},
+		}
+		if err := conn.Do(ctx, q); err != nil {
+			return err
+		}
 	}
 	for _, key := range uniqueList {
 		if _, found := foundKeys[key]; !found {
@@ -1936,46 +2017,54 @@ func (b *MemoryNegRiskEventBatch) Insert(ctx context.Context, conn *ch.Client, d
 }
 
 func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	var (
-		colID             proto.ColFixedStr
-		colQuestionCount  proto.ColUInt32
-		colQuestionIDs    *proto.ColArr[[]byte]
-		colUpdatedAtBlock proto.ColUInt64
-		colUpdatedAt      proto.ColDateTime64
-		colBlockNumber    proto.ColUInt64
-		colTxIndex        proto.ColUInt64
-		colLogIndex       proto.ColUInt64
-	)
-	colID.SetSize(32)
-	colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "question_count", Data: &colQuestionCount},
-		{Name: "question_ids", Data: colQuestionIDs},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, argMax(`t`.`question_count`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `question_count`, argMax(`t`.`question_ids`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `question_ids`, argMax(`t`.`updated_at_block`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at_block`, argMax(`t`.`updated_at`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at`, argMax(`t`.`block_number`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `block_number`, argMax(`t`.`transaction_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `transaction_index`, argMax(`t`.`log_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `log_index` FROM %s.%s AS `t` GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_neg_risk_events")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
-		for i := 0; i < block.Rows; i++ {
-			item := MemoryNegRiskEvent{
-				ID:             common.BytesToHash(colID.Row(i)),
-				QuestionCount:  colQuestionCount.Row(i),
-				QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
-				UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-				UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
-				BlockNumber:    colBlockNumber.Row(i),
-				TxIndex:        colTxIndex.Row(i),
-				LogIndex:       colLogIndex.Row(i),
-			}
-			c.Set(item)
+	runBucket := func(bucket int) error {
+		var (
+			colID             proto.ColFixedStr
+			colQuestionCount  proto.ColUInt32
+			colQuestionIDs    *proto.ColArr[[]byte]
+			colUpdatedAtBlock proto.ColUInt64
+			colUpdatedAt      proto.ColDateTime64
+			colBlockNumber    proto.ColUInt64
+			colTxIndex        proto.ColUInt64
+			colLogIndex       proto.ColUInt64
+		)
+		colID.SetSize(32)
+		colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "question_count", Data: &colQuestionCount},
+			{Name: "question_ids", Data: colQuestionIDs},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
 		}
-		return nil
-	}})
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_neg_risk_events"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			for i := 0; i < block.Rows; i++ {
+				item := MemoryNegRiskEvent{
+					ID:             common.BytesToHash(colID.Row(i)),
+					QuestionCount:  colQuestionCount.Row(i),
+					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
+					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
+					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
+					BlockNumber:    colBlockNumber.Row(i),
+					TxIndex:        colTxIndex.Row(i),
+					LogIndex:       colLogIndex.Row(i),
+				}
+				c.Set(item)
+			}
+			return nil
+		}})
+	}
+	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
+		if err := runBucket(bucket); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type MemoryNegRiskEventBatchResolver struct {
@@ -2019,61 +2108,71 @@ func (r *MemoryNegRiskEventBatchResolver) Resolve(ctx context.Context, conn *ch.
 		return nil
 	}
 
-	var values []string
-	for _, key := range uniqueList {
-		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
-	}
-
-	queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_neg_risk_events WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
-
-	var (
-		colID             proto.ColFixedStr
-		colQuestionCount  proto.ColUInt32
-		colQuestionIDs    *proto.ColArr[[]byte]
-		colUpdatedAtBlock proto.ColUInt64
-		colUpdatedAt      proto.ColDateTime64
-		colBlockNumber    proto.ColUInt64
-		colTxIndex        proto.ColUInt64
-		colLogIndex       proto.ColUInt64
-	)
-	colID.SetSize(32)
-	colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "question_count", Data: &colQuestionCount},
-		{Name: "question_ids", Data: colQuestionIDs},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
 	foundKeys := make(map[NegRiskEventsClockKey]struct{})
-	q := ch.Query{
-		Body:   queryStr,
-		Result: results,
-		OnResult: func(ctx context.Context, block proto.Block) error {
-			for i := 0; i < block.Rows; i++ {
-				item := MemoryNegRiskEvent{
-					ID:             common.BytesToHash(colID.Row(i)),
-					QuestionCount:  colQuestionCount.Row(i),
-					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
-					UpdatedAtBlock: colUpdatedAtBlock.Row(i),
-					UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
-					BlockNumber:    colBlockNumber.Row(i),
-					TxIndex:        colTxIndex.Row(i),
-					LogIndex:       colLogIndex.Row(i),
+	const resolverChunkSize = 4000
+	for chunkStart := 0; chunkStart < len(uniqueList); chunkStart += resolverChunkSize {
+		chunkEnd := chunkStart + resolverChunkSize
+		if chunkEnd > len(uniqueList) {
+			chunkEnd = len(uniqueList)
+		}
+		chunk := uniqueList[chunkStart:chunkEnd]
+
+		var values []string
+		for _, key := range chunk {
+			values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
+		}
+
+		queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_neg_risk_events WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+
+		var (
+			colID             proto.ColFixedStr
+			colQuestionCount  proto.ColUInt32
+			colQuestionIDs    *proto.ColArr[[]byte]
+			colUpdatedAtBlock proto.ColUInt64
+			colUpdatedAt      proto.ColDateTime64
+			colBlockNumber    proto.ColUInt64
+			colTxIndex        proto.ColUInt64
+			colLogIndex       proto.ColUInt64
+		)
+		colID.SetSize(32)
+		colQuestionIDs = (&proto.ColFixedStr{Size: 32}).Array()
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "question_count", Data: &colQuestionCount},
+			{Name: "question_ids", Data: colQuestionIDs},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
+		}
+		q := ch.Query{
+			Body:     queryStr,
+			Result:   results,
+			Settings: []ch.Setting{{Key: "max_query_size", Value: "10485760"}},
+			OnResult: func(ctx context.Context, block proto.Block) error {
+				for i := 0; i < block.Rows; i++ {
+					item := MemoryNegRiskEvent{
+						ID:             common.BytesToHash(colID.Row(i)),
+						QuestionCount:  colQuestionCount.Row(i),
+						QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
+						UpdatedAtBlock: colUpdatedAtBlock.Row(i),
+						UpdatedAt:      colUpdatedAt.Row(i).UnixMilli(),
+						BlockNumber:    colBlockNumber.Row(i),
+						TxIndex:        colTxIndex.Row(i),
+						LogIndex:       colLogIndex.Row(i),
+					}
+					r.cache.Set(item)
+					foundKeys[NewNegRiskEventsClockKey(item)] = struct{}{}
 				}
-				r.cache.Set(item)
-				foundKeys[NewNegRiskEventsClockKey(item)] = struct{}{}
-			}
-			return nil
-		},
-	}
-	if err := conn.Do(ctx, q); err != nil {
-		return err
+				return nil
+			},
+		}
+		if err := conn.Do(ctx, q); err != nil {
+			return err
+		}
 	}
 	for _, key := range uniqueList {
 		if _, found := foundKeys[key]; !found {
@@ -2394,47 +2493,55 @@ func (b *MemoryFixedProductMarketMakerBatch) Insert(ctx context.Context, conn *c
 }
 
 func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	var (
-		colID              proto.ColFixedStr
-		colConditionID     proto.ColFixedStr
-		colCollateralToken proto.ColFixedStr
-		colUpdatedAtBlock  proto.ColUInt64
-		colUpdatedAt       proto.ColDateTime64
-		colBlockNumber     proto.ColUInt64
-		colTxIndex         proto.ColUInt64
-		colLogIndex        proto.ColUInt64
-	)
-	colID.SetSize(20)
-	colConditionID.SetSize(32)
-	colCollateralToken.SetSize(20)
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "condition_id", Data: &colConditionID},
-		{Name: "collateral_token", Data: &colCollateralToken},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
-	return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, argMax(`t`.`condition_id`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `condition_id`, argMax(`t`.`collateral_token`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `collateral_token`, argMax(`t`.`updated_at_block`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at_block`, argMax(`t`.`updated_at`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `updated_at`, argMax(`t`.`block_number`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `block_number`, argMax(`t`.`transaction_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `transaction_index`, argMax(`t`.`log_index`, (`t`.`block_number`, `t`.`transaction_index`, `t`.`log_index`)) AS `log_index` FROM %s.%s AS `t` GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
-		for i := 0; i < block.Rows; i++ {
-			item := MemoryFixedProductMarketMaker{
-				ID:              common.BytesToAddress(colID.Row(i)),
-				ConditionID:     common.BytesToHash(colConditionID.Row(i)),
-				CollateralToken: common.BytesToAddress(colCollateralToken.Row(i)),
-				UpdatedAtBlock:  colUpdatedAtBlock.Row(i),
-				UpdatedAt:       colUpdatedAt.Row(i).UnixMilli(),
-				BlockNumber:     colBlockNumber.Row(i),
-				TxIndex:         colTxIndex.Row(i),
-				LogIndex:        colLogIndex.Row(i),
-			}
-			c.Set(item)
+	runBucket := func(bucket int) error {
+		var (
+			colID              proto.ColFixedStr
+			colConditionID     proto.ColFixedStr
+			colCollateralToken proto.ColFixedStr
+			colUpdatedAtBlock  proto.ColUInt64
+			colUpdatedAt       proto.ColDateTime64
+			colBlockNumber     proto.ColUInt64
+			colTxIndex         proto.ColUInt64
+			colLogIndex        proto.ColUInt64
+		)
+		colID.SetSize(20)
+		colConditionID.SetSize(32)
+		colCollateralToken.SetSize(20)
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "condition_id", Data: &colConditionID},
+			{Name: "collateral_token", Data: &colCollateralToken},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
 		}
-		return nil
-	}})
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`condition_id` AS `condition_id`, `t`.`collateral_token` AS `collateral_token`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers"), recoveryFixedStringRange("`t`.`id`", bucket, 20)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			for i := 0; i < block.Rows; i++ {
+				item := MemoryFixedProductMarketMaker{
+					ID:              common.BytesToAddress(colID.Row(i)),
+					ConditionID:     common.BytesToHash(colConditionID.Row(i)),
+					CollateralToken: common.BytesToAddress(colCollateralToken.Row(i)),
+					UpdatedAtBlock:  colUpdatedAtBlock.Row(i),
+					UpdatedAt:       colUpdatedAt.Row(i).UnixMilli(),
+					BlockNumber:     colBlockNumber.Row(i),
+					TxIndex:         colTxIndex.Row(i),
+					LogIndex:        colLogIndex.Row(i),
+				}
+				c.Set(item)
+			}
+			return nil
+		}})
+	}
+	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
+		if err := runBucket(bucket); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type MemoryFixedProductMarketMakerBatchResolver struct {
@@ -2478,62 +2585,72 @@ func (r *MemoryFixedProductMarketMakerBatchResolver) Resolve(ctx context.Context
 		return nil
 	}
 
-	var values []string
-	for _, key := range uniqueList {
-		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
-	}
-
-	queryStr := fmt.Sprintf("SELECT `id`, `condition_id`, `collateral_token`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_fixed_product_market_makers WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
-
-	var (
-		colID              proto.ColFixedStr
-		colConditionID     proto.ColFixedStr
-		colCollateralToken proto.ColFixedStr
-		colUpdatedAtBlock  proto.ColUInt64
-		colUpdatedAt       proto.ColDateTime64
-		colBlockNumber     proto.ColUInt64
-		colTxIndex         proto.ColUInt64
-		colLogIndex        proto.ColUInt64
-	)
-	colID.SetSize(20)
-	colConditionID.SetSize(32)
-	colCollateralToken.SetSize(20)
-	colUpdatedAt.WithPrecision(proto.Precision(3))
-	colUpdatedAt.WithLocation(time.UTC)
-	results := proto.Results{
-		{Name: "id", Data: &colID},
-		{Name: "condition_id", Data: &colConditionID},
-		{Name: "collateral_token", Data: &colCollateralToken},
-		{Name: "updated_at_block", Data: &colUpdatedAtBlock},
-		{Name: "updated_at", Data: &colUpdatedAt},
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "transaction_index", Data: &colTxIndex},
-		{Name: "log_index", Data: &colLogIndex},
-	}
 	foundKeys := make(map[FixedProductMarketMakersClockKey]struct{})
-	q := ch.Query{
-		Body:   queryStr,
-		Result: results,
-		OnResult: func(ctx context.Context, block proto.Block) error {
-			for i := 0; i < block.Rows; i++ {
-				item := MemoryFixedProductMarketMaker{
-					ID:              common.BytesToAddress(colID.Row(i)),
-					ConditionID:     common.BytesToHash(colConditionID.Row(i)),
-					CollateralToken: common.BytesToAddress(colCollateralToken.Row(i)),
-					UpdatedAtBlock:  colUpdatedAtBlock.Row(i),
-					UpdatedAt:       colUpdatedAt.Row(i).UnixMilli(),
-					BlockNumber:     colBlockNumber.Row(i),
-					TxIndex:         colTxIndex.Row(i),
-					LogIndex:        colLogIndex.Row(i),
+	const resolverChunkSize = 4000
+	for chunkStart := 0; chunkStart < len(uniqueList); chunkStart += resolverChunkSize {
+		chunkEnd := chunkStart + resolverChunkSize
+		if chunkEnd > len(uniqueList) {
+			chunkEnd = len(uniqueList)
+		}
+		chunk := uniqueList[chunkStart:chunkEnd]
+
+		var values []string
+		for _, key := range chunk {
+			values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
+		}
+
+		queryStr := fmt.Sprintf("SELECT `id`, `condition_id`, `collateral_token`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_fixed_product_market_makers WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+
+		var (
+			colID              proto.ColFixedStr
+			colConditionID     proto.ColFixedStr
+			colCollateralToken proto.ColFixedStr
+			colUpdatedAtBlock  proto.ColUInt64
+			colUpdatedAt       proto.ColDateTime64
+			colBlockNumber     proto.ColUInt64
+			colTxIndex         proto.ColUInt64
+			colLogIndex        proto.ColUInt64
+		)
+		colID.SetSize(20)
+		colConditionID.SetSize(32)
+		colCollateralToken.SetSize(20)
+		colUpdatedAt.WithPrecision(proto.Precision(3))
+		colUpdatedAt.WithLocation(time.UTC)
+		results := proto.Results{
+			{Name: "id", Data: &colID},
+			{Name: "condition_id", Data: &colConditionID},
+			{Name: "collateral_token", Data: &colCollateralToken},
+			{Name: "updated_at_block", Data: &colUpdatedAtBlock},
+			{Name: "updated_at", Data: &colUpdatedAt},
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "transaction_index", Data: &colTxIndex},
+			{Name: "log_index", Data: &colLogIndex},
+		}
+		q := ch.Query{
+			Body:     queryStr,
+			Result:   results,
+			Settings: []ch.Setting{{Key: "max_query_size", Value: "10485760"}},
+			OnResult: func(ctx context.Context, block proto.Block) error {
+				for i := 0; i < block.Rows; i++ {
+					item := MemoryFixedProductMarketMaker{
+						ID:              common.BytesToAddress(colID.Row(i)),
+						ConditionID:     common.BytesToHash(colConditionID.Row(i)),
+						CollateralToken: common.BytesToAddress(colCollateralToken.Row(i)),
+						UpdatedAtBlock:  colUpdatedAtBlock.Row(i),
+						UpdatedAt:       colUpdatedAt.Row(i).UnixMilli(),
+						BlockNumber:     colBlockNumber.Row(i),
+						TxIndex:         colTxIndex.Row(i),
+						LogIndex:        colLogIndex.Row(i),
+					}
+					r.cache.Set(item)
+					foundKeys[NewFixedProductMarketMakersClockKey(item)] = struct{}{}
 				}
-				r.cache.Set(item)
-				foundKeys[NewFixedProductMarketMakersClockKey(item)] = struct{}{}
-			}
-			return nil
-		},
-	}
-	if err := conn.Do(ctx, q); err != nil {
-		return err
+				return nil
+			},
+		}
+		if err := conn.Do(ctx, q); err != nil {
+			return err
+		}
 	}
 	for _, key := range uniqueList {
 		if _, found := foundKeys[key]; !found {
@@ -2811,64 +2928,74 @@ func (r *ConditionalTokensConditionPreparationBatchResolver) Resolve(ctx context
 		return nil
 	}
 
-	var values []string
-	for _, key := range uniqueList {
-		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ConditionID.Hex(), "0x")))
-	}
-
-	queryStr := fmt.Sprintf("SELECT `block_number`, `block_timestamp`, `transaction_index`, `log_index`, `conditionId`, `oracle`, `questionId`, `outcomeSlotCount` FROM %s.conditional_tokens_condition_preparation_events WHERE `conditionId` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `conditionId`", quoteIdent(db), strings.Join(values, ", "))
-
-	var (
-		colBlockNumber      proto.ColUInt64
-		colBlockTimestamp   proto.ColDateTime64
-		colTransactionIndex proto.ColUInt64
-		colLogIndex         proto.ColUInt64
-		colConditionID      proto.ColFixedStr
-		colOracle           proto.ColFixedStr
-		colQuestionID       proto.ColFixedStr
-		colOutcomeSlotCount proto.ColUInt256
-	)
-	colBlockTimestamp.WithPrecision(proto.Precision(3))
-	colBlockTimestamp.WithLocation(time.UTC)
-	colConditionID.SetSize(32)
-	colOracle.SetSize(20)
-	colQuestionID.SetSize(32)
-	results := proto.Results{
-		{Name: "block_number", Data: &colBlockNumber},
-		{Name: "block_timestamp", Data: &colBlockTimestamp},
-		{Name: "transaction_index", Data: &colTransactionIndex},
-		{Name: "log_index", Data: &colLogIndex},
-		{Name: "conditionId", Data: &colConditionID},
-		{Name: "oracle", Data: &colOracle},
-		{Name: "questionId", Data: &colQuestionID},
-		{Name: "outcomeSlotCount", Data: &colOutcomeSlotCount},
-	}
 	foundKeys := make(map[ConditionPreparationsClockKey]struct{})
-	q := ch.Query{
-		Body:   queryStr,
-		Result: results,
-		OnResult: func(ctx context.Context, block proto.Block) error {
-			for i := 0; i < block.Rows; i++ {
-				item := ConditionalTokensConditionPreparation{
-					EventMeta: EventMeta{
-						BlockNumber:      colBlockNumber.Row(i),
-						BlockTimestamp:   colBlockTimestamp.Row(i),
-						TransactionIndex: colTransactionIndex.Row(i),
-						LogIndex:         colLogIndex.Row(i),
-					},
-					ConditionID:      common.BytesToHash(colConditionID.Row(i)),
-					Oracle:           common.BytesToAddress(colOracle.Row(i)),
-					QuestionID:       common.BytesToHash(colQuestionID.Row(i)),
-					OutcomeSlotCount: hotStateUint256(colOutcomeSlotCount.Row(i)),
+	const resolverChunkSize = 4000
+	for chunkStart := 0; chunkStart < len(uniqueList); chunkStart += resolverChunkSize {
+		chunkEnd := chunkStart + resolverChunkSize
+		if chunkEnd > len(uniqueList) {
+			chunkEnd = len(uniqueList)
+		}
+		chunk := uniqueList[chunkStart:chunkEnd]
+
+		var values []string
+		for _, key := range chunk {
+			values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ConditionID.Hex(), "0x")))
+		}
+
+		queryStr := fmt.Sprintf("SELECT `block_number`, `block_timestamp`, `transaction_index`, `log_index`, `conditionId`, `oracle`, `questionId`, `outcomeSlotCount` FROM %s.conditional_tokens_condition_preparation_events WHERE `conditionId` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `conditionId`", quoteIdent(db), strings.Join(values, ", "))
+
+		var (
+			colBlockNumber      proto.ColUInt64
+			colBlockTimestamp   proto.ColDateTime64
+			colTransactionIndex proto.ColUInt64
+			colLogIndex         proto.ColUInt64
+			colConditionID      proto.ColFixedStr
+			colOracle           proto.ColFixedStr
+			colQuestionID       proto.ColFixedStr
+			colOutcomeSlotCount proto.ColUInt256
+		)
+		colBlockTimestamp.WithPrecision(proto.Precision(3))
+		colBlockTimestamp.WithLocation(time.UTC)
+		colConditionID.SetSize(32)
+		colOracle.SetSize(20)
+		colQuestionID.SetSize(32)
+		results := proto.Results{
+			{Name: "block_number", Data: &colBlockNumber},
+			{Name: "block_timestamp", Data: &colBlockTimestamp},
+			{Name: "transaction_index", Data: &colTransactionIndex},
+			{Name: "log_index", Data: &colLogIndex},
+			{Name: "conditionId", Data: &colConditionID},
+			{Name: "oracle", Data: &colOracle},
+			{Name: "questionId", Data: &colQuestionID},
+			{Name: "outcomeSlotCount", Data: &colOutcomeSlotCount},
+		}
+		q := ch.Query{
+			Body:     queryStr,
+			Result:   results,
+			Settings: []ch.Setting{{Key: "max_query_size", Value: "10485760"}},
+			OnResult: func(ctx context.Context, block proto.Block) error {
+				for i := 0; i < block.Rows; i++ {
+					item := ConditionalTokensConditionPreparation{
+						EventMeta: EventMeta{
+							BlockNumber:      colBlockNumber.Row(i),
+							BlockTimestamp:   colBlockTimestamp.Row(i),
+							TransactionIndex: colTransactionIndex.Row(i),
+							LogIndex:         colLogIndex.Row(i),
+						},
+						ConditionID:      common.BytesToHash(colConditionID.Row(i)),
+						Oracle:           common.BytesToAddress(colOracle.Row(i)),
+						QuestionID:       common.BytesToHash(colQuestionID.Row(i)),
+						OutcomeSlotCount: hotStateUint256(colOutcomeSlotCount.Row(i)),
+					}
+					r.cache.Set(item)
+					foundKeys[NewConditionPreparationsClockKey(item)] = struct{}{}
 				}
-				r.cache.Set(item)
-				foundKeys[NewConditionPreparationsClockKey(item)] = struct{}{}
-			}
-			return nil
-		},
-	}
-	if err := conn.Do(ctx, q); err != nil {
-		return err
+				return nil
+			},
+		}
+		if err := conn.Do(ctx, q); err != nil {
+			return err
+		}
 	}
 	for _, key := range uniqueList {
 		if _, found := foundKeys[key]; !found {

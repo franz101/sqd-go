@@ -82,7 +82,7 @@ package generated
 	if cfg != nil && cfg.HotCacheCapacity != nil && *cfg.HotCacheCapacity > 0 {
 		hotDefault = fmt.Sprintf("%d", *cfg.HotCacheCapacity)
 	}
-	coldDefault := "0" // 0 => coldcache resolves its own default (RAM/8, clamped)
+	coldDefault := "0" // 0 => coldcache resolves its own dynamic RAM default.
 	if cfg != nil && cfg.ColdCacheMB != nil && *cfg.ColdCacheMB > 0 {
 		coldDefault = fmt.Sprintf("%d<<20", *cfg.ColdCacheMB)
 	}
@@ -101,9 +101,10 @@ func hotCacheCapacity() uint64 {
 	return %[1]s
 }
 
-// coldCacheBytes returns the shared cold-tier block-cache budget in bytes, or 0
-// to let the cold tier pick its own default (RAM/8, clamped). SQD_COLDCACHE_MB
-// overrides the config.yaml cold_cache_mb.
+// coldCacheBytes returns the shared cold-tier RAM block-cache budget in bytes,
+// or 0 to let the cold tier pick its own dynamic default (RAM/8, clamped).
+// SQD_COLDCACHE_MB overrides the config.yaml cold_cache_mb. This is not the
+// on-disk Pebble budget; cold-tier disk growth is intentionally not capped here.
 func coldCacheBytes() int64 {
 	if envVal := os.Getenv("SQD_COLDCACHE_MB"); envVal != "" {
 		if parsed, err := strconv.ParseInt(envVal, 10, 64); err == nil && parsed > 0 {
@@ -212,6 +213,18 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	coldAttached, err := s.HotState.ReopenColdCacheFresh()
 	if err != nil {
 		return fmt.Errorf("load state: reopen cold tier: %w", err)
+	}
+	if os.Getenv("SQD_SPARSE_RESUME") == "1" {
+		if coldAttached {
+			log.Printf("[LOAD STATE] sparse resume at block %d: cold tier reopened non-authoritative; state keys will be prefetched from ClickHouse on demand", blockNumber)
+		} else {
+			log.Printf("[LOAD STATE] sparse resume at block %d: state keys will be prefetched from ClickHouse on demand", blockNumber)
+		}
+		s.HotState.coldAuthoritative = false
+		s.LastSyncBlock = blockNumber
+		s.LastPruneBlock = blockNumber
+		s.SaveSnapshot(blockNumber)
+		return nil
 	}
 	if err := s.HotState.Recover(ctx, conn, db); err != nil {
 		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)

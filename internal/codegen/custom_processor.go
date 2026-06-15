@@ -341,8 +341,9 @@ func CustomProcessing(ctx context.Context, store Store, state *State, block *Par
 		return nil
 	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily
-	// (GetUserPosition/GetCondition/...) from durable ClickHouse state.
+	if err := prefetchBlocksState(ctx, store, state, []*ParsedBlock{block}); err != nil {
+		return err
+	}
 
 	// Process block
 	if CustomProcessFn != nil {
@@ -359,8 +360,13 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 	if state == nil || block == nil {
 		return nil
 	}
+	if len(block.Sequence) == 0 {
+		return nil
+	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily.
+	if err := prefetchProtoBlocksState(ctx, store, state, []*ProtoEventBlock{block}); err != nil {
+		return err
+	}
 
 	if CustomProcessProtoFn != nil {
 		if err := CustomProcessProtoFn(state, block); err != nil {
@@ -717,6 +723,32 @@ func (p *Processor) ProcessParsedBlock(ctx context.Context, store *database.Stor
 	return CustomProcessingProto(ctx, stateStore, p.State, pb)
 }
 
+// PrefetchParsedBlocks implements ingestion.BatchParsedBlockPrefetcher for the
+// producer-parse path. It resolves state keys once for the whole fetched page
+// instead of issuing one batch resolver query per block.
+func (p *Processor) PrefetchParsedBlocks(ctx context.Context, store *database.Store, blocks []any) error {
+	if p == nil || len(blocks) == 0 {
+		return nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	protoBlocks := make([]*ProtoEventBlock, 0, len(blocks))
+	for _, block := range blocks {
+		pb, ok := block.(*ProtoEventBlock)
+		if !ok || pb == nil || len(pb.Sequence) == 0 {
+			continue
+		}
+		protoBlocks = append(protoBlocks, pb)
+	}
+	return prefetchProtoBlocksState(ctx, stateStore, p.State, protoBlocks)
+}
+
 func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {
 	if p == nil || len(logs) == 0 {
 		return nil
@@ -982,9 +1014,8 @@ func (p *Processor) CloseColdCache() error {
 
 `)
 
-	// Prefetch was intentionally removed: hot-state misses resolve lazily (and
-	// batched per block where it matters), so emitting per-event prefetch
-	// sweeps was dead weight in every generated processor.
+	renderGenericPrefetchBlocksState(&b, cfg, events, hotStateTables)
+	renderGenericPrefetchProtoBlocksState(&b, cfg, events, hotStateTables)
 	b.WriteString(`func PrintPnLSummary(state *State, blockNumber uint64) {}
 `)
 

@@ -84,6 +84,14 @@ type FastBatchParseProcessor interface {
 	ReclaimParseBatches()
 }
 
+// BatchParsedBlockPrefetcher is optionally implemented by generated
+// FastBatchParseProcessor implementations that can collect state keys across a
+// whole producer-parsed page and resolve them in a small number of ClickHouse
+// queries before per-block custom processing starts.
+type BatchParsedBlockPrefetcher interface {
+	PrefetchParsedBlocks(ctx context.Context, store *database.Store, blocks []any) error
+}
+
 // CommitHorizonReporter is optionally implemented by processors that durably
 // commit derived state at intervals. When implemented, the ingestion checkpoint
 // is gated so it never leads this horizon: a crash resumes from durable state

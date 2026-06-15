@@ -49,11 +49,13 @@ const (
 	cursorPollInterval = 5 * time.Second
 	statsInterval      = 5 * time.Second
 
-	// Adaptive page sizing: when pageSize=0, grow page size based on performance
-	// Target ~20k blocks/second processing rate
-	targetBlocksPerSec  = 20000
-	minAdaptivePageSize = 5000
-	maxAdaptivePageSize = 100000
+	// Adaptive page sizing: when pageSize=0 in cursor mode, bounded catch-up
+	// requests resize around observed producer throughput. Keeping batches near a
+	// two-second fetch+parse window amortizes HTTP overhead without letting the
+	// producer run too far ahead of the single consumer.
+	targetAdaptivePageDuration = 2 * time.Second
+	minAdaptivePageSize        = 200
+	maxAdaptivePageSize        = 100000
 
 	// Cursor-mode producers fetch through /finalized-stream while at least
 	// this many blocks below the finalized head, switching to the paced live
@@ -222,8 +224,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				} else {
 					state.Init(recovery.TrackerCurrent, recovery.TrackerFinalized, recovery.TrackerRollbackChain)
 				}
-				if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, recovery.Number); err != nil {
-					return fmt.Errorf("rollback after recovery checkpoint %d: %w", recovery.Number, err)
+				if recovery.NeedsRollback {
+					if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, recovery.Number); err != nil {
+						return fmt.Errorf("rollback after recovery checkpoint %d: %w", recovery.Number, err)
+					}
+				} else {
+					log.Printf("Chain %d: recovery checkpoint %d is already finalized with no unfinalized tail; skipping startup rollback", chain.ID, recovery.Number)
 				}
 				if err := store.SaveSyncState(ctx, chain.ID, recoverySyncState(recovery)); err != nil {
 					return fmt.Errorf("save recovery checkpoint %d: %w", recovery.Number, err)
@@ -401,6 +407,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 	var currentConsumerBlock atomic.Uint64
 	currentConsumerBlock.Store(currentBlock)
+	var currentAdaptivePageSize atomic.Uint64
 
 	type producerSignal struct {
 		forkErr *client.ForkError
@@ -432,6 +439,25 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			var lastFinalized uint64
 			// Adaptive page sizing: when pageSize=0, use this instead of nil
 			var adaptivePageSize uint64 = minAdaptivePageSize
+			currentAdaptivePageSize.Store(adaptivePageSize)
+			lastAdaptiveLog := time.Now()
+			updateAdaptivePageSize := func(returnedBlocks uint64, producerDur time.Duration) {
+				if pageSize != 0 || !cursorMode || returnedBlocks == 0 {
+					return
+				}
+				next := adjustAdaptivePageSize(adaptivePageSize, returnedBlocks, producerDur, replayBuf.Len(), replayBuf.capacity)
+				if next == adaptivePageSize {
+					return
+				}
+				old := adaptivePageSize
+				adaptivePageSize = next
+				currentAdaptivePageSize.Store(next)
+				if time.Since(lastAdaptiveLog) >= 30*time.Second || next == minAdaptivePageSize || next == maxAdaptivePageSize {
+					log.Printf("Chain %d: adaptive page size %d -> %d (returned=%d producer=%s buffered=%d)",
+						chain.ID, old, next, returnedBlocks, producerDur.Round(time.Millisecond), replayBuf.Len())
+					lastAdaptiveLog = time.Now()
+				}
+			}
 			onCatchupEndpoint := false
 			sentSignal := false
 			sendSignal := func(sig producerSignal) {
@@ -493,9 +519,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					log.Printf("Chain %d: within %d of finalized head %d — fetching via live stream", chain.ID, finalizedCatchupMargin, lastFinalized)
 				}
 
-				t0 := time.Now()
+				requestStart := time.Now()
 				response, err := fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
-				profFetchNanos.Add(int64(time.Since(t0)))
+				fetchDur := time.Since(requestStart)
+				profFetchNanos.Add(int64(fetchDur))
 
 				if err != nil {
 					var forkErr *client.ForkError
@@ -594,11 +621,13 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						sendSignal(producerSignal{err: perr})
 						return
 					}
-					profParseNanos.Add(int64(time.Since(parseStart)))
+					parseDur := time.Since(parseStart)
+					profParseNanos.Add(int64(parseDur))
 					profIters.Add(1)
 					if havePending {
 						replayBuf.WriteParsed(chain.ID, pending, response.Head.Finalized, true, rangeLabel, batchStartBlock, batchFlush, evCount)
 						pHash = pending.Hash
+						updateAdaptivePageSize(pending.Number-batchStartBlock+1, fetchDur+parseDur)
 						// Self-advance: the producer already tracks the parent hash of
 						// the last block it wrote, so it can fetch the next page while
 						// the consumer is still processing this one. Goroutine sampling
@@ -744,11 +773,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					pHash = db.hash
 				}
 
-				profParseNanos.Add(int64(time.Since(parseStart)))
+				parseDur := time.Since(parseStart)
+				profParseNanos.Add(int64(parseDur))
 				profDecodeNanos.Add(int64(decodeDur))
 				profIters.Add(1)
 
 				if len(decodedBlocks) > 0 {
+					last := decodedBlocks[len(decodedBlocks)-1]
+					updateAdaptivePageSize(last.number-batchStartBlock+1, fetchDur+parseDur)
 					select {
 					case next := <-advance:
 						pBlock = next.nextBlock
@@ -805,8 +837,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		}
 		deltaBlocks := totalBlockCount - lastStatsBlocks
 		deltaEvents := totalEventCount - lastStatsEvents
-		log.Printf("Chain %d: stats %s | checkpoint: %d | next: %d | buffered: %d | +%d blocks, +%d events in %s | %.1f blk/s (avg %.1f) | total: %d blocks, %d events",
+		log.Printf("Chain %d: stats %s | checkpoint: %d | next: %d | buffered: %d | page: %d | +%d blocks, +%d events in %s | %.1f blk/s (avg %.1f) | total: %d blocks, %d events",
 			chain.ID, reason, lastCheckpoint, currentConsumerBlockVal, replayBuf.Len(),
+			currentAdaptivePageSize.Load(),
 			deltaBlocks, deltaEvents, interval.Round(time.Millisecond),
 			float64(deltaBlocks)/interval.Seconds(), float64(totalBlockCount)/elapsed.Seconds(),
 			totalBlockCount, totalEventCount)
@@ -821,6 +854,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	var batchCustomLogs []CustomLog
 	var batchRawJSONL []byte
 	var pendingBatchBlocks uint64
+	var pendingParsedEntries []blockEntry
 	resetBatch := func() {
 		batchBlockRows = batchBlockRows[:0]
 		batchDecodedEvents = batchDecodedEvents[:0]
@@ -928,6 +962,93 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 	for {
 		if entry, ok := replayBuf.GetBlock(currentConsumerBlockVal); ok {
+			if batchParse {
+				pendingParsedEntries = append(pendingParsedEntries, entry)
+				currentConsumerBlockVal = entry.number + 1
+
+				if !entry.isLastInBatch {
+					select {
+					case <-statsTicker.C:
+						logStats("periodic")
+					default:
+					}
+					if effectiveEndBlock != nil && currentConsumerBlockVal > *effectiveEndBlock {
+						break
+					}
+					continue
+				}
+
+				if prefetcher, ok := batchProc.(BatchParsedBlockPrefetcher); ok {
+					blocks := make([]any, 0, len(pendingParsedEntries))
+					for _, pe := range pendingParsedEntries {
+						if pe.proto != nil {
+							blocks = append(blocks, pe.proto)
+						}
+					}
+					prefetchStart := time.Now()
+					if err := prefetcher.PrefetchParsedBlocks(ctx, store, blocks); err != nil {
+						_ = drainPendingInsert()
+						return fmt.Errorf("custom processor v2 prefetch error at batch ending %d: %w", entry.number, err)
+					}
+					profCustomNanos.Add(int64(time.Since(prefetchStart)))
+				}
+
+				for _, pe := range pendingParsedEntries {
+					if pe.proto != nil {
+						procStart := time.Now()
+						if err := batchProc.ProcessParsedBlock(ctx, store, pe.proto); err != nil {
+							_ = drainPendingInsert()
+							return fmt.Errorf("custom processor v2 error at block %d: %w", pe.number, err)
+						}
+						profCustomNanos.Add(int64(time.Since(procStart)))
+					}
+
+					if cursorMode {
+						blockRef := client.BlockRef{Number: pe.number, Hash: pe.hash}
+						state.ApplyBatch(pe.finalized, []client.BlockRef{blockRef})
+
+						const snapshotEnableMargin = 128
+						if snapshotController != nil && !snapshotsActive && pe.finalized != nil {
+							if pe.number+snapshotEnableMargin >= pe.finalized.Number {
+								snapshotController.SetSnapshotsEnabled(true)
+								snapshotsActive = true
+								if backfillGC {
+									debug.SetGCPercent(prevGOGC)
+									backfillGC = false
+								}
+								log.Printf("Chain %d: snapshots enabled — consumer block %d is within %d of finalized head %d",
+									chain.ID, pe.number, snapshotEnableMargin, pe.finalized.Number)
+							}
+						}
+					}
+					atomic.AddUint64(&totalBlocks, 1)
+				}
+
+				atomic.AddUint64(&totalEvents, entry.batchEvents)
+				currentConsumerBlock.Store(currentConsumerBlockVal)
+				if err := drainPendingInsert(); err != nil {
+					return err
+				}
+				kickPendingInsert(entry.batchFlush)
+				if err := finishBatchTail(entry); err != nil {
+					return err
+				}
+				lastCheckpoint = entry.number
+				resetBatch()
+				pendingParsedEntries = pendingParsedEntries[:0]
+
+				select {
+				case <-statsTicker.C:
+					logStats("periodic")
+				default:
+				}
+
+				if effectiveEndBlock != nil && currentConsumerBlockVal > *effectiveEndBlock {
+					break
+				}
+				continue
+			}
+
 			// Accumulate data for batch insertion
 			if len(entry.events) > 0 {
 				if storeBlocks {
@@ -1441,11 +1562,49 @@ func nextProducerRequestRange(currentBlock, pageSize, adaptivePageSize, lastFina
 	return nextRequestRange(currentBlock, pageSize, effectiveEndBlock, cursorMode)
 }
 
+func adjustAdaptivePageSize(current, returnedBlocks uint64, producerDur time.Duration, buffered, capacity int) uint64 {
+	if current == 0 {
+		current = minAdaptivePageSize
+	}
+	if returnedBlocks == 0 || producerDur <= 0 {
+		return current
+	}
+	desired := uint64(float64(returnedBlocks) * targetAdaptivePageDuration.Seconds() / producerDur.Seconds())
+	if capacity > 0 && buffered >= (capacity*3)/4 {
+		desired = current / 2
+	}
+	desired = clampUint64(desired, minAdaptivePageSize, maxAdaptivePageSize)
+	if desired > current*2 {
+		desired = current * 2
+	}
+	if desired < current/2 {
+		desired = current / 2
+	}
+	desired = clampUint64(desired, minAdaptivePageSize, maxAdaptivePageSize)
+	// Avoid churn from tiny timing fluctuations.
+	lower := current - current/10
+	upper := current + current/10
+	if desired > lower && desired < upper {
+		return current
+	}
+	return desired
+}
+
 func minEndBlock(current *uint64, candidate uint64) *uint64 {
 	if current != nil && *current < candidate {
 		return current
 	}
 	return &candidate
+}
+
+func clampUint64(v, lo, hi uint64) uint64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func chainEndpoint(chainID uint64, hot bool) string {

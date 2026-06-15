@@ -31,11 +31,30 @@ package generated
 `)
 	renderHotStateImports(&b, tables, events)
 
-	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n\n")
+	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n")
+	b.WriteString("const recoveryBucketCount = 8\n\n")
 	if customTablesUseSerializedCold(tables) {
 		b.WriteString("// coldBoolByte packs a bool for the cold-tier value codec.\n")
 		b.WriteString("func coldBoolByte(x bool) byte {\n\tif x {\n\t\treturn 1\n\t}\n\treturn 0\n}\n\n")
 	}
+	b.WriteString(`func recoveryFixedStringRange(column string, bucket int, size int) string {
+	if recoveryBucketCount <= 1 {
+		return "1"
+	}
+	width := 256 / recoveryBucketCount
+	lower := bucket * width
+	lowerHex := fmt.Sprintf("%02x%s", lower, strings.Repeat("00", size-1))
+	lowerExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", lowerHex, size)
+	if bucket >= recoveryBucketCount-1 {
+		return fmt.Sprintf("%s >= %s", column, lowerExpr)
+	}
+	upper := (bucket + 1) * width
+	upperHex := fmt.Sprintf("%02x%s", upper, strings.Repeat("00", size-1))
+	upperExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", upperHex, size)
+	return fmt.Sprintf("%s >= %s AND %s < %s", column, lowerExpr, column, upperExpr)
+}
+
+`)
 	for _, spec := range specs {
 		if !spec.table.IsEvent {
 			renderHotStateEntity(&b, spec.table)
@@ -759,7 +778,7 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("func (c *")
 	b.WriteString(spec.cacheType)
-	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\tvar (\n")
+	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\trunBucket := func(bucket int) error {\n\tvar (\n")
 	for _, field := range spec.table.Fields {
 		b.WriteString("\t\t")
 		b.WriteString(batchColumnField(field))
@@ -788,7 +807,9 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(strconv.Quote(recoverQuery(spec.table)))
 	b.WriteString(", quoteIdent(db), quoteIdent(")
 	b.WriteString(strconv.Quote(spec.table.Name))
-	b.WriteString(")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\titem := ")
+	b.WriteString("), ")
+	b.WriteString(recoverWhereExpr(spec.table))
+	b.WriteString("), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\titem := ")
 	b.WriteString(spec.table.GoTypeName)
 	b.WriteString("{\n")
 	for _, field := range spec.table.Fields {
@@ -798,7 +819,7 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 		b.WriteString(",\n")
 	}
-	b.WriteString("\t\t\t}\n\t\t\tc.Set(item)\n\t\t}\n\t\treturn nil\n\t}})\n}\n\n")
+	b.WriteString("\t\t\t}\n\t\t\tc.Set(item)\n\t\t}\n\t\treturn nil\n\t}})\n\t}\n\tfor bucket := 0; bucket < recoveryBucketCount; bucket++ {\n\t\tif err := runBucket(bucket); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n\n")
 }
 
 func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
@@ -1483,43 +1504,81 @@ func customInsertColumnList(table customTableSpec) string {
 }
 
 // recoverQuery returns the latest row per primary key from a ReplacingMergeTree
-// state table. It uses argMax(col, version) ... GROUP BY key — a single-pass hash
-// aggregation — rather than ORDER BY version DESC ... LIMIT 1 BY key, which forces
-// a GLOBAL sort of the entire table. On the live polymarket positions table
-// (134M rows / 129M distinct keys) the LIMIT 1 BY form did not finish in 14 min
-// while the argMax form returned the identical 129M rows in ~29s (~30x). version
-// is the (block_number, transaction_index, log_index) tuple — the same ordering
-// the LIMIT 1 BY used — so the selected row is identical. Key columns are emitted
-// as the GROUP BY key (and thus their own latest value); every other column,
-// including the version columns themselves, takes argMax over the version tuple.
-// Result columns keep their original names via AS, so the columnar decode that
-// maps by name is unchanged.
+// state table. It uses argMax(col, version) ... GROUP BY key in deterministic
+// primary-key ranges when the leading key is FixedString. A single global
+// aggregation is fastest when it fits, but the live polymarket positions table
+// can require >50 GiB of temp space; bucketed aggregation preserves the same
+// result while bounding each ClickHouse query and letting ClickHouse prune by
+// primary key. Non-FixedString keys fall back to hash buckets.
+// version is the (block_number, transaction_index, log_index) tuple — the same
+// ordering LIMIT 1 BY would use — so the selected row is identical. Key columns
+// are emitted as the GROUP BY key; every other column, including version columns,
+// takes argMax over the version tuple. Result columns keep their original names
+// via AS, so the columnar decode that maps by name is unchanged.
 func recoverQuery(table customTableSpec) string {
-	// Every column is qualified with the table alias `t`. argMax aliases its result
-	// to the column's own name (... AS `block_number`); without qualification the
-	// version tuple's bare `block_number` resolves to that aggregate alias instead
-	// of the column, and ClickHouse rejects an aggregate nested in an aggregate
-	// (ILLEGAL_AGGREGATION). `t`.`block_number` always resolves to the column.
+	// Recover the latest row per primary key by streaming the part in reverse
+	// sorting-key order (optimize_read_in_order) and taking the first row seen for
+	// each key via LIMIT 1 BY. The memory_* tables are ReplacingMergeTree ORDER BY
+	// (pk..., block_number, transaction_index, log_index), so a full-key DESC scan
+	// visits each key's highest (block_number, transaction_index, log_index) — its
+	// latest version — first.
+	//
+	// This deliberately avoids `argMax(col, version) GROUP BY key`: argMax builds an
+	// aggregation hash table with one entry per distinct key, which on the 129M-key
+	// memory_user_positions table costs ~50 GiB of RAM and ~350s. The read-in-order
+	// stream holds <1 GiB (no per-key state) and is bounded only by decompression
+	// throughput. Every column is selected directly (no aggregate), so the version
+	// columns are read as-is and the `t` alias is only needed to qualify the bucket
+	// WHERE / ORDER BY against the (range- or hash-) bucket predicate.
 	q := func(col string) string { return "`t`." + quoteSQLIdent(col) }
-	version := "(" + q("block_number") + ", " + q("transaction_index") + ", " + q("log_index") + ")"
-	isKey := make(map[string]bool, len(table.PrimaryKey))
-	for _, k := range table.PrimaryKey {
-		isKey[k] = true
-	}
 	selects := make([]string, 0, len(table.Fields))
 	for _, field := range table.Fields {
-		out := quoteSQLIdent(field.ColumnName)
-		if isKey[field.ColumnName] {
-			selects = append(selects, q(field.ColumnName)+" AS "+out)
+		selects = append(selects, q(field.ColumnName)+" AS "+quoteSQLIdent(field.ColumnName))
+	}
+	orderBy := make([]string, 0, len(table.PrimaryKey)+3)
+	for _, k := range table.PrimaryKey {
+		orderBy = append(orderBy, q(k)+" DESC")
+	}
+	orderBy = append(orderBy, q("block_number")+" DESC", q("transaction_index")+" DESC", q("log_index")+" DESC")
+	limitBy := make([]string, 0, len(table.PrimaryKey))
+	for _, k := range table.PrimaryKey {
+		limitBy = append(limitBy, q(k))
+	}
+	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s AS `t` WHERE %s ORDER BY " + strings.Join(orderBy, ", ") + " LIMIT 1 BY " + strings.Join(limitBy, ", ") + " SETTINGS optimize_read_in_order = 1"
+}
+
+func recoverWhereExpr(table customTableSpec) string {
+	if len(table.PrimaryKey) == 0 {
+		return strconv.Quote("1")
+	}
+	firstKey := table.PrimaryKey[0]
+	for _, field := range table.Fields {
+		if field.ColumnName != firstKey {
 			continue
 		}
-		selects = append(selects, "argMax("+q(field.ColumnName)+", "+version+") AS "+out)
+		if size, ok := fixedStringColumnSize(field.ColumnType); ok {
+			return fmt.Sprintf("recoveryFixedStringRange(%s, bucket, %d)", strconv.Quote("`t`."+quoteSQLIdent(firstKey)), size)
+		}
+		break
 	}
-	groupBy := make([]string, 0, len(table.PrimaryKey))
+	q := func(col string) string { return "`t`." + quoteSQLIdent(col) }
+	hashCols := make([]string, 0, len(table.PrimaryKey))
 	for _, k := range table.PrimaryKey {
-		groupBy = append(groupBy, q(k))
+		hashCols = append(hashCols, q(k))
 	}
-	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s AS `t` GROUP BY " + strings.Join(groupBy, ", ")
+	return "fmt.Sprintf(" + strconv.Quote("cityHash64("+strings.Join(hashCols, ", ")+") %% %d = %d") + ", recoveryBucketCount, bucket)"
+}
+
+func fixedStringColumnSize(chType string) (int, bool) {
+	const prefix = "FixedString("
+	if !strings.HasPrefix(chType, prefix) || !strings.HasSuffix(chType, ")") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(chType, prefix), ")"))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func quotedColumns(columns []string) []string {
@@ -1700,12 +1759,54 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\t}\n")
 	b.WriteString("\tr.misses = nil\n\n")
 	b.WriteString("\tif len(uniqueList) == 0 {\n\t\treturn nil\n\t}\n\n")
+	b.WriteString("\tfoundKeys := make(map[")
+	b.WriteString(keyType)
+	b.WriteString("]struct{})\n")
+	b.WriteString("\tconst resolverChunkSize = 4000\n")
+	b.WriteString("\tfor chunkStart := 0; chunkStart < len(uniqueList); chunkStart += resolverChunkSize {\n")
+	b.WriteString("\t\tchunkEnd := chunkStart + resolverChunkSize\n")
+	b.WriteString("\t\tif chunkEnd > len(uniqueList) {\n\t\t\tchunkEnd = len(uniqueList)\n\t\t}\n")
+	b.WriteString("\t\tchunk := uniqueList[chunkStart:chunkEnd]\n\n")
 
 	keyFields := spec.table.keyFields()
-	if len(keyFields) > 1 {
-		b.WriteString("\tvar values []string\n")
-		b.WriteString("\tfor _, key := range uniqueList {\n")
-		b.WriteString("\t\tvalues = append(values, \"(\"")
+	if len(keyFields) > 1 && keyFieldsExternalFixed(keyFields) {
+		for _, field := range keyFields {
+			colName := "keyCol" + field.Name
+			size := 32
+			if field.Type == "common.Address" {
+				size = 20
+			}
+			b.WriteString("\t\tvar ")
+			b.WriteString(colName)
+			b.WriteString(" proto.ColFixedStr\n")
+			b.WriteString("\t\t")
+			b.WriteString(colName)
+			b.WriteString(".SetSize(")
+			b.WriteString(strconv.Itoa(size))
+			b.WriteString(")\n")
+		}
+		b.WriteString("\t\tfor _, key := range chunk {\n")
+		for _, field := range keyFields {
+			b.WriteString("\t\t\tkeyCol")
+			b.WriteString(field.Name)
+			b.WriteString(".Append(key.")
+			b.WriteString(field.Name)
+			b.WriteString(".Bytes())\n")
+		}
+		b.WriteString("\t\t}\n\n")
+		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s AS `t` INNER JOIN _resolver_keys AS `k` ON %s ORDER BY `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY %s",
+			customSelectColumnListQualified(spec.table, "`t`"),
+			spec.table.Name,
+			keyJoinCondition(keyFields, "`t`", "`k`"),
+			keyColumnExpressionListQualified(keyFields, "`t`"),
+		)
+		b.WriteString(fmt.Sprintf("\t\tqueryStr := fmt.Sprintf(%s, quoteIdent(db))\n\n",
+			strconv.Quote(queryBody),
+		))
+	} else if len(keyFields) > 1 {
+		b.WriteString("\t\tvar values []string\n")
+		b.WriteString("\t\tfor _, key := range chunk {\n")
+		b.WriteString("\t\t\tvalues = append(values, \"(\"")
 		for i, field := range keyFields {
 			if i > 0 {
 				b.WriteString(" + \", \"")
@@ -1714,7 +1815,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 			b.WriteString(keySQLValueExpr("key."+field.Name, field))
 		}
 		b.WriteString(" + \")\")\n")
-		b.WriteString("\t}\n\n")
+		b.WriteString("\t\t}\n\n")
 
 		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s WHERE %s IN (%%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY %s",
 			customSelectColumnList(spec.table),
@@ -1722,17 +1823,17 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 			customInsertColumnList(customTableSpec{Columns: keyColumns(keyFields)}),
 			keyColumnExpressionList(keyFields),
 		)
-		b.WriteString(fmt.Sprintf("\tqueryStr := fmt.Sprintf(%s, quoteIdent(db), strings.Join(values, \", \"))\n\n",
+		b.WriteString(fmt.Sprintf("\t\tqueryStr := fmt.Sprintf(%s, quoteIdent(db), strings.Join(values, \", \"))\n\n",
 			strconv.Quote(queryBody),
 		))
 	} else if len(keyFields) == 1 {
-		b.WriteString("\tvar values []string\n")
-		b.WriteString("\tfor _, key := range uniqueList {\n")
+		b.WriteString("\t\tvar values []string\n")
+		b.WriteString("\t\tfor _, key := range chunk {\n")
 		keyField := keyFields[0]
-		b.WriteString("\t\tvalues = append(values, ")
+		b.WriteString("\t\t\tvalues = append(values, ")
 		b.WriteString(keySQLValueExpr("key."+keyField.Name, keyField))
 		b.WriteString(")\n")
-		b.WriteString("\t}\n\n")
+		b.WriteString("\t\t}\n\n")
 
 		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s WHERE %s IN (%%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY %s",
 			customSelectColumnList(spec.table),
@@ -1740,54 +1841,74 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 			quoteSQLIdent(keyField.ColumnName),
 			keyColumnExpressionList(keyFields),
 		)
-		b.WriteString(fmt.Sprintf("\tqueryStr := fmt.Sprintf(%s, quoteIdent(db), strings.Join(values, \", \"))\n\n",
+		b.WriteString(fmt.Sprintf("\t\tqueryStr := fmt.Sprintf(%s, quoteIdent(db), strings.Join(values, \", \"))\n\n",
 			strconv.Quote(queryBody),
 		))
 	} else {
-		b.WriteString("\tqueryStr := \"\"\n")
+		b.WriteString("\t\tqueryStr := \"\"\n")
 	}
 
-	b.WriteString("\tvar (\n")
+	b.WriteString("\t\tvar (\n")
 	for _, field := range spec.table.Fields {
-		b.WriteString("\t\t")
+		b.WriteString("\t\t\t")
 		b.WriteString(batchColumnField(field))
 		b.WriteString(" ")
 		b.WriteString(resultColumnType(field))
 		b.WriteString("\n")
 	}
-	b.WriteString("\t)\n")
+	b.WriteString("\t\t)\n")
 	for _, field := range spec.table.Fields {
 		for _, line := range resultInitLines(field) {
-			b.WriteString("\t")
+			b.WriteString("\t\t")
 			b.WriteString(line)
 			b.WriteString("\n")
 		}
 	}
-	b.WriteString("\tresults := proto.Results{\n")
+	b.WriteString("\t\tresults := proto.Results{\n")
 	for _, field := range spec.table.Fields {
-		b.WriteString("\t\t{Name: ")
+		b.WriteString("\t\t\t{Name: ")
 		b.WriteString(strconv.Quote(field.ColumnName))
 		b.WriteString(", Data: ")
 		b.WriteString(resultData(field))
 		b.WriteString("},\n")
 	}
-	b.WriteString("\t}\n")
+	b.WriteString("\t\t}\n")
 
-	b.WriteString("\tfoundKeys := make(map[")
-	b.WriteString(keyType)
-	b.WriteString("]struct{})\n")
-	b.WriteString("\tq := ch.Query{\n")
-	b.WriteString("\t\tBody:   queryStr,\n")
-	b.WriteString("\t\tResult: results,\n")
-	b.WriteString("\t\tOnResult: func(ctx context.Context, block proto.Block) error {\n")
-	b.WriteString("\t\t\tfor i := 0; i < block.Rows; i++ {\n")
-	b.WriteString("\t\t\t\titem := ")
+	b.WriteString("\t\tq := ch.Query{\n")
+	b.WriteString("\t\t\tBody:   queryStr,\n")
+	b.WriteString("\t\t\tResult: results,\n")
+	b.WriteString("\t\t\tSettings: []ch.Setting{{Key: \"max_query_size\", Value: \"10485760\"}},\n")
+	if len(keyFields) > 1 && keyFieldsExternalFixed(keyFields) {
+		b.WriteString("\t\t\tExternalTable: \"_resolver_keys\",\n")
+		b.WriteString("\t\t\tExternalData: []proto.InputColumn{\n")
+		for _, field := range keyFields {
+			b.WriteString("\t\t\t\t{Name: ")
+			b.WriteString(strconv.Quote(field.ColumnName))
+			b.WriteString(", Data: keyCol")
+			b.WriteString(field.Name)
+			b.WriteString("},\n")
+		}
+		b.WriteString("\t\t\t},\n")
+	}
+	b.WriteString("\t\t\tOnResult: func(ctx context.Context, block proto.Block) error {\n")
+	b.WriteString("\t\t\t\tfor i := 0; i < block.Rows; i++ {\n")
+	b.WriteString("\t\t\t\t\titem := ")
 	b.WriteString(valueType)
 	b.WriteString("{\n")
 	if spec.table.IsEvent {
-		b.WriteString("\t\t\t\t\tEventMeta: EventMeta{\n")
+		b.WriteString("\t\t\t\t\t\tEventMeta: EventMeta{\n")
 		for _, field := range spec.table.Fields {
 			if field.Name == "BlockNumber" || field.Name == "BlockTimestamp" || field.Name == "TransactionIndex" || field.Name == "LogIndex" {
+				b.WriteString("\t\t\t\t\t\t\t")
+				b.WriteString(field.Name)
+				b.WriteString(": ")
+				b.WriteString(resultValueExpr(field, spec.table.IsEvent))
+				b.WriteString(",\n")
+			}
+		}
+		b.WriteString("\t\t\t\t\t\t},\n")
+		for _, field := range spec.table.Fields {
+			if !(field.Name == "BlockNumber" || field.Name == "BlockTimestamp" || field.Name == "TransactionIndex" || field.Name == "LogIndex") {
 				b.WriteString("\t\t\t\t\t\t")
 				b.WriteString(field.Name)
 				b.WriteString(": ")
@@ -1795,35 +1916,26 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 				b.WriteString(",\n")
 			}
 		}
-		b.WriteString("\t\t\t\t\t},\n")
-		for _, field := range spec.table.Fields {
-			if !(field.Name == "BlockNumber" || field.Name == "BlockTimestamp" || field.Name == "TransactionIndex" || field.Name == "LogIndex") {
-				b.WriteString("\t\t\t\t\t")
-				b.WriteString(field.Name)
-				b.WriteString(": ")
-				b.WriteString(resultValueExpr(field, spec.table.IsEvent))
-				b.WriteString(",\n")
-			}
-		}
 	} else {
 		for _, field := range spec.table.Fields {
-			b.WriteString("\t\t\t\t\t")
+			b.WriteString("\t\t\t\t\t\t")
 			b.WriteString(field.Name)
 			b.WriteString(": ")
 			b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 			b.WriteString(",\n")
 		}
 	}
-	b.WriteString("\t\t\t\t}\n")
-	b.WriteString("\t\t\t\tr.cache.Set(item)\n")
-	b.WriteString("\t\t\t\tfoundKeys[New")
+	b.WriteString("\t\t\t\t\t}\n")
+	b.WriteString("\t\t\t\t\tr.cache.Set(item)\n")
+	b.WriteString("\t\t\t\t\tfoundKeys[New")
 	b.WriteString(keyType)
 	b.WriteString("(item)] = struct{}{}\n")
-	b.WriteString("\t\t\t}\n")
-	b.WriteString("\t\t\treturn nil\n")
-	b.WriteString("\t\t},\n")
+	b.WriteString("\t\t\t\t}\n")
+	b.WriteString("\t\t\t\treturn nil\n")
+	b.WriteString("\t\t\t},\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tif err := conn.Do(ctx, q); err != nil {\n\t\t\treturn err\n\t\t}\n")
 	b.WriteString("\t}\n")
-	b.WriteString("\tif err := conn.Do(ctx, q); err != nil {\n\t\treturn err\n\t}\n")
 	b.WriteString("\tfor _, key := range uniqueList {\n")
 	b.WriteString("\t\tif _, found := foundKeys[key]; !found {\n")
 	b.WriteString("\t\t\ttombstone := ")
@@ -1874,6 +1986,15 @@ func customSelectColumnList(table customTableSpec) string {
 	return strings.Join(selects, ", ")
 }
 
+func customSelectColumnListQualified(table customTableSpec, alias string) string {
+	selects := make([]string, 0, len(table.Fields))
+	for _, field := range table.Fields {
+		col := quoteSQLIdent(field.ColumnName)
+		selects = append(selects, alias+"."+col+" AS "+col)
+	}
+	return strings.Join(selects, ", ")
+}
+
 func keyColumns(fields []customFieldSpec) []customColumnSpec {
 	out := make([]customColumnSpec, 0, len(fields))
 	for _, f := range fields {
@@ -1888,6 +2009,32 @@ func keyColumnExpressionList(fields []customFieldSpec) string {
 		out = append(out, quoteSQLIdent(field.ColumnName))
 	}
 	return strings.Join(out, ", ")
+}
+
+func keyColumnExpressionListQualified(fields []customFieldSpec, alias string) string {
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		out = append(out, alias+"."+quoteSQLIdent(field.ColumnName))
+	}
+	return strings.Join(out, ", ")
+}
+
+func keyJoinCondition(fields []customFieldSpec, leftAlias, rightAlias string) string {
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		col := quoteSQLIdent(field.ColumnName)
+		out = append(out, leftAlias+"."+col+" = "+rightAlias+"."+col)
+	}
+	return strings.Join(out, " AND ")
+}
+
+func keyFieldsExternalFixed(fields []customFieldSpec) bool {
+	for _, field := range fields {
+		if field.Type != "common.Address" && field.Type != "common.Hash" {
+			return false
+		}
+	}
+	return len(fields) > 0
 }
 
 func findStateEventSpec(events []eventSpec, state config.StateConfig) (*eventSpec, error) {
