@@ -444,6 +444,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						return
 					}
 					log.Printf("Chain %d: fetch %s error: %v, retrying...", chain.ID, rangeLabel, err)
+					// Adaptive paging back-off: a too-large range can reject/time out, so
+					// halve the page before retrying (binary-search down). Only affects the
+					// request ceiling — pBlock is unchanged, so no block is skipped.
+					if pageSize == 0 {
+						adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, 0, true, minAdaptivePageSize, maxAdaptivePageSize)
+					}
 					select {
 					case <-pCtx.Done():
 						return
@@ -604,6 +610,17 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				if len(decodedBlocks) > 0 {
 					select {
 					case next := <-advance:
+						// Adaptive paging: next.nextBlock - batchStartBlock is the block
+						// span this request actually covered (including gap-skipped empty
+						// blocks). Feed it back so the page grows toward the portal's
+						// cursor cap on a sparse range (far fewer round-trips across the
+						// empty pre-deployment prefix) and tracks it on a dense one. Only
+						// the request ceiling moves; pBlock is authoritative, so no block
+						// is ever skipped.
+						if pageSize == 0 && next.nextBlock > batchStartBlock {
+							span := next.nextBlock - batchStartBlock
+							adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, span, false, minAdaptivePageSize, maxAdaptivePageSize)
+						}
 						pBlock = next.nextBlock
 						pHash = next.parentHash
 					case <-pCtx.Done():
