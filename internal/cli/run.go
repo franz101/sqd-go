@@ -22,7 +22,7 @@ import (
 // runDev loads the project, runs codegen, starts docker compose, then runs the
 // ingestion pipeline. On exit it tears down docker compose. Use this for local
 // development where ClickHouse is managed by compose.
-func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
+func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
@@ -58,13 +58,13 @@ func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, en
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch)
 }
 
 // runStartPipeline loads the project, runs codegen, then starts ingestion.
 // Unlike runDev it does not manage docker compose — the user is responsible for
 // running ClickHouse externally.
-func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string) int {
+func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -79,7 +79,7 @@ func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBl
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch)
 }
 
 func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
@@ -121,7 +121,7 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 // the pipeline falls back to the legacy JSON-decoded path with struct-based
 // event processing. This is useful for debugging or when proto support has not
 // been validated for a new contract.
-func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string) int {
+func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string, parallelFetch bool) int {
 	if protoMode {
 		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
 	}
@@ -179,7 +179,12 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 		GeneratedSQLDir:    filepath.Dir(outPath),
 		CursorMode:         true,
 		PageSize:           pageSize,
-		ColdCache: resolveColdCache(noColdCache, project.Config.ColdCache),
+		ColdCache:          resolveColdCache(noColdCache, project.Config.ColdCache),
+		ParallelFetch:      parallelFetch,
+	}
+	if parallelFetch {
+		workers, pageBlocks := ingestion.ParallelFetchSettings()
+		log.Printf("PARALLEL FETCH ENABLED: finalized backfill via %d concurrent range workers (page %d blocks)", workers, pageBlocks)
 	}
 	if opts.ColdCache {
 		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")
