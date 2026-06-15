@@ -39,7 +39,7 @@ type Options struct {
 	ForkMode           config.ForkMode
 	CustomProcessor    CustomProcessor
 	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
-	StateLoader        func(blockNumber uint64) error // called on startup to load processor state from database
+	StateLoader        func(ctx context.Context, blockNumber uint64) error // called on startup to load processor state from database
 	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
 	// ColdCache enables a Pebble-backed cold tier under the hot caches (finalized
 	// backfill only). It removes the per-miss ClickHouse point-SELECT: an evicted
@@ -219,7 +219,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 				// Load processor state from database at the recovery checkpoint
 				log.Printf("[LOAD STATE] Loading processor state from ClickHouse database at block %d...", recovery.Number)
-				if err := proc.LoadFromDatabase(recovery.Number); err != nil {
+				if err := proc.LoadFromDatabase(ctx, recovery.Number); err != nil {
 					log.Printf("[LOAD STATE] State load from ClickHouse at block %d failed: %v (will rebuild from events)", recovery.Number, err)
 				} else {
 					log.Printf("[LOAD STATE] Processor state loaded successfully from ClickHouse database at block %d", recovery.Number)
@@ -908,7 +908,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				restoredBlock, err := proc.RestoreToBlock(safe.Number)
 				if err != nil {
 					log.Printf("[LOAD STATE] Processor state restore to block %d failed: %v. Attempting fallback state load from ClickHouse database...", safe.Number, err)
-					if err := proc.LoadFromDatabase(safe.Number); err != nil {
+					if err := proc.LoadFromDatabase(ctx, safe.Number); err != nil {
 						return fmt.Errorf("restore processor state after fork at %d: %w", safe.Number, err)
 					}
 					restoredBlock = safe.Number
@@ -920,7 +920,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						entry, ok := replayBuf.GetBlock(bNum)
 						if !ok {
 							log.Printf("[ROLLBACK] Replay buffer cache miss for block %d during catch up. Attempting fallback state load from ClickHouse database...", bNum)
-							if err := proc.LoadFromDatabase(safe.Number); err != nil {
+							if err := proc.LoadFromDatabase(ctx, safe.Number); err != nil {
 								return fmt.Errorf("restore processor state after fork at %d: %w", safe.Number, err)
 							}
 							break
