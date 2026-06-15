@@ -15,10 +15,11 @@ import (
 type parsedArgs struct {
 	command      string
 	project      string
-	restart     bool
-	noColdCache bool
-	coldCacheMB string
-	protoMode   bool
+	restart       bool
+	noColdCache   bool
+	coldCacheMB   string
+	parallelFetch bool
+	protoMode     bool
 	initSource   string
 	initABI      string
 	initName     string
@@ -89,6 +90,8 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.protoMode = false
 		case "--no-cold-cache":
 			p.noColdCache = true
+		case "--parallel-fetch":
+			p.parallelFetch = true
 		case "--cold-cache-mb":
 			i++
 			if i >= len(args) {
@@ -177,14 +180,14 @@ func Run(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
 		}
-		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch)
 
 	case "stop":
 		return runStop()
@@ -203,7 +206,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch)
 	}
 }
 
@@ -328,6 +331,9 @@ Flags:
   --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default; config: cold_cache: false)
   --cold-cache-mb       (start/dev) Cold-tier block-cache budget in MiB; overrides config cold_cache_mb
                        (0/unset = auto-size to RAM/8). Sets SQD_COLDCACHE_MB.
+  --parallel-fetch      (start/dev) Fetch the finalized backfill range with concurrent range workers
+                       (round-trip-bound full syncs only). Worker count via SQD_PARALLEL_FETCHERS
+                       (default 6), grid-page width via SQD_PARALLEL_PAGE (default 10000).
 
 Examples:
   sqd-go
@@ -335,6 +341,7 @@ Examples:
   sqd-go codegen examples/uniswap
   sqd-go start examples/uniswap
   sqd-go start examples/uniswap --blockchain polygon --start-block 80000000 --restart
+  sqd-go start examples/uniswap --end-block 20000835 --parallel-fetch --restart
   sqd-go start examples/uniswap --restart
   sqd-go dev examples/uniswap --restart
   sqd-go stop
