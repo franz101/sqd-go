@@ -32,7 +32,11 @@ package generated
 	renderHotStateImports(&b, tables, events)
 
 	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n")
-	b.WriteString("const recoveryBucketCount = 8\n\n")
+	b.WriteString("const recoveryBucketCount = 8\n")
+	// recoveryConcurrency bounds how many bucket queries run at once during
+	// Recover. Beyond ~8 the latest-per-key scan is decompression-bound, so 8
+	// saturates a typical box without extra connections.
+	b.WriteString("const recoveryConcurrency = 8\n\n")
 	if customTablesUseSerializedCold(tables) {
 		b.WriteString("// coldBoolByte packs a bool for the cold-tier value codec.\n")
 		b.WriteString("func coldBoolByte(x bool) byte {\n\tif x {\n\t\treturn 1\n\t}\n\treturn 0\n}\n\n")
@@ -52,6 +56,141 @@ package generated
 	upperHex := fmt.Sprintf("%02x%s", upper, strings.Repeat("00", size-1))
 	upperExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", upperHex, size)
 	return fmt.Sprintf("%s >= %s AND %s < %s", column, lowerExpr, column, upperExpr)
+}
+
+func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
+	host := os.Getenv("CLICKHOUSE_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := 9000
+	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			port = p
+		}
+	}
+	user := os.Getenv("CLICKHOUSE_USER")
+	if user == "" {
+		user = "default"
+	}
+	return ch.Dial(ctx, ch.Options{
+		Address:  fmt.Sprintf("%s:%d", host, port),
+		Database: "default",
+		User:     user,
+		Password: os.Getenv("CLICKHOUSE_PASSWORD"),
+	})
+}
+
+// recoverBucketsParallel runs the latest-per-key scan for nbuckets disjoint
+// key-prefix buckets concurrently, then applies every decoded row on a single
+// goroutine. Each worker owns its own ch.Client (ch-go connections are not safe
+// for concurrent Do): the pool is the caller's primary connection plus up to
+// recoveryConcurrency-1 freshly dialed ones, and a dial failure just means fewer
+// workers rather than an error. run executes one bucket against a connection and
+// hands each decoded block to flush; set applies one row to the cache. The cache
+// and its cold tier are not safe for concurrent writers, so the queries fan out
+// while every set runs on the lone consumer. Buckets partition the keyspace, so
+// no key is ever set twice and set ordering is irrelevant.
+func recoverBucketsParallel[T any](
+	ctx context.Context,
+	primary *ch.Client,
+	nbuckets int,
+	run func(ctx context.Context, conn *ch.Client, bucket int, flush func([]T)) error,
+	set func(T),
+) error {
+	if nbuckets <= 1 {
+		return run(ctx, primary, 0, func(batch []T) {
+			for i := range batch {
+				set(batch[i])
+			}
+		})
+	}
+
+	conc := recoveryConcurrency
+	if conc > nbuckets {
+		conc = nbuckets
+	}
+	conns := make([]*ch.Client, 1, conc)
+	conns[0] = primary
+	for len(conns) < conc {
+		wc, err := recoveryDialConn(ctx)
+		if err != nil {
+			break
+		}
+		conns = append(conns, wc)
+	}
+	defer func() {
+		for _, wc := range conns[1:] {
+			_ = wc.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	items := make(chan []T, len(conns)*2)
+	var consumerWG sync.WaitGroup
+	consumerWG.Add(1)
+	go func() {
+		defer consumerWG.Done()
+		for batch := range items {
+			for i := range batch {
+				set(batch[i])
+			}
+		}
+	}()
+
+	buckets := make(chan int)
+	var (
+		workerWG sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+	flush := func(batch []T) {
+		if len(batch) == 0 {
+			return
+		}
+		select {
+		case items <- batch:
+		case <-ctx.Done():
+		}
+	}
+	for _, conn := range conns {
+		workerWG.Add(1)
+		go func(conn *ch.Client) {
+			defer workerWG.Done()
+			for bucket := range buckets {
+				if err := run(ctx, conn, bucket, flush); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}(conn)
+	}
+feed:
+	for bucket := 0; bucket < nbuckets; bucket++ {
+		select {
+		case buckets <- bucket:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(buckets)
+	workerWG.Wait()
+	close(items)
+	consumerWG.Wait()
+	return firstErr
 }
 
 `)
@@ -81,6 +220,8 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 	imports := map[string]string{
 		`"context"`:                           "",
 		`"fmt"`:                               "",
+		`"os"`:                                "",
+		`"strconv"`:                           "",
 		`"strings"`:                           "",
 		`"sync"`:                              "",
 		`"sync/atomic"`:                       "",
@@ -778,7 +919,9 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("func (c *")
 	b.WriteString(spec.cacheType)
-	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\trunBucket := func(bucket int) error {\n\tvar (\n")
+	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\trun := func(ctx context.Context, conn *ch.Client, bucket int, flush func([]")
+	b.WriteString(spec.table.GoTypeName)
+	b.WriteString(")) error {\n\tvar (\n")
 	for _, field := range spec.table.Fields {
 		b.WriteString("\t\t")
 		b.WriteString(batchColumnField(field))
@@ -809,7 +952,9 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(strconv.Quote(spec.table.Name))
 	b.WriteString("), ")
 	b.WriteString(recoverWhereExpr(spec.table))
-	b.WriteString("), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\titem := ")
+	b.WriteString("), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tbatch := make([]")
+	b.WriteString(spec.table.GoTypeName)
+	b.WriteString(", 0, block.Rows)\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\tbatch = append(batch, ")
 	b.WriteString(spec.table.GoTypeName)
 	b.WriteString("{\n")
 	for _, field := range spec.table.Fields {
@@ -819,7 +964,9 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 		b.WriteString(",\n")
 	}
-	b.WriteString("\t\t\t}\n\t\t\tc.Set(item)\n\t\t}\n\t\treturn nil\n\t}})\n\t}\n\tfor bucket := 0; bucket < recoveryBucketCount; bucket++ {\n\t\tif err := runBucket(bucket); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n\n")
+	b.WriteString("\t\t\t})\n\t\t}\n\t\tflush(batch)\n\t\treturn nil\n\t}})\n\t}\n\treturn recoverBucketsParallel[")
+	b.WriteString(spec.table.GoTypeName)
+	b.WriteString("](ctx, conn, recoveryBucketCount, run, c.Set)\n}\n\n")
 }
 
 func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {

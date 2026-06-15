@@ -12,7 +12,9 @@ import (
 	"github.com/franz101/sqd-go/drafts/protomath"
 	"github.com/franz101/sqd-go/internal/coldcache"
 	"github.com/holiman/uint256"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +24,7 @@ import (
 
 const DefaultClockCacheCapacity uint64 = 100000
 const recoveryBucketCount = 8
+const recoveryConcurrency = 8
 
 // coldBoolByte packs a bool for the cold-tier value codec.
 func coldBoolByte(x bool) byte {
@@ -46,6 +49,141 @@ func recoveryFixedStringRange(column string, bucket int, size int) string {
 	upperHex := fmt.Sprintf("%02x%s", upper, strings.Repeat("00", size-1))
 	upperExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", upperHex, size)
 	return fmt.Sprintf("%s >= %s AND %s < %s", column, lowerExpr, column, upperExpr)
+}
+
+func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
+	host := os.Getenv("CLICKHOUSE_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := 9000
+	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			port = p
+		}
+	}
+	user := os.Getenv("CLICKHOUSE_USER")
+	if user == "" {
+		user = "default"
+	}
+	return ch.Dial(ctx, ch.Options{
+		Address:  fmt.Sprintf("%s:%d", host, port),
+		Database: "default",
+		User:     user,
+		Password: os.Getenv("CLICKHOUSE_PASSWORD"),
+	})
+}
+
+// recoverBucketsParallel runs the latest-per-key scan for nbuckets disjoint
+// key-prefix buckets concurrently, then applies every decoded row on a single
+// goroutine. Each worker owns its own ch.Client (ch-go connections are not safe
+// for concurrent Do): the pool is the caller's primary connection plus up to
+// recoveryConcurrency-1 freshly dialed ones, and a dial failure just means fewer
+// workers rather than an error. run executes one bucket against a connection and
+// hands each decoded block to flush; set applies one row to the cache. The cache
+// and its cold tier are not safe for concurrent writers, so the queries fan out
+// while every set runs on the lone consumer. Buckets partition the keyspace, so
+// no key is ever set twice and set ordering is irrelevant.
+func recoverBucketsParallel[T any](
+	ctx context.Context,
+	primary *ch.Client,
+	nbuckets int,
+	run func(ctx context.Context, conn *ch.Client, bucket int, flush func([]T)) error,
+	set func(T),
+) error {
+	if nbuckets <= 1 {
+		return run(ctx, primary, 0, func(batch []T) {
+			for i := range batch {
+				set(batch[i])
+			}
+		})
+	}
+
+	conc := recoveryConcurrency
+	if conc > nbuckets {
+		conc = nbuckets
+	}
+	conns := make([]*ch.Client, 1, conc)
+	conns[0] = primary
+	for len(conns) < conc {
+		wc, err := recoveryDialConn(ctx)
+		if err != nil {
+			break
+		}
+		conns = append(conns, wc)
+	}
+	defer func() {
+		for _, wc := range conns[1:] {
+			_ = wc.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	items := make(chan []T, len(conns)*2)
+	var consumerWG sync.WaitGroup
+	consumerWG.Add(1)
+	go func() {
+		defer consumerWG.Done()
+		for batch := range items {
+			for i := range batch {
+				set(batch[i])
+			}
+		}
+	}()
+
+	buckets := make(chan int)
+	var (
+		workerWG sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+	flush := func(batch []T) {
+		if len(batch) == 0 {
+			return
+		}
+		select {
+		case items <- batch:
+		case <-ctx.Done():
+		}
+	}
+	for _, conn := range conns {
+		workerWG.Add(1)
+		go func(conn *ch.Client) {
+			defer workerWG.Done()
+			for bucket := range buckets {
+				if err := run(ctx, conn, bucket, flush); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}(conn)
+	}
+feed:
+	for bucket := 0; bucket < nbuckets; bucket++ {
+		select {
+		case buckets <- bucket:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(buckets)
+	workerWG.Wait()
+	close(items)
+	consumerWG.Wait()
+	return firstErr
 }
 
 type MemoryCondition struct {
@@ -430,7 +568,7 @@ func (b *MemoryConditionBatch) Insert(ctx context.Context, conn *ch.Client, db s
 }
 
 func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	runBucket := func(bucket int) error {
+	run := func(ctx context.Context, conn *ch.Client, bucket int, flush func([]MemoryCondition)) error {
 		var (
 			colID               proto.ColFixedStr
 			colOracle           proto.ColFixedStr
@@ -464,8 +602,9 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 			{Name: "log_index", Data: &colLogIndex},
 		}
 		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`oracle` AS `oracle`, `t`.`question_id` AS `question_id`, `t`.`outcome_slot_count` AS `outcome_slot_count`, `t`.`resolved` AS `resolved`, `t`.`payouts` AS `payouts`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_conditions"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			batch := make([]MemoryCondition, 0, block.Rows)
 			for i := 0; i < block.Rows; i++ {
-				item := MemoryCondition{
+				batch = append(batch, MemoryCondition{
 					ID:               common.BytesToHash(colID.Row(i)),
 					Oracle:           common.BytesToAddress(colOracle.Row(i)),
 					QuestionID:       common.BytesToHash(colQuestionID.Row(i)),
@@ -477,18 +616,13 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 					BlockNumber:      colBlockNumber.Row(i),
 					TxIndex:          colTxIndex.Row(i),
 					LogIndex:         colLogIndex.Row(i),
-				}
-				c.Set(item)
+				})
 			}
+			flush(batch)
 			return nil
 		}})
 	}
-	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
-		if err := runBucket(bucket); err != nil {
-			return err
-		}
-	}
-	return nil
+	return recoverBucketsParallel[MemoryCondition](ctx, conn, recoveryBucketCount, run, c.Set)
 }
 
 type MemoryConditionBatchResolver struct {
@@ -939,7 +1073,7 @@ func (b *MemoryUserPositionBatch) Insert(ctx context.Context, conn *ch.Client, d
 }
 
 func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	runBucket := func(bucket int) error {
+	run := func(ctx context.Context, conn *ch.Client, bucket int, flush func([]MemoryUserPosition)) error {
 		var (
 			colUser           proto.ColFixedStr
 			colTokenID        proto.ColFixedStr
@@ -971,8 +1105,9 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 			{Name: "log_index", Data: &colLogIndex},
 		}
 		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`user` DESC, `t`.`token_id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_user_positions"), recoveryFixedStringRange("`t`.`user`", bucket, 20)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			batch := make([]MemoryUserPosition, 0, block.Rows)
 			for i := 0; i < block.Rows; i++ {
-				item := MemoryUserPosition{
+				batch = append(batch, MemoryUserPosition{
 					User:           common.BytesToAddress(colUser.Row(i)),
 					TokenID:        common.BytesToHash(colTokenID.Row(i)),
 					Amount:         protomath.Decimal256(colAmount.Row(i)),
@@ -984,18 +1119,13 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 					BlockNumber:    colBlockNumber.Row(i),
 					TxIndex:        colTxIndex.Row(i),
 					LogIndex:       colLogIndex.Row(i),
-				}
-				c.Set(item)
+				})
 			}
+			flush(batch)
 			return nil
 		}})
 	}
-	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
-		if err := runBucket(bucket); err != nil {
-			return err
-		}
-	}
-	return nil
+	return recoverBucketsParallel[MemoryUserPosition](ctx, conn, recoveryBucketCount, run, c.Set)
 }
 
 type MemoryUserPositionBatchResolver struct {
@@ -1492,7 +1622,7 @@ func (b *MemoryMarketBatch) Insert(ctx context.Context, conn *ch.Client, db stri
 }
 
 func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	runBucket := func(bucket int) error {
+	run := func(ctx context.Context, conn *ch.Client, bucket int, flush func([]MemoryMarket)) error {
 		var (
 			colID             proto.ColFixedStr
 			colQuestionCount  proto.ColUInt32
@@ -1518,8 +1648,9 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 			{Name: "log_index", Data: &colLogIndex},
 		}
 		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_markets"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			batch := make([]MemoryMarket, 0, block.Rows)
 			for i := 0; i < block.Rows; i++ {
-				item := MemoryMarket{
+				batch = append(batch, MemoryMarket{
 					ID:             common.BytesToHash(colID.Row(i)),
 					QuestionCount:  colQuestionCount.Row(i),
 					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
@@ -1528,18 +1659,13 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 					BlockNumber:    colBlockNumber.Row(i),
 					TxIndex:        colTxIndex.Row(i),
 					LogIndex:       colLogIndex.Row(i),
-				}
-				c.Set(item)
+				})
 			}
+			flush(batch)
 			return nil
 		}})
 	}
-	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
-		if err := runBucket(bucket); err != nil {
-			return err
-		}
-	}
-	return nil
+	return recoverBucketsParallel[MemoryMarket](ctx, conn, recoveryBucketCount, run, c.Set)
 }
 
 type MemoryMarketBatchResolver struct {
@@ -2017,7 +2143,7 @@ func (b *MemoryNegRiskEventBatch) Insert(ctx context.Context, conn *ch.Client, d
 }
 
 func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	runBucket := func(bucket int) error {
+	run := func(ctx context.Context, conn *ch.Client, bucket int, flush func([]MemoryNegRiskEvent)) error {
 		var (
 			colID             proto.ColFixedStr
 			colQuestionCount  proto.ColUInt32
@@ -2043,8 +2169,9 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 			{Name: "log_index", Data: &colLogIndex},
 		}
 		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_neg_risk_events"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			batch := make([]MemoryNegRiskEvent, 0, block.Rows)
 			for i := 0; i < block.Rows; i++ {
-				item := MemoryNegRiskEvent{
+				batch = append(batch, MemoryNegRiskEvent{
 					ID:             common.BytesToHash(colID.Row(i)),
 					QuestionCount:  colQuestionCount.Row(i),
 					QuestionIDs:    hotStateHashSlice(colQuestionIDs.Row(i)),
@@ -2053,18 +2180,13 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 					BlockNumber:    colBlockNumber.Row(i),
 					TxIndex:        colTxIndex.Row(i),
 					LogIndex:       colLogIndex.Row(i),
-				}
-				c.Set(item)
+				})
 			}
+			flush(batch)
 			return nil
 		}})
 	}
-	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
-		if err := runBucket(bucket); err != nil {
-			return err
-		}
-	}
-	return nil
+	return recoverBucketsParallel[MemoryNegRiskEvent](ctx, conn, recoveryBucketCount, run, c.Set)
 }
 
 type MemoryNegRiskEventBatchResolver struct {
@@ -2493,7 +2615,7 @@ func (b *MemoryFixedProductMarketMakerBatch) Insert(ctx context.Context, conn *c
 }
 
 func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	runBucket := func(bucket int) error {
+	run := func(ctx context.Context, conn *ch.Client, bucket int, flush func([]MemoryFixedProductMarketMaker)) error {
 		var (
 			colID              proto.ColFixedStr
 			colConditionID     proto.ColFixedStr
@@ -2520,8 +2642,9 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 			{Name: "log_index", Data: &colLogIndex},
 		}
 		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`condition_id` AS `condition_id`, `t`.`collateral_token` AS `collateral_token`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers"), recoveryFixedStringRange("`t`.`id`", bucket, 20)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+			batch := make([]MemoryFixedProductMarketMaker, 0, block.Rows)
 			for i := 0; i < block.Rows; i++ {
-				item := MemoryFixedProductMarketMaker{
+				batch = append(batch, MemoryFixedProductMarketMaker{
 					ID:              common.BytesToAddress(colID.Row(i)),
 					ConditionID:     common.BytesToHash(colConditionID.Row(i)),
 					CollateralToken: common.BytesToAddress(colCollateralToken.Row(i)),
@@ -2530,18 +2653,13 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 					BlockNumber:     colBlockNumber.Row(i),
 					TxIndex:         colTxIndex.Row(i),
 					LogIndex:        colLogIndex.Row(i),
-				}
-				c.Set(item)
+				})
 			}
+			flush(batch)
 			return nil
 		}})
 	}
-	for bucket := 0; bucket < recoveryBucketCount; bucket++ {
-		if err := runBucket(bucket); err != nil {
-			return err
-		}
-	}
-	return nil
+	return recoverBucketsParallel[MemoryFixedProductMarketMaker](ctx, conn, recoveryBucketCount, run, c.Set)
 }
 
 type MemoryFixedProductMarketMakerBatchResolver struct {
