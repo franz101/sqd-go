@@ -111,7 +111,7 @@ func PopulateUserPositions(ctx context.Context, chHost string, chPort int, chUse
 					RealizedPnL:    decimal256FromDecimal(realizedPnL),
 					TotalBought:    decimal256FromDecimal(totalBought),
 					UpdatedAtBlock: 1,
-					UpdatedAt:      time.Now().UTC(),
+					UpdatedAt:      time.Now().UTC().UnixMilli(),
 					BlockNumber:    1,
 					TxIndex:        0,
 					LogIndex:       0,

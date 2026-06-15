@@ -54,8 +54,8 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 func init() {
 	// link to cli
 	generated.CustomProcessFn = Process
-	cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-		return generated.NewProcessor()
+	cli.RegisterProcessorV2(generated.ProjectName, func(protoMode bool) (ingestion.Processor, error) {
+		return generated.NewProcessor(protoMode)
 	})
 
 	// settings:

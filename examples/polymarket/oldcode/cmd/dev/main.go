@@ -61,9 +61,8 @@ func main() {
 			_, err := state.RestoreToBlock(b)
 			return err
 		},
-		StateLoader: func(blockNumber uint64) error {
-			httpPort := envOrDefaultInt("CLICKHOUSE_HTTP_PORT", 8123)
-			return state.LoadFromClickHouse(context.Background(), httpPort, blockNumber)
+		StateLoader: func(ctx context.Context, blockNumber uint64) error {
+			return state.LoadFromClickHouse(ctx, blockNumber)
 		},
 	}
 	if err := ingestion.Run(context.Background(), project.Config, opts); err != nil {
