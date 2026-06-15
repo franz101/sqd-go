@@ -5,3 +5,5 @@ ecs/
 .env
 .claude/
 .venv/
+# Local codegen scratch output (projects live under examples/)
+/uniswap/
