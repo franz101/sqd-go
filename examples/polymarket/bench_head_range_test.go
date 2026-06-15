@@ -76,7 +76,7 @@ func TestBenchHeadRange(t *testing.T) {
 	defer func() { _ = proc.CloseColdCache() }()
 	proc.State.SetSnapshotsEnabled(false)
 	loadStart := time.Now()
-	if err := proc.LoadFromDatabase(60444591); err != nil {
+	if err := proc.LoadFromDatabase(context.Background(), 60444591); err != nil {
 		t.Fatalf("load state from clickhouse: %v", err)
 	}
 	t.Logf("state rebuild from ClickHouse (recovery path): %s, authoritative=%v",

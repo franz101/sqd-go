@@ -233,7 +233,9 @@ func (p *derivedPairProcessor) Process(ctx context.Context, store *database.Stor
 func (p *derivedPairProcessor) RestoreToBlock(blockNumber uint64) (uint64, error) {
 	return blockNumber, nil
 }
-func (p *derivedPairProcessor) LoadFromDatabase(blockNumber uint64) error { return nil }
+func (p *derivedPairProcessor) LoadFromDatabase(ctx context.Context, blockNumber uint64) error {
+	return nil
+}
 
 // writeUniswapProject scaffolds a minimal UniswapV2Factory config.yaml under root.
 func writeUniswapProject(t *testing.T, root, name string) {

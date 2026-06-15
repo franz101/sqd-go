@@ -91,7 +91,7 @@ func TestWallet0xf05b67Positions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create recovery processor: %v", err)
 	}
-	if err := recoveredProc.LoadFromDatabase(stats.lastBlock); err != nil {
+	if err := recoveredProc.LoadFromDatabase(context.Background(), stats.lastBlock); err != nil {
 		t.Fatalf("load processor state from ClickHouse: %v", err)
 	}
 	if restored, err := recoveredProc.RestoreToBlock(stats.lastBlock); err != nil {

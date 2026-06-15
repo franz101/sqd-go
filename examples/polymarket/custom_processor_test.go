@@ -906,7 +906,7 @@ func TestProcessorDatabaseRecovery(t *testing.T) {
 	}
 
 	// Call recovery/LoadFromDatabase
-	err = proc.LoadFromDatabase(78000100)
+	err = proc.LoadFromDatabase(context.Background(), 78000100)
 	if err != nil {
 		t.Fatalf("LoadFromDatabase failed: %v", err)
 	}

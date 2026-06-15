@@ -41,7 +41,9 @@ func (p *countingProcessor) Process(ctx context.Context, store *database.Store, 
 }
 
 func (p *countingProcessor) RestoreToBlock(blockNumber uint64) (uint64, error) { return blockNumber, nil }
-func (p *countingProcessor) LoadFromDatabase(blockNumber uint64) error { return nil }
+func (p *countingProcessor) LoadFromDatabase(ctx context.Context, blockNumber uint64) error {
+	return nil
+}
 
 // TestMultiBatchCursorPagesizeZeroExercisesFourPlusBatches validates that
 // pagesize=0 cursor mode fetches at least 4 adaptive producer batches
@@ -175,7 +177,9 @@ func (p *exchangeSniffingProcessor) Process(ctx context.Context, store *database
 }
 
 func (p *exchangeSniffingProcessor) RestoreToBlock(blockNumber uint64) (uint64, error) { return blockNumber, nil }
-func (p *exchangeSniffingProcessor) LoadFromDatabase(blockNumber uint64) error { return nil }
+func (p *exchangeSniffingProcessor) LoadFromDatabase(ctx context.Context, blockNumber uint64) error {
+	return nil
+}
 
 // TestBlockRangeEventDensityAround6874531 fetches a 500-block window
 // around block 6874531 and inspects event density per block.
