@@ -1183,7 +1183,7 @@ func (r *MemoryUserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.
 			keyColTokenID.Append(key.TokenID.Bytes())
 		}
 
-		queryStr := fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.memory_user_positions AS `t` INNER JOIN _resolver_keys AS `k` ON `t`.`user` = `k`.`user` AND `t`.`token_id` = `k`.`token_id` ORDER BY `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id`", quoteIdent(db))
+		queryStr := fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.memory_user_positions AS `t` WHERE (`t`.`user`, `t`.`token_id`) IN (SELECT `user`, `token_id` FROM _resolver_keys) ORDER BY `t`.`user` DESC, `t`.`token_id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id` SETTINGS optimize_read_in_order = 1", quoteIdent(db))
 
 		var (
 			colUser           proto.ColFixedStr

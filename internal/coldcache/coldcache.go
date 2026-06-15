@@ -24,6 +24,7 @@ package coldcache
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -31,6 +32,9 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // Default off-heap budgets. Both are hard caps; steady-state RSS ≈ Cache +
@@ -332,6 +336,85 @@ func (s *Store) Delete(key []byte) error {
 		return nil
 	}
 	return s.db.Delete(key, pebble.NoSync)
+}
+
+// BuildAndIngestSSTable writes all key-value pairs emitted by iter into a
+// temporary sorted sstable file under tmpDir, then atomically ingests it into
+// the Pebble store. iter must emit keys in strictly ascending order (Pebble
+// requires this; the sstable.Writer will return an error if violated).
+//
+// This is the fast path for bulk recovery: compared to Apply batches, SSTable
+// ingestion skips the MemTable and write-ahead log entirely, placing data
+// directly in the LSM at L0 (Pebble promotes to lower levels on compaction).
+// For large sorted data sets this is typically 3-10x faster than batched Apply.
+//
+// tmpDir is used to stage the .sst file before ingest; it must be on the same
+// filesystem as the Pebble directory so that the rename ingest uses hard-links
+// or atomic moves. Use the Pebble dir itself (s.dir) or a sibling directory.
+//
+// iter is a function that calls emit(key, value) for each entry in ascending
+// key order, and returns any iteration error. BuildAndIngestSSTable returns the
+// number of keys written and any error. The sstable file is removed from tmpDir
+// once ingest completes (success or failure).
+func (s *Store) BuildAndIngestSSTable(tmpDir string, iter func(emit func(key, val []byte) error) error) (n int64, err error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return 0, fmt.Errorf("coldcache: mkdir tmpDir: %w", err)
+	}
+	// Reserve a unique temp filename. We create the file via vfs.Default.Create
+	// (which returns a vfs.File accepted by objstorageprovider.NewFileWritable),
+	// so close the OS temp immediately and re-create via the Pebble VFS.
+	tmpOSFile, err := os.CreateTemp(tmpDir, "coldcache-ingest-*.sst")
+	if err != nil {
+		return 0, fmt.Errorf("coldcache: create temp sst: %w", err)
+	}
+	sstPath := tmpOSFile.Name()
+	_ = tmpOSFile.Close()
+	_ = os.Remove(sstPath)
+
+	defer func() {
+		_ = os.Remove(sstPath) // clean up staging file in all cases
+	}()
+
+	// Create the sstable file via the Pebble VFS default (real filesystem).
+	vfsFile, err := vfs.Default.Create(sstPath)
+	if err != nil {
+		return 0, fmt.Errorf("coldcache: vfs create sst: %w", err)
+	}
+	writable := objstorageprovider.NewFileWritable(vfsFile)
+
+	// Use WriterOptions that match what the store was opened with. TableFormat 0
+	// (DefaultCompression, no bloom filter in the table) keeps it simple; we add
+	// a bloom filter at the DB level already. Use snappy compression to save I/O.
+	wOpts := sstable.WriterOptions{
+		Compression: sstable.SnappyCompression,
+		// TableFormat: leave at default (TableFormatRocksDBv2 for v1.1.5) which is
+		// compatible with db.Ingest.
+	}
+	w := sstable.NewWriter(writable, wOpts)
+
+	var iterErr error
+	iterErr = iter(func(key, val []byte) error {
+		n++
+		return w.Set(key, val)
+	})
+
+	if iterErr != nil {
+		_ = w.Close()
+		return 0, fmt.Errorf("coldcache: sstable iter: %w", iterErr)
+	}
+	if err := w.Close(); err != nil {
+		return 0, fmt.Errorf("coldcache: sstable close: %w", err)
+	}
+
+	// Ingest the finished sstable into the DB. Pebble moves (not copies) the
+	// file, so the temp staging file will be gone after ingest.
+	if err := s.db.Ingest([]string{sstPath}); err != nil {
+		return 0, fmt.Errorf("coldcache: ingest: %w", err)
+	}
+	return n, nil
 }
 
 // Close releases the database (and, for a single-owner store, its off-heap

@@ -1935,10 +1935,24 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 			b.WriteString(".Bytes())\n")
 		}
 		b.WriteString("\t\t}\n\n")
-		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s AS `t` INNER JOIN _resolver_keys AS `k` ON %s ORDER BY `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY %s",
+		// Resolve missed keys via a primary-key tuple-IN against the _resolver_keys
+		// external table, NOT an INNER JOIN. ClickHouse prunes granules with the
+		// (pk...) primary index for an IN-set, but full-scans the left table for a
+		// JOIN — the prefetch was reading ~133M rows/query (the whole table) on every
+		// batch. Ordering by the pk prefix DESC lets optimize_read_in_order stream the
+		// latest row per key out of the few pruned granules instead of a global sort.
+		extKeyCols := make([]string, 0, len(keyFields))
+		descKeyCols := make([]string, 0, len(keyFields))
+		for _, kf := range keyFields {
+			extKeyCols = append(extKeyCols, quoteSQLIdent(kf.ColumnName))
+			descKeyCols = append(descKeyCols, "`t`."+quoteSQLIdent(kf.ColumnName)+" DESC")
+		}
+		queryBody := fmt.Sprintf("SELECT %s FROM %%s.%s AS `t` WHERE (%s) IN (SELECT %s FROM _resolver_keys) ORDER BY %s, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY %s SETTINGS optimize_read_in_order = 1",
 			customSelectColumnListQualified(spec.table, "`t`"),
 			spec.table.Name,
-			keyJoinCondition(keyFields, "`t`", "`k`"),
+			keyColumnExpressionListQualified(keyFields, "`t`"),
+			strings.Join(extKeyCols, ", "),
+			strings.Join(descKeyCols, ", "),
 			keyColumnExpressionListQualified(keyFields, "`t`"),
 		)
 		b.WriteString(fmt.Sprintf("\t\tqueryStr := fmt.Sprintf(%s, quoteIdent(db))\n\n",
