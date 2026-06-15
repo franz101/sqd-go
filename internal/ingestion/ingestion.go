@@ -650,8 +650,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		}
 	}()
 
-	var batchEventBlocks uint64
-	var batchEventsCount uint64
 	statsTicker := time.NewTicker(statsInterval)
 	defer statsTicker.Stop()
 	lastStatsTime := startTime
@@ -700,8 +698,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		}
 		batchCustomLogs = batchCustomLogs[:0]
 		batchRawJSONL = batchRawJSONL[:0]
-		batchEventBlocks = 0
-		batchEventsCount = 0
 		pendingBatchBlocks = 0
 	}
 	sendProducerAdvance := func(nextBlock uint64, parentHash string) error {
@@ -752,11 +748,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 							chain.ID, entry.number, snapshotEnableMargin, entry.finalized.Number)
 					}
 				}
-			}
-
-			if len(entry.events) > 0 {
-				batchEventBlocks++
-				batchEventsCount += uint64(len(entry.events))
 			}
 
 			atomic.AddUint64(&totalEvents, uint64(len(entry.events)))
@@ -864,12 +855,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						}
 					}
 				}
-
-				scanned := entry.number - entry.requestStartBlock + 1
-				elapsed := time.Now().Sub(startTime)
-				rate := float64(atomic.LoadUint64(&totalBlocks)) / elapsed.Seconds()
-				log.Printf("Chain %d: %s scanned %d blocks, event blocks: %d, events: %d | checkpoint: %d | total: %d blocks, %d events | %.1f blk/s",
-					chain.ID, entry.rangeLabel, scanned, batchEventBlocks, batchEventsCount, entry.number, atomic.LoadUint64(&totalBlocks), atomic.LoadUint64(&totalEvents), rate)
 
 				lastCheckpoint = entry.number
 				resetBatch()
