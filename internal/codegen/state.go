@@ -229,9 +229,11 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	if err := s.HotState.Recover(ctx, conn, db); err != nil {
 		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
 	}
-	if coldAttached {
+	if coldAttached && os.Getenv("SQD_RECOVERY_MIN_BLOCK") == "" {
 		s.HotState.coldAuthoritative = true
 		log.Printf("[LOAD STATE] cold tier rebuilt and authoritative at block %d: steady-state misses skip ClickHouse", blockNumber)
+	} else if coldAttached {
+		log.Printf("[LOAD STATE] recency-bounded recovery at block %d (SQD_RECOVERY_MIN_BLOCK=%s): cold non-authoritative, stale keys resolve via the batch resolver", blockNumber, os.Getenv("SQD_RECOVERY_MIN_BLOCK"))
 	}
 
 	s.LastSyncBlock = blockNumber

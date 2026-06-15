@@ -74,6 +74,24 @@ func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
 	})
 }
 
+// recoveryRecencyClause optionally narrows recovery to rows updated at/after
+// SQD_RECOVERY_MIN_BLOCK. Most state keys are touched once and never again, so
+// preloading only the recent working set lets resume skip the cold-start
+// prefetch storm; older keys fall through to the (index-pruned) batch resolver.
+// Empty (the default) loads every key. Applied only to entities carrying an
+// updated_at_block column.
+func recoveryRecencyClause() string {
+	v := os.Getenv("SQD_RECOVERY_MIN_BLOCK")
+	if v == "" {
+		return ""
+	}
+	mb, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || mb == 0 {
+		return ""
+	}
+	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " >= " + strconv.FormatUint(mb, 10)
+}
+
 // recoverColdParallel rebuilds a pointer-free entity's cold tier from nbuckets
 // disjoint key-prefix buckets, fully in parallel. Each worker owns its own
 // ch.Client (ch-go connections are not safe for concurrent Do) AND its own cold
@@ -585,7 +603,7 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`oracle` AS `oracle`, `t`.`question_id` AS `question_id`, `t`.`outcome_slot_count` AS `outcome_slot_count`, `t`.`resolved` AS `resolved`, `t`.`payouts` AS `payouts`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_conditions"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`oracle` AS `oracle`, `t`.`question_id` AS `question_id`, `t`.`outcome_slot_count` AS `outcome_slot_count`, `t`.`resolved` AS `resolved`, `t`.`payouts` AS `payouts`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_conditions"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryCondition{
 					ID:               common.BytesToHash(colID.Row(i)),
@@ -1091,7 +1109,7 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`user` DESC, `t`.`token_id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_user_positions"), recoveryFixedStringRange("`t`.`user`", bucket, 20)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`user` DESC, `t`.`token_id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_user_positions"), recoveryFixedStringRange("`t`.`user`", bucket, 20)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryUserPosition{
 					User:           common.BytesToAddress(colUser.Row(i)),
@@ -1643,7 +1661,7 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_markets"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_markets"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryMarket{
 					ID:             common.BytesToHash(colID.Row(i)),
@@ -2167,7 +2185,7 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_neg_risk_events"), recoveryFixedStringRange("`t`.`id`", bucket, 32)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_neg_risk_events"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryNegRiskEvent{
 					ID:             common.BytesToHash(colID.Row(i)),
@@ -2643,7 +2661,7 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`condition_id` AS `condition_id`, `t`.`collateral_token` AS `collateral_token`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers"), recoveryFixedStringRange("`t`.`id`", bucket, 20)), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`condition_id` AS `condition_id`, `t`.`collateral_token` AS `collateral_token`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers"), recoveryFixedStringRange("`t`.`id`", bucket, 20)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryFixedProductMarketMaker{
 					ID:              common.BytesToAddress(colID.Row(i)),

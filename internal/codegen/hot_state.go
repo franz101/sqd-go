@@ -81,6 +81,24 @@ func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
 	})
 }
 
+// recoveryRecencyClause optionally narrows recovery to rows updated at/after
+// SQD_RECOVERY_MIN_BLOCK. Most state keys are touched once and never again, so
+// preloading only the recent working set lets resume skip the cold-start
+// prefetch storm; older keys fall through to the (index-pruned) batch resolver.
+// Empty (the default) loads every key. Applied only to entities carrying an
+// updated_at_block column.
+func recoveryRecencyClause() string {
+	v := os.Getenv("SQD_RECOVERY_MIN_BLOCK")
+	if v == "" {
+		return ""
+	}
+	mb, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || mb == 0 {
+		return ""
+	}
+	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " >= " + strconv.FormatUint(mb, 10)
+}
+
 // recoverColdParallel rebuilds a pointer-free entity's cold tier from nbuckets
 // disjoint key-prefix buckets, fully in parallel. Each worker owns its own
 // ch.Client (ch-go connections are not safe for concurrent Do) AND its own cold
@@ -1689,6 +1707,17 @@ func recoverQuery(table customTableSpec) string {
 }
 
 func recoverWhereExpr(table customTableSpec) string {
+	base := recoverBucketWhereExpr(table)
+	// Append the optional recency narrowing for entities that track update block.
+	for _, field := range table.Fields {
+		if field.ColumnName == "updated_at_block" {
+			return base + " + recoveryRecencyClause()"
+		}
+	}
+	return base
+}
+
+func recoverBucketWhereExpr(table customTableSpec) string {
 	if len(table.PrimaryKey) == 0 {
 		return strconv.Quote("1")
 	}
