@@ -220,6 +220,73 @@ func (s *Store) Put(key, value []byte) error {
 	return s.db.Set(key, value, pebble.NoSync)
 }
 
+// coldBatchFlushCount is how many Puts a WriteBatch buffers before applying.
+// At ~256 B/entry that is a ~4 MiB Pebble commit — large enough to amortize the
+// per-commit cost during a bulk recovery, small enough to bound memory when many
+// batches run concurrently.
+const coldBatchFlushCount = 16384
+
+// WriteBatch buffers Puts and applies them to the store in one Pebble commit,
+// auto-flushing every coldBatchFlushCount entries. It is NOT safe for concurrent
+// use, but distinct WriteBatch values may be filled and committed concurrently
+// against the same Store (Pebble's Apply is concurrency-safe) — which is how the
+// parallel recovery path spills each key-prefix bucket without a shared
+// single-writer bottleneck. Callers must Close it (which flushes any remainder).
+type WriteBatch struct {
+	db    *pebble.DB
+	b     *pebble.Batch
+	count int
+}
+
+// NewWriteBatch opens a buffered writer over the store. A nil/closed store
+// yields a no-op batch so callers need no special-casing.
+func (s *Store) NewWriteBatch() *WriteBatch {
+	if s == nil || s.db == nil {
+		return &WriteBatch{}
+	}
+	return &WriteBatch{db: s.db, b: s.db.NewBatch()}
+}
+
+// Put buffers a key/value, flushing automatically when the batch fills. Pebble
+// copies both slices into the batch, so callers may pass transient
+// (unsafe-aliased) slices.
+func (w *WriteBatch) Put(key, value []byte) error {
+	if w == nil || w.b == nil {
+		return nil
+	}
+	if err := w.b.Set(key, value, nil); err != nil {
+		return err
+	}
+	w.count++
+	if w.count >= coldBatchFlushCount {
+		return w.flush()
+	}
+	return nil
+}
+
+func (w *WriteBatch) flush() error {
+	if w.b == nil || w.count == 0 {
+		return nil
+	}
+	if err := w.db.Apply(w.b, pebble.NoSync); err != nil {
+		return err
+	}
+	w.b.Reset()
+	w.count = 0
+	return nil
+}
+
+// Close flushes any buffered entries and releases the batch.
+func (w *WriteBatch) Close() error {
+	if w == nil || w.b == nil {
+		return nil
+	}
+	err := w.flush()
+	_ = w.b.Close()
+	w.b = nil
+	return err
+}
+
 // GetInto copies the value stored under key into dst (up to len(dst) bytes)
 // and reports whether it was found. Unlike Get it allocates nothing: callers
 // with a fixed-size destination (the pointer-free hot-state entities) pass

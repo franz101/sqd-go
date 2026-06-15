@@ -81,34 +81,30 @@ func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
 	})
 }
 
-// recoverBucketsParallel runs the latest-per-key scan for nbuckets disjoint
-// key-prefix buckets concurrently, then applies every decoded row on a single
-// goroutine. Each worker owns its own ch.Client (ch-go connections are not safe
-// for concurrent Do): the pool is the caller's primary connection plus up to
-// recoveryConcurrency-1 freshly dialed ones, and a dial failure just means fewer
-// workers rather than an error. run executes one bucket against a connection and
-// hands each decoded block to flush; set applies one row to the cache. The cache
-// and its cold tier are not safe for concurrent writers, so the queries fan out
-// while every set runs on the lone consumer. Buckets partition the keyspace, so
-// no key is ever set twice and set ordering is irrelevant.
-func recoverBucketsParallel[T any](
+// recoverColdParallel rebuilds a pointer-free entity's cold tier from nbuckets
+// disjoint key-prefix buckets, fully in parallel. Each worker owns its own
+// ch.Client (ch-go connections are not safe for concurrent Do) AND its own cold
+// WriteBatch, so the query fan-out and the Pebble spill both run concurrently
+// with no shared cache state -- the buckets partition the keyspace, so no key is
+// written twice. The hot ring is deliberately left empty: it warms lazily as Get
+// promotes cold hits, which avoids churning every row through the bounded ring
+// (the single-consumer Set was the recovery bottleneck). run drives one bucket
+// and calls emit per decoded row; encode hands key/value byte views to put
+// synchronously (Pebble copies them, so stack-aliased slices are safe).
+func recoverColdParallel[T any](
 	ctx context.Context,
 	primary *ch.Client,
 	nbuckets int,
-	run func(ctx context.Context, conn *ch.Client, bucket int, flush func([]T)) error,
-	set func(T),
+	cold *coldcache.Store,
+	run func(ctx context.Context, conn *ch.Client, bucket int, emit func(T)) error,
+	encode func(v T, put func(key, val []byte) error) error,
 ) error {
-	if nbuckets <= 1 {
-		return run(ctx, primary, 0, func(batch []T) {
-			for i := range batch {
-				set(batch[i])
-			}
-		})
-	}
-
 	conc := recoveryConcurrency
 	if conc > nbuckets {
 		conc = nbuckets
+	}
+	if conc < 1 {
+		conc = 1
 	}
 	conns := make([]*ch.Client, 1, conc)
 	conns[0] = primary
@@ -128,21 +124,9 @@ func recoverBucketsParallel[T any](
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	items := make(chan []T, len(conns)*2)
-	var consumerWG sync.WaitGroup
-	consumerWG.Add(1)
-	go func() {
-		defer consumerWG.Done()
-		for batch := range items {
-			for i := range batch {
-				set(batch[i])
-			}
-		}
-	}()
-
 	buckets := make(chan int)
 	var (
-		workerWG sync.WaitGroup
+		wg       sync.WaitGroup
 		errMu    sync.Mutex
 		firstErr error
 	)
@@ -157,21 +141,23 @@ func recoverBucketsParallel[T any](
 		}
 		errMu.Unlock()
 	}
-	flush := func(batch []T) {
-		if len(batch) == 0 {
-			return
-		}
-		select {
-		case items <- batch:
-		case <-ctx.Done():
-		}
-	}
 	for _, conn := range conns {
-		workerWG.Add(1)
+		wg.Add(1)
 		go func(conn *ch.Client) {
-			defer workerWG.Done()
+			defer wg.Done()
+			batch := cold.NewWriteBatch()
+			defer func() {
+				if err := batch.Close(); err != nil {
+					fail(err)
+				}
+			}()
+			emit := func(v T) {
+				if err := encode(v, batch.Put); err != nil {
+					fail(err)
+				}
+			}
 			for bucket := range buckets {
-				if err := run(ctx, conn, bucket, flush); err != nil {
+				if err := run(ctx, conn, bucket, emit); err != nil {
 					fail(err)
 					return
 				}
@@ -187,9 +173,7 @@ feed:
 		}
 	}
 	close(buckets)
-	workerWG.Wait()
-	close(items)
-	consumerWG.Wait()
+	wg.Wait()
 	return firstErr
 }
 
@@ -919,7 +903,7 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("func (c *")
 	b.WriteString(spec.cacheType)
-	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\trun := func(ctx context.Context, conn *ch.Client, bucket int, flush func([]")
+	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\trun := func(ctx context.Context, conn *ch.Client, bucket int, emit func(")
 	b.WriteString(spec.table.GoTypeName)
 	b.WriteString(")) error {\n\tvar (\n")
 	for _, field := range spec.table.Fields {
@@ -952,9 +936,7 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(strconv.Quote(spec.table.Name))
 	b.WriteString("), ")
 	b.WriteString(recoverWhereExpr(spec.table))
-	b.WriteString("), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tbatch := make([]")
-	b.WriteString(spec.table.GoTypeName)
-	b.WriteString(", 0, block.Rows)\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\tbatch = append(batch, ")
+	b.WriteString("), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\temit(")
 	b.WriteString(spec.table.GoTypeName)
 	b.WriteString("{\n")
 	for _, field := range spec.table.Fields {
@@ -964,9 +946,21 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 		b.WriteString(",\n")
 	}
-	b.WriteString("\t\t\t})\n\t\t}\n\t\tflush(batch)\n\t\treturn nil\n\t}})\n\t}\n\treturn recoverBucketsParallel[")
-	b.WriteString(spec.table.GoTypeName)
-	b.WriteString("](ctx, conn, recoveryBucketCount, run, c.Set)\n}\n\n")
+	b.WriteString("\t\t\t})\n\t\t}\n\t\treturn nil\n\t}})\n\t}\n")
+	// Pointer-free entities (raw-bytes cold tier) rebuild the cold tier in
+	// parallel: each bucket worker spills directly to its own Pebble WriteBatch,
+	// skipping the single-consumer hot-ring churn. The hot ring warms lazily via
+	// Get's cold-hit promotion. Slice-bearing (serialized-cold) entities and the
+	// no-cold fallback keep the simple sequential Set, which preserves their
+	// eviction accounting.
+	if isPointerFreeEntity(spec.table) {
+		b.WriteString("\tif c.cold != nil {\n\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
+		b.WriteString(spec.keyType)
+		b.WriteString("(v)\n\t\t\treturn put(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)), unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)))\n\t\t})\n\t}\n")
+	}
+	b.WriteString("\tfor bucket := 0; bucket < recoveryBucketCount; bucket++ {\n\t\tif err := run(ctx, conn, bucket, c.Set); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n\n")
 }
 
 func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
