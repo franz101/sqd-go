@@ -38,9 +38,9 @@ type Options struct {
 	CursorMode         bool
 	ForkMode           config.ForkMode
 	CustomProcessor    CustomProcessor
-	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
+	StateRestorer      func(blockNumber uint64) error                      // called before fork replay to roll back processor state
 	StateLoader        func(ctx context.Context, blockNumber uint64) error // called on startup to load processor state from database
-	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
+	Processor          Processor                                           // unified processor interface (overrides individual callbacks if set)
 	// ColdCache enables a Pebble-backed cold tier under the hot caches (finalized
 	// backfill only). It removes the per-miss ClickHouse point-SELECT: an evicted
 	// entry is served from local disk, and on a from-genesis run a hot+cold miss is
@@ -362,16 +362,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		forkErr *client.ForkError
 		err     error
 	}
-	type producerAdvance struct {
-		nextBlock  uint64
-		parentHash string
-	}
 	errChan := make(chan producerSignal, 1)
 	finalizedChan := make(chan *client.BlockRef, 100)
 
 	var prodCancel context.CancelFunc
 	var producerDone bool
-	var producerAdvanceChan chan producerAdvance
 
 	var startProd func(startBlk uint64, initialParent string)
 	startProd = func(startBlk uint64, initialParent string) {
@@ -379,12 +374,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			prodCancel()
 		}
 		producerDone = false
-		advanceChan := make(chan producerAdvance, 1)
-		producerAdvanceChan = advanceChan
 		var prodCtx context.Context
 		prodCtx, prodCancel = context.WithCancel(ctx)
 
-		go func(pCtx context.Context, pBlock uint64, pHash string, advance <-chan producerAdvance) {
+		go func(pCtx context.Context, pBlock uint64, pHash string) {
 			var lastFinalized uint64
 			// Adaptive page sizing: when pageSize=0, use this instead of nil
 			var adaptivePageSize uint64 = minAdaptivePageSize
@@ -608,30 +601,32 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				profIters.Add(1)
 
 				if len(decodedBlocks) > 0 {
-					select {
-					case next := <-advance:
-						// Adaptive paging: next.nextBlock - batchStartBlock is the block
-						// span this request actually covered (including gap-skipped empty
-						// blocks). Feed it back so the page grows toward the portal's
-						// cursor cap on a sparse range (far fewer round-trips across the
-						// empty pre-deployment prefix) and tracks it on a dense one. Only
-						// the request ceiling moves; pBlock is authoritative, so no block
-						// is ever skipped.
-						if pageSize == 0 && next.nextBlock > batchStartBlock {
-							span := next.nextBlock - batchStartBlock
-							adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, span, false, minAdaptivePageSize, maxAdaptivePageSize)
-						}
-						pBlock = next.nextBlock
-						pHash = next.parentHash
-					case <-pCtx.Done():
-						return
+					// Self-advance: the producer just wrote every block of this page to
+					// the replay buffer and tracked the last block's hash in pHash, so
+					// it can fetch the next page immediately instead of blocking on a
+					// per-page handshake with the consumer. Goroutine sampling on the v2
+					// line showed that handshake left the producer idle ~50% of wall
+					// time (fetch and consume fully serialized at page boundaries). The
+					// per-block replay-buffer backpressure above already bounds how far
+					// ahead the producer can run, so it can never lap the consumer.
+					next := decodedBlocks[len(decodedBlocks)-1].number + 1
+					// Adaptive paging: next - batchStartBlock is the block span this
+					// request actually covered. Feed it back so the page grows toward the
+					// portal's cursor cap on a sparse range (far fewer round-trips across
+					// the empty pre-deployment prefix) and tracks it on a dense one. Only
+					// the request ceiling moves; pBlock is authoritative, so no block is
+					// ever skipped.
+					if pageSize == 0 && next > batchStartBlock {
+						span := next - batchStartBlock
+						adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, span, false, minAdaptivePageSize, maxAdaptivePageSize)
 					}
+					pBlock = next
 				} else {
 					// No blocks decoded, advance by 1 to retry
 					pBlock++
 				}
 			}
-		}(prodCtx, startBlk, initialParent, advanceChan)
+		}(prodCtx, startBlk, initialParent)
 	}
 
 	// Start the initial producer
@@ -704,18 +699,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		batchEventsCount = 0
 		pendingBatchBlocks = 0
 	}
-	sendProducerAdvance := func(nextBlock uint64, parentHash string) error {
-		if producerAdvanceChan == nil {
-			return nil
-		}
-		select {
-		case producerAdvanceChan <- producerAdvance{nextBlock: nextBlock, parentHash: parentHash}:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
 	for {
 		if entry, ok := replayBuf.GetBlock(currentConsumerBlockVal); ok {
 			// Accumulate data for batch insertion
@@ -795,9 +778,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 				profInsertNanos.Add(int64(time.Since(insertStart)))
 
-				if err := sendProducerAdvance(entry.number+1, entry.hash); err != nil {
-					return err
-				}
+				// The producer self-advances (it tracked the last block's hash and
+				// kept fetching), so there is no per-page advance handshake to send
+				// here — the consumer just proceeds to the custom processor.
 
 				// 4. Custom Processor
 				if useParseDecodeV2 && len(batchRawJSONL) > 0 {
@@ -954,7 +937,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						}
 					}
 				}
-
 
 				replayBuf.PruneAfter(safe.Number)
 				if pendingBatchBlocks > 0 {
