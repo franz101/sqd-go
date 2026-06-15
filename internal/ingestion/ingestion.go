@@ -38,9 +38,9 @@ type Options struct {
 	CursorMode         bool
 	ForkMode           config.ForkMode
 	CustomProcessor    CustomProcessor
-	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
+	StateRestorer      func(blockNumber uint64) error                      // called before fork replay to roll back processor state
 	StateLoader        func(ctx context.Context, blockNumber uint64) error // called on startup to load processor state from database
-	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
+	Processor          Processor                                           // unified processor interface (overrides individual callbacks if set)
 	// ColdCache enables a Pebble-backed cold tier under the hot caches (finalized
 	// backfill only). It removes the per-miss ClickHouse point-SELECT: an evicted
 	// entry is served from local disk, and on a from-genesis run a hot+cold miss is
@@ -58,6 +58,13 @@ const (
 	targetBlocksPerSec  = 20000
 	minAdaptivePageSize = 5000
 	maxAdaptivePageSize = 100000
+
+	// Cursor-mode producers fetch through /finalized-stream while at least
+	// this many blocks below the finalized head, switching to the paced live
+	// /stream endpoint only for the final approach. Anything at or below the
+	// finalized head is immutable, so the margin just prevents endpoint
+	// flapping near the boundary.
+	finalizedCatchupMargin = 512
 )
 
 // CustomLog is a decoded EVM log passed to legacy CustomProcessor callbacks.
@@ -266,6 +273,17 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 	sqd := client.New(chainEndpoint(chain.ID, cursorMode))
 	defer sqd.Close()
+	// The hot /stream endpoint paces its responses for real-time consumption —
+	// fine at the head, but a deep catch-up read through it trickles in at
+	// ~200 KB/s (multi-minute fetches, ~26 blk/s). Blocks at or below the
+	// finalized head are immutable, so cursor mode fetches them from the
+	// un-paced /finalized-stream endpoint and only switches to /stream once
+	// the producer is within finalizedCatchupMargin of the finalized head.
+	var sqdFinalized *client.Client
+	if cursorMode {
+		sqdFinalized = client.New(chainEndpoint(chain.ID, false))
+		defer sqdFinalized.Close()
+	}
 	jsonl := parser.NewFastJSONLParser(1024)
 	replayBuf := NewReplayBuffer(8192) // ~8K blocks of replay capacity
 	// No-data-loss (Invariant 0): if the processor reports a durable commit
@@ -388,6 +406,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			var lastFinalized uint64
 			// Adaptive page sizing: when pageSize=0, use this instead of nil
 			var adaptivePageSize uint64 = minAdaptivePageSize
+			onCatchupEndpoint := false
 			sentSignal := false
 			sendSignal := func(sig producerSignal) {
 				sentSignal = true
@@ -433,8 +452,23 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					return
 				}
 
+				// Catch-up fetches go through /finalized-stream; the request shape
+				// (parentBlockHash, includeAllBlocks) stays identical, so fork
+				// detection and the dense replay buffer are unaffected.
+				fetchClient := sqd
+				if sqdFinalized != nil && lastFinalized > 0 && pBlock+finalizedCatchupMargin <= lastFinalized {
+					fetchClient = sqdFinalized
+					if !onCatchupEndpoint {
+						onCatchupEndpoint = true
+						log.Printf("Chain %d: catch-up fetch via finalized-stream (block %d, finalized head %d)", chain.ID, pBlock, lastFinalized)
+					}
+				} else if onCatchupEndpoint {
+					onCatchupEndpoint = false
+					log.Printf("Chain %d: within %d of finalized head %d — fetching via live stream", chain.ID, finalizedCatchupMargin, lastFinalized)
+				}
+
 				t0 := time.Now()
-				response, err := sqd.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
+				response, err := fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
 				profFetchNanos.Add(int64(time.Since(t0)))
 
 				if err != nil {
@@ -954,7 +988,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						}
 					}
 				}
-
 
 				replayBuf.PruneAfter(safe.Number)
 				if pendingBatchBlocks > 0 {
