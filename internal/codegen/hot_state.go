@@ -1123,15 +1123,55 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	}
 
 	b.WriteString("func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {\n")
+	b.WriteString("\t// Recover every entity concurrently. Each entity gets its own ClickHouse\n")
+	b.WriteString("\t// connection so its fetch + cold-tier build runs fully in parallel with the\n")
+	b.WriteString("\t// others (the big entity no longer blocks the small ones). Per-entity state\n")
+	b.WriteString("\t// (hot ring, per-entity cold store) is independent; the shared cold block\n")
+	b.WriteString("\t// cache is ref-counted and concurrency-safe. More connections/RAM, far less\n")
+	b.WriteString("\t// wall time — \"ok if it takes more disk\".\n")
+	b.WriteString("\ttasks := []func(context.Context, *ch.Client, string) error{\n")
 	for _, spec := range specs {
 		if spec.table.IsEvent {
 			continue
 		}
-		b.WriteString("\tif err := s.")
+		b.WriteString("\t\ts.")
 		b.WriteString(spec.baseName)
-		b.WriteString(".Recover(ctx, conn, db); err != nil {\n\t\treturn err\n\t}\n")
+		b.WriteString(".Recover,\n")
 	}
-	b.WriteString("\treturn nil\n}\n\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tctx, cancel := context.WithCancel(ctx)\n")
+	b.WriteString("\tdefer cancel()\n")
+	b.WriteString("\tvar (\n")
+	b.WriteString("\t\twg       sync.WaitGroup\n")
+	b.WriteString("\t\terrMu    sync.Mutex\n")
+	b.WriteString("\t\tfirstErr error\n")
+	b.WriteString("\t\tdeferred []int // entities that couldn't get a dedicated connection\n")
+	b.WriteString("\t)\n")
+	b.WriteString("\tfail := func(err error) {\n")
+	b.WriteString("\t\tif err == nil {\n\t\t\treturn\n\t\t}\n")
+	b.WriteString("\t\terrMu.Lock()\n")
+	b.WriteString("\t\tif firstErr == nil {\n\t\t\tfirstErr = err\n\t\t\tcancel()\n\t\t}\n")
+	b.WriteString("\t\terrMu.Unlock()\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tfor i, fn := range tasks {\n")
+	b.WriteString("\t\twc, err := recoveryDialConn(ctx)\n")
+	b.WriteString("\t\tif err != nil {\n\t\t\tdeferred = append(deferred, i)\n\t\t\tcontinue\n\t\t}\n")
+	b.WriteString("\t\twg.Add(1)\n")
+	b.WriteString("\t\tgo func(fn func(context.Context, *ch.Client, string) error, c *ch.Client) {\n")
+	b.WriteString("\t\t\tdefer wg.Done()\n")
+	b.WriteString("\t\t\tdefer c.Close()\n")
+	b.WriteString("\t\t\tfail(fn(ctx, c, db))\n")
+	b.WriteString("\t\t}(fn, wc)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\twg.Wait()\n")
+	b.WriteString("\t// Any entity that couldn't get its own connection runs sequentially on the\n")
+	b.WriteString("\t// shared caller connection now that all goroutines have finished (ch.Client\n")
+	b.WriteString("\t// is not safe for concurrent use).\n")
+	b.WriteString("\tfor _, i := range deferred {\n")
+	b.WriteString("\t\tif firstErr != nil {\n\t\t\tbreak\n\t\t}\n")
+	b.WriteString("\t\tfail(tasks[i](ctx, conn, db))\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn firstErr\n}\n\n")
 
 	// Generate Update methods
 	for _, spec := range specs {
@@ -2201,15 +2241,6 @@ func keyColumnExpressionListQualified(fields []customFieldSpec, alias string) st
 		out = append(out, alias+"."+quoteSQLIdent(field.ColumnName))
 	}
 	return strings.Join(out, ", ")
-}
-
-func keyJoinCondition(fields []customFieldSpec, leftAlias, rightAlias string) string {
-	out := make([]string, 0, len(fields))
-	for _, field := range fields {
-		col := quoteSQLIdent(field.ColumnName)
-		out = append(out, leftAlias+"."+col+" = "+rightAlias+"."+col)
-	}
-	return strings.Join(out, " AND ")
 }
 
 func keyFieldsExternalFixed(fields []customFieldSpec) bool {

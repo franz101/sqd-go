@@ -3322,22 +3322,62 @@ func (s *HotState) CloseColdCache() error {
 }
 
 func (s *HotState) Recover(ctx context.Context, conn *ch.Client, db string) error {
-	if err := s.Conditions.Recover(ctx, conn, db); err != nil {
-		return err
+	// Recover every entity concurrently. Each entity gets its own ClickHouse
+	// connection so its fetch + cold-tier build runs fully in parallel with the
+	// others (the big entity no longer blocks the small ones). Per-entity state
+	// (hot ring, per-entity cold store) is independent; the shared cold block
+	// cache is ref-counted and concurrency-safe. More connections/RAM, far less
+	// wall time — "ok if it takes more disk".
+	tasks := []func(context.Context, *ch.Client, string) error{
+		s.Conditions.Recover,
+		s.UserPositions.Recover,
+		s.Markets.Recover,
+		s.NegRiskEvents.Recover,
+		s.FixedProductMarketMakers.Recover,
 	}
-	if err := s.UserPositions.Recover(ctx, conn, db); err != nil {
-		return err
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+		deferred []int // entities that couldn't get a dedicated connection
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
 	}
-	if err := s.Markets.Recover(ctx, conn, db); err != nil {
-		return err
+	for i, fn := range tasks {
+		wc, err := recoveryDialConn(ctx)
+		if err != nil {
+			deferred = append(deferred, i)
+			continue
+		}
+		wg.Add(1)
+		go func(fn func(context.Context, *ch.Client, string) error, c *ch.Client) {
+			defer wg.Done()
+			defer c.Close()
+			fail(fn(ctx, c, db))
+		}(fn, wc)
 	}
-	if err := s.NegRiskEvents.Recover(ctx, conn, db); err != nil {
-		return err
+	wg.Wait()
+	// Any entity that couldn't get its own connection runs sequentially on the
+	// shared caller connection now that all goroutines have finished (ch.Client
+	// is not safe for concurrent use).
+	for _, i := range deferred {
+		if firstErr != nil {
+			break
+		}
+		fail(tasks[i](ctx, conn, db))
 	}
-	if err := s.FixedProductMarketMakers.Recover(ctx, conn, db); err != nil {
-		return err
-	}
-	return nil
+	return firstErr
 }
 
 func (s *HotState) UpdateMemoryCondition(value MemoryCondition) {
