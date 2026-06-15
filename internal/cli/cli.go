@@ -17,6 +17,7 @@ type parsedArgs struct {
 	project      string
 	restart     bool
 	noColdCache bool
+	coldCacheMB string
 	protoMode   bool
 	initSource   string
 	initABI      string
@@ -88,6 +89,12 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.protoMode = false
 		case "--no-cold-cache":
 			p.noColdCache = true
+		case "--cold-cache-mb":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--cold-cache-mb requires a value")
+			}
+			p.coldCacheMB = args[i]
 		case "-p", "--pagesize":
 			i++
 			if i >= len(args) {
@@ -132,6 +139,13 @@ func Run(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parse args: %v\n", err)
 		return 2
+	}
+
+	// --cold-cache-mb is a runtime override of the cold-tier block-cache budget.
+	// The cold tier reads SQD_COLDCACHE_MB and honors it over the config-baked
+	// cold_cache_mb, so the flag is just a convenience setter for that env var.
+	if p.coldCacheMB != "" {
+		os.Setenv("SQD_COLDCACHE_MB", p.coldCacheMB)
 	}
 
 	if p.command == "" {
@@ -312,6 +326,8 @@ Flags:
   --no-proto            (start/dev) Use V1 legacy parsed mode instead of proto (struct-based event
                        processing with JSON decode; useful for debugging or unvalidated contracts)
   --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default; config: cold_cache: false)
+  --cold-cache-mb       (start/dev) Cold-tier block-cache budget in MiB; overrides config cold_cache_mb
+                       (0/unset = auto-size to RAM/8). Sets SQD_COLDCACHE_MB.
 
 Examples:
   sqd-go
