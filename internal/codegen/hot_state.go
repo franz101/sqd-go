@@ -31,7 +31,152 @@ package generated
 `)
 	renderHotStateImports(&b, tables, events)
 
-	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n\n")
+	b.WriteString("const DefaultClockCacheCapacity uint64 = 100000\n")
+	if len(specs) > 0 {
+		b.WriteString("const recoveryBucketCount = 8\n")
+		b.WriteString("const recoveryConcurrency = 8\n\n")
+		b.WriteString(`func recoveryFixedStringRange(column string, bucket int, size int) string {
+	if recoveryBucketCount <= 1 {
+		return "1"
+	}
+	width := 256 / recoveryBucketCount
+	lower := bucket * width
+	lowerHex := fmt.Sprintf("%02x%s", lower, strings.Repeat("00", size-1))
+	lowerExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", lowerHex, size)
+	if bucket >= recoveryBucketCount-1 {
+		return fmt.Sprintf("%s >= %s", column, lowerExpr)
+	}
+	upper := (bucket + 1) * width
+	upperHex := fmt.Sprintf("%02x%s", upper, strings.Repeat("00", size-1))
+	upperExpr := fmt.Sprintf("toFixedString(unhex('%s'), %d)", upperHex, size)
+	return fmt.Sprintf("%s >= %s AND %s < %s", column, lowerExpr, column, upperExpr)
+}
+
+func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
+	host := os.Getenv("CLICKHOUSE_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := 9000
+	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			port = p
+		}
+	}
+	user := os.Getenv("CLICKHOUSE_USER")
+	if user == "" {
+		user = "default"
+	}
+	return ch.Dial(ctx, ch.Options{
+		Address:  fmt.Sprintf("%s:%d", host, port),
+		Database: "default",
+		User:     user,
+		Password: os.Getenv("CLICKHOUSE_PASSWORD"),
+	})
+}
+
+func recoveryRecencyClause() string {
+	v := os.Getenv("SQD_RECOVERY_MIN_BLOCK")
+	if v == "" {
+		return ""
+	}
+	mb, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || mb == 0 {
+		return ""
+	}
+	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " >= " + strconv.FormatUint(mb, 10)
+}
+
+func recoverColdParallel[T any](
+	ctx context.Context,
+	primary *ch.Client,
+	nbuckets int,
+	cold *coldcache.Store,
+	run func(ctx context.Context, conn *ch.Client, bucket int, emit func(T)) error,
+	encode func(v T, put func(key, val []byte) error) error,
+) error {
+	conc := recoveryConcurrency
+	if conc > nbuckets {
+		conc = nbuckets
+	}
+	if conc < 1 {
+		conc = 1
+	}
+	conns := make([]*ch.Client, 1, conc)
+	conns[0] = primary
+	for len(conns) < conc {
+		wc, err := recoveryDialConn(ctx)
+		if err != nil {
+			break
+		}
+		conns = append(conns, wc)
+	}
+	defer func() {
+		for _, wc := range conns[1:] {
+			_ = wc.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	buckets := make(chan int)
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+	for _, conn := range conns {
+		wg.Add(1)
+		go func(conn *ch.Client) {
+			defer wg.Done()
+			batch := cold.NewWriteBatch()
+			defer func() {
+				if err := batch.Close(); err != nil {
+					fail(err)
+				}
+			}()
+			emit := func(v T) {
+				if err := encode(v, batch.Put); err != nil {
+					fail(err)
+				}
+			}
+			for bucket := range buckets {
+				if err := run(ctx, conn, bucket, emit); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}(conn)
+	}
+feed:
+	for bucket := 0; bucket < nbuckets; bucket++ {
+		select {
+		case buckets <- bucket:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(buckets)
+	wg.Wait()
+	return firstErr
+}
+
+`)
+	} else {
+		b.WriteString("\n")
+	}
 	for _, spec := range specs {
 		if !spec.table.IsEvent {
 			renderHotStateEntity(&b, spec.table)
@@ -56,18 +201,22 @@ package generated
 
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
-		`"context"`:                                            "",
-		`"fmt"`:                                                "",
-		`"strings"`:                                            "",
-		`"sync"`:                                               "",
-		`"sync/atomic"`:                                        "",
-		`"github.com/ClickHouse/ch-go"`:                        "",
-		`"github.com/ClickHouse/ch-go/proto"`:                  "",
-		`"github.com/franz101/sqd-go/coldcache"`:      "",
+		`"context"`:                              "",
+		`"fmt"`:                                  "",
+		`"strings"`:                              "",
+		`"sync"`:                                 "",
+		`"sync/atomic"`:                          "",
+		`"github.com/ClickHouse/ch-go"`:          "",
+		`"github.com/ClickHouse/ch-go/proto"`:    "",
+		`"github.com/franz101/sqd-go/coldcache"`: "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""
 		imports[`"math/big"`] = ""
+	}
+	if len(tables) > 0 {
+		imports[`"os"`] = ""
+		imports[`"strconv"`] = ""
 	}
 	if customTablesUseColdCache(tables) {
 		// Cold tier (Pebble) stores pointer-free hot values as raw bytes; the
@@ -541,7 +690,9 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("func (c *")
 	b.WriteString(spec.cacheType)
-	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\tvar (\n")
+	b.WriteString(") Recover(ctx context.Context, conn *ch.Client, db string) error {\n\trun := func(ctx context.Context, conn *ch.Client, bucket int, emit func(")
+	b.WriteString(spec.table.GoTypeName)
+	b.WriteString(")) error {\n\tvar (\n")
 	for _, field := range spec.table.Fields {
 		b.WriteString("\t\t")
 		b.WriteString(batchColumnField(field))
@@ -570,7 +721,9 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(strconv.Quote(recoverQuery(spec.table)))
 	b.WriteString(", quoteIdent(db), quoteIdent(")
 	b.WriteString(strconv.Quote(spec.table.Name))
-	b.WriteString(")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\titem := ")
+	b.WriteString("), ")
+	b.WriteString(recoverWhereExpr(spec.table))
+	b.WriteString("), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {\n\t\tfor i := 0; i < block.Rows; i++ {\n\t\t\temit(")
 	b.WriteString(spec.table.GoTypeName)
 	b.WriteString("{\n")
 	for _, field := range spec.table.Fields {
@@ -580,7 +733,15 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString(resultValueExpr(field, spec.table.IsEvent))
 		b.WriteString(",\n")
 	}
-	b.WriteString("\t\t\t}\n\t\t\tc.Set(item)\n\t\t}\n\t\treturn nil\n\t}})\n}\n\n")
+	b.WriteString("\t\t\t})\n\t\t}\n\t\treturn nil\n\t}})\n\t}\n")
+	if isPointerFreeEntity(spec.table) {
+		b.WriteString("\tif c.cold != nil {\n\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
+		b.WriteString(spec.keyType)
+		b.WriteString("(v)\n\t\t\treturn put(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)), unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)))\n\t\t})\n\t}\n")
+	}
+	b.WriteString("\tfor bucket := 0; bucket < recoveryBucketCount; bucket++ {\n\t\tif err := run(ctx, conn, bucket, c.Set); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n\n")
 }
 
 func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
@@ -654,9 +815,11 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		}
 	}
 	if len(coldSpecs) == 0 {
+		b.WriteString("func (s *HotState) ColdAuthoritative() bool { return false }\n\n")
 		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n\treturn nil\n}\n\n")
 		b.WriteString("func (s *HotState) CloseColdCache() error {\n\treturn nil\n}\n\n")
 	} else {
+		b.WriteString("func (s *HotState) ColdAuthoritative() bool {\n\treturn s != nil && s.coldAuthoritative\n}\n\n")
 		b.WriteString("func (s *HotState) EnableColdCache(dir string, authoritative bool, cacheBytes int64, memTableBytes uint64) error {\n")
 		b.WriteString("\tif s == nil {\n\t\treturn nil\n\t}\n")
 		b.WriteString("\tvar err error\n")
@@ -694,6 +857,18 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString("\tif err := s.")
 		b.WriteString(spec.baseName)
 		b.WriteString(".Recover(ctx, conn, db); err != nil {\n\t\treturn err\n\t}\n")
+	}
+	if len(coldSpecs) > 0 {
+		b.WriteString("\tif ")
+		for i, spec := range coldSpecs {
+			if i > 0 {
+				b.WriteString(" || ")
+			}
+			b.WriteString("s.")
+			b.WriteString(spec.baseName)
+			b.WriteString(".cold != nil")
+		}
+		b.WriteString(" {\n\t\ts.coldAuthoritative = true\n\t}\n")
 	}
 	b.WriteString("\treturn nil\n}\n\n")
 
@@ -764,37 +939,37 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	}
 	b.WriteString("\treturn nil\n}\n")
 
-		// Generate Restore methods for journal rollback
-		for _, spec := range specs {
-			if spec.table.IsEvent {
-				continue
-			}
-			b.WriteString("func (s *HotState) Restore")
-			b.WriteString(spec.table.GoTypeName)
-			b.WriteString("(key ")
-			b.WriteString(spec.keyType)
-			b.WriteString(", value ")
-			b.WriteString(spec.table.GoTypeName)
-			b.WriteString(", had bool) {\n")
-			b.WriteString("\ts.mu.Lock()\n")
-			b.WriteString("\tdefer s.mu.Unlock()\n")
-			b.WriteString("\tif had {\n")
-			b.WriteString("\t\ts.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".SetByKey(key, value)\n")
-			b.WriteString("\t\ts.dirty")
-			b.WriteString(spec.baseName)
-			b.WriteString("[key] = struct{}{}\n")
-			b.WriteString("\t\treturn\n")
-			b.WriteString("\t}\n")
-			b.WriteString("\ts.")
-			b.WriteString(spec.baseName)
-			b.WriteString(".Delete(key)\n")
-			b.WriteString("\tdelete(s.dirty")
-			b.WriteString(spec.baseName)
-			b.WriteString(", key)\n")
-			b.WriteString("}\n\n")
+	// Generate Restore methods for journal rollback
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
 		}
+		b.WriteString("func (s *HotState) Restore")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString("(key ")
+		b.WriteString(spec.keyType)
+		b.WriteString(", value ")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString(", had bool) {\n")
+		b.WriteString("\ts.mu.Lock()\n")
+		b.WriteString("\tdefer s.mu.Unlock()\n")
+		b.WriteString("\tif had {\n")
+		b.WriteString("\t\ts.")
+		b.WriteString(spec.baseName)
+		b.WriteString(".SetByKey(key, value)\n")
+		b.WriteString("\t\ts.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString("[key] = struct{}{}\n")
+		b.WriteString("\t\treturn\n")
+		b.WriteString("\t}\n")
+		b.WriteString("\ts.")
+		b.WriteString(spec.baseName)
+		b.WriteString(".Delete(key)\n")
+		b.WriteString("\tdelete(s.dirty")
+		b.WriteString(spec.baseName)
+		b.WriteString(", key)\n")
+		b.WriteString("}\n\n")
+	}
 }
 
 func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
@@ -1197,11 +1372,65 @@ func customInsertColumnList(table customTableSpec) string {
 }
 
 func recoverQuery(table customTableSpec) string {
+	q := func(col string) string { return "`t`." + quoteSQLIdent(col) }
 	selects := make([]string, 0, len(table.Fields))
 	for _, field := range table.Fields {
-		selects = append(selects, quoteSQLIdent(field.ColumnName))
+		selects = append(selects, q(field.ColumnName)+" AS "+quoteSQLIdent(field.ColumnName))
 	}
-	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s ORDER BY block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY " + strings.Join(quotedColumns(table.PrimaryKey), ", ")
+	orderBy := make([]string, 0, len(table.PrimaryKey)+3)
+	for _, k := range table.PrimaryKey {
+		orderBy = append(orderBy, q(k)+" DESC")
+	}
+	orderBy = append(orderBy, q("block_number")+" DESC", q("transaction_index")+" DESC", q("log_index")+" DESC")
+	limitBy := make([]string, 0, len(table.PrimaryKey))
+	for _, k := range table.PrimaryKey {
+		limitBy = append(limitBy, q(k))
+	}
+	return "SELECT " + strings.Join(selects, ", ") + " FROM %s.%s AS `t` WHERE %s ORDER BY " + strings.Join(orderBy, ", ") + " LIMIT 1 BY " + strings.Join(limitBy, ", ") + " SETTINGS optimize_read_in_order = 1"
+}
+
+func recoverWhereExpr(table customTableSpec) string {
+	base := recoverBucketWhereExpr(table)
+	for _, field := range table.Fields {
+		if field.ColumnName == "updated_at_block" {
+			return base + " + recoveryRecencyClause()"
+		}
+	}
+	return base
+}
+
+func recoverBucketWhereExpr(table customTableSpec) string {
+	if len(table.PrimaryKey) == 0 {
+		return strconv.Quote("1")
+	}
+	firstKey := table.PrimaryKey[0]
+	for _, field := range table.Fields {
+		if field.ColumnName != firstKey {
+			continue
+		}
+		if size, ok := fixedStringColumnSize(field.ColumnType); ok {
+			return fmt.Sprintf("recoveryFixedStringRange(%s, bucket, %d)", strconv.Quote("`t`."+quoteSQLIdent(firstKey)), size)
+		}
+		break
+	}
+	q := func(col string) string { return "`t`." + quoteSQLIdent(col) }
+	hashCols := make([]string, 0, len(table.PrimaryKey))
+	for _, k := range table.PrimaryKey {
+		hashCols = append(hashCols, q(k))
+	}
+	return "fmt.Sprintf(" + strconv.Quote("cityHash64("+strings.Join(hashCols, ", ")+") %% %d = %d") + ", recoveryBucketCount, bucket)"
+}
+
+func fixedStringColumnSize(chType string) (int, bool) {
+	const prefix = "FixedString("
+	if !strings.HasPrefix(chType, prefix) || !strings.HasSuffix(chType, ")") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(chType, prefix), ")"))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func quotedColumns(columns []string) []string {

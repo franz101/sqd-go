@@ -27,6 +27,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -99,7 +100,7 @@ type Store struct {
 	// optimization). When set, a Get whose key is provably absent skips Pebble
 	// entirely. nil => V2 behaviour (every miss probes Pebble). See filter.go.
 	neg        *negFilter
-	filterHits uint64 // Pebble Gets skipped because the filter proved the key absent
+	filterHits atomic.Uint64 // Pebble Gets skipped because the filter proved the key absent
 }
 
 // EnableNegativeFilter attaches a fixed-size in-memory negative-lookup Bloom
@@ -113,12 +114,26 @@ func (s *Store) EnableNegativeFilter(bitBudget uint64) {
 	s.neg = newNegFilter(bitBudget)
 }
 
+func defaultNegativeFilterBits() uint64 {
+	if v := os.Getenv("SQD_COLDFILTER_BITS"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	if v := os.Getenv("SQD_BLOOM_KEYS"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n * 10
+		}
+	}
+	return 1 << 31
+}
+
 // FilterSkips returns how many Pebble Gets the negative filter has avoided.
 func (s *Store) FilterSkips() uint64 {
 	if s == nil {
 		return 0
 	}
-	return s.filterHits
+	return s.filterHits.Load()
 }
 
 // Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
@@ -156,7 +171,12 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 		cache.Unref()
 		return nil, err
 	}
-	return &Store{db: db, cache: cache, dir: dir}, nil
+	s := &Store{db: db, cache: cache, dir: dir}
+	if bits := defaultNegativeFilterBits(); bits > 0 {
+		s.EnableNegativeFilter(bits)
+		log.Printf("cold tier: negative Bloom filter %d MiB (SQD_COLDFILTER_BITS=0 disables)", bits>>23)
+	}
+	return s, nil
 }
 
 // Put stores value under key. Pebble copies both slices synchronously, so callers
@@ -172,6 +192,91 @@ func (s *Store) Put(key, value []byte) error {
 	return s.db.Set(key, value, pebble.NoSync)
 }
 
+const writeBatchFlushCount = 16384
+
+type WriteBatch struct {
+	db    *pebble.DB
+	b     *pebble.Batch
+	neg   *negFilter
+	count int
+}
+
+func (s *Store) NewWriteBatch() *WriteBatch {
+	if s == nil || s.db == nil {
+		return &WriteBatch{}
+	}
+	return &WriteBatch{db: s.db, b: s.db.NewBatch(), neg: s.neg}
+}
+
+func (w *WriteBatch) Put(key, value []byte) error {
+	if w == nil || w.b == nil {
+		return nil
+	}
+	if err := w.b.Set(key, value, nil); err != nil {
+		return err
+	}
+	if w.neg != nil {
+		w.neg.add(key)
+	}
+	w.count++
+	if w.count >= writeBatchFlushCount {
+		return w.flush()
+	}
+	return nil
+}
+
+func (w *WriteBatch) flush() error {
+	if w == nil || w.b == nil || w.count == 0 {
+		return nil
+	}
+	if err := w.db.Apply(w.b, pebble.NoSync); err != nil {
+		return err
+	}
+	w.b.Reset()
+	w.count = 0
+	return nil
+}
+
+func (w *WriteBatch) Close() error {
+	if w == nil || w.b == nil {
+		return nil
+	}
+	err := w.flush()
+	_ = w.b.Close()
+	w.b = nil
+	return err
+}
+
+func (s *Store) MightContain(key []byte) bool {
+	if s == nil || s.neg == nil {
+		return true
+	}
+	if !s.neg.mayContain(key) {
+		s.filterHits.Add(1)
+		return false
+	}
+	return true
+}
+
+func (s *Store) GetInto(dst []byte, key []byte) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, nil
+	}
+	if !s.MightContain(key) {
+		return false, nil
+	}
+	v, closer, err := s.db.Get(key)
+	if err == pebble.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	copy(dst, v)
+	closer.Close()
+	return true, nil
+}
+
 // Get returns a COPY of the value stored under key (so it stays valid after the
 // internal pebble closer is released), and whether it was found.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
@@ -180,8 +285,7 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	}
 	// Negative filter (V3): if the key was never written to the cold store, skip
 	// the Pebble round-trip. No false negatives, so this is always correct.
-	if s.neg != nil && !s.neg.mayContain(key) {
-		s.filterHits++
+	if !s.MightContain(key) {
 		return nil, false, nil
 	}
 	v, closer, err := s.db.Get(key)
