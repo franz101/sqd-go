@@ -114,3 +114,37 @@ func TestNilStoreSafe(t *testing.T) {
 		t.Fatalf("nil Close: %v", err)
 	}
 }
+
+func TestDefaultCacheBytesClampedToBounds(t *testing.T) {
+	c := defaultCacheBytes()
+	if c < MinDefaultCacheBytes || c > MaxDefaultCacheBytes {
+		t.Fatalf("defaultCacheBytes()=%d outside [%d, %d]", c, MinDefaultCacheBytes, MaxDefaultCacheBytes)
+	}
+	// When total RAM is known, the default must be exactly RAM/8 clamped to the
+	// bounds — no other value is acceptable.
+	if total := totalRAMBytes(); total > 0 {
+		want := min(max(total/8, MinDefaultCacheBytes), MaxDefaultCacheBytes)
+		if c != want {
+			t.Fatalf("defaultCacheBytes()=%d, want clamp(RAM/8)=%d (RAM=%d)", c, want, total)
+		}
+	}
+}
+
+func TestTotalRAMBytesNonNegative(t *testing.T) {
+	// Must never report a negative figure; on Linux (this CI) it should be > 0.
+	if got := totalRAMBytes(); got < 0 {
+		t.Fatalf("totalRAMBytes()=%d, want >= 0", got)
+	}
+}
+
+func TestColdCacheMBOverride(t *testing.T) {
+	// SQD_COLDCACHE_MB must win over the RAM-aware default. We can't read the
+	// resolved cap back out of Store, but Open must succeed with the override set
+	// and the override path must not panic or misparse.
+	t.Setenv("SQD_COLDCACHE_MB", "37")
+	s, err := Open(t.TempDir()+"/cc", 0, 0)
+	if err != nil {
+		t.Fatalf("Open with SQD_COLDCACHE_MB: %v", err)
+	}
+	defer s.Close()
+}
