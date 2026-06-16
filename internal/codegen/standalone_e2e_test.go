@@ -144,10 +144,15 @@ func TestGeneratedCodeImportsNoInternalPackages(t *testing.T) {
 // custom_processor.go (no go.mod, not inside a sqd-go checkout) is turned into a
 // self-contained module that requires sqd-go, then codegen + go build are run
 // over it. This is the "double compilation" that previously died at the internal
-// import wall. Gated behind -short because it shells out to the Go toolchain.
+// import wall.
+//
+// It is opt-in (SQD_E2E_STANDALONE=1): it runs `go get` + `go mod tidy` + `go
+// build` of a clickhouse/pebble-importing module, which is far too slow for the
+// default per-package test timeout. The fast TestGeneratedCodeImportsNoInternalPackages
+// guard above runs everywhere and catches the regression this protects against.
 func TestGeneratedProjectBuildsAsStandaloneModule(t *testing.T) {
-	if testing.Short() {
-		t.Skip("standalone build shells out to the go toolchain; skipped under -short")
+	if os.Getenv("SQD_E2E_STANDALONE") == "" {
+		t.Skip("slow standalone build e2e; set SQD_E2E_STANDALONE=1 to run")
 	}
 	goBin, err := exec.LookPath("go")
 	if err != nil {

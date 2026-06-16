@@ -347,6 +347,9 @@ func TestIntegrationParallelFetchCoverageStat(t *testing.T) {
 	srv := sparseFakePortal(present, 99_999_999)
 	defer srv.Close()
 	t.Setenv("SQD_PORTAL_ENDPOINT", srv.URL)
+	// The fake-portal run finishes in a couple of seconds, well under the 10s
+	// default stats cadence; shorten it so periodic stats lines actually fire.
+	t.Setenv("SQD_STATS_INTERVAL", "200ms")
 
 	end := endBlock
 	cfg := &config.Config{
@@ -413,10 +416,13 @@ func TestIntegrationParallelFetchCoverageStat(t *testing.T) {
 		ClickHouseUser:     "default",
 		ClickHousePassword: password,
 		ClickHouseDatabase: dbName,
-		Restart:            true,
-		CursorMode:         true,
-		ParallelFetch:      true,
-		PageSize:           0,
+		// NOT Restart: ingestion.Run drops the whole database on restart, which
+		// would delete the usdc_transfer_events table created above (no
+		// GeneratedSQLDir here to recreate it). The per-run dbName is already fresh.
+		Restart:       false,
+		CursorMode:    true,
+		ParallelFetch: true,
+		PageSize:      0,
 	}
 	err = Run(runCtx, cfg, opts)
 	if err != nil && runCtx.Err() == nil {

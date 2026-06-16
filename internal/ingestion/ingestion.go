@@ -14,12 +14,12 @@ import (
 	"unicode"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/franz101/sqd-go/abiunpack"
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/monitoring"
 	"github.com/franz101/sqd-go/internal/parser"
-	"github.com/franz101/sqd-go/abiunpack"
 )
 
 // Options configures the ingestion pipeline: ClickHouse connection, page
@@ -813,7 +813,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		}
 	}()
 
-	statsTicker := time.NewTicker(statsInterval)
+	statsTicker := time.NewTicker(resolveStatsInterval())
 	defer statsTicker.Stop()
 	lastStatsTime := startTime
 	lastStatsBlocks := uint64(0)
@@ -1175,6 +1175,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			logStats("periodic")
 		}
 	}
+
+	// Emit a final stats line on clean completion so the last cursor position and
+	// full chain coverage are recorded, not just left in the profile below (periodic
+	// ticks can miss the final advance on a fast backfill).
+	logStats("final")
 
 	// Clean completion (backfill): force a durable commit of the tail (the blocks
 	// processed since the last periodic commit) and advance the checkpoint to it,
