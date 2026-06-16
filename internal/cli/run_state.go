@@ -43,21 +43,28 @@ func runStateRebuild(args []string, projectPath string) int {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return 1
 	}
+	// project.Root may be relative (as typed on the CLI); module resolution and
+	// filepath.Rel both need it absolute.
+	projRoot, err := filepath.Abs(project.Root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "--state: resolve project path: %v\n", err)
+		return 1
+	}
 
 	if _, err := exec.LookPath("go"); err != nil {
 		fmt.Fprintln(os.Stderr, "--state needs the Go toolchain on PATH to build the project into the binary; install Go or drop --state")
 		return 1
 	}
 
-	if !projectHasRootGoPackage(project.Root) {
-		fmt.Fprintf(os.Stderr, "--state: project %q has no custom processor (no .go files in %s).\n", project.Config.Name, project.Root)
+	if !projectHasRootGoPackage(projRoot) {
+		fmt.Fprintf(os.Stderr, "--state: project %q has no custom processor (no .go files in %s).\n", project.Config.Name, projRoot)
 		fmt.Fprintln(os.Stderr, "  --state runs a project's derived state + PK cold cache, which need a custom_schema.go/custom_processor.go.")
 		fmt.Fprintln(os.Stderr, "  Scaffold one with `sqd-go init template <kind> <dir>` (or add a custom_schema), then re-run with --state.")
 		fmt.Fprintln(os.Stderr, "  An events-only contract has no stateful entity to cache; run it without --state.")
 		return 1
 	}
 
-	moduleRoot, modulePath, err := moduleInfo(project.Root)
+	moduleRoot, modulePath, err := moduleInfo(projRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "--state: %v\n", err)
 		return 1
@@ -67,7 +74,7 @@ func runStateRebuild(args []string, projectPath string) int {
 		fmt.Fprintln(os.Stderr, "  Its generated custom_processor.go imports internal/cli, which only resolves in-module. Place the project inside a sqd-go checkout.")
 		return 1
 	}
-	importPath, err := projectImportPath(modulePath, moduleRoot, project.Root)
+	importPath, err := projectImportPath(modulePath, moduleRoot, projRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "--state: %v\n", err)
 		return 1

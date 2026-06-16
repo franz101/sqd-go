@@ -509,25 +509,14 @@ func (b *ProtoEventBlock) EventsIter() chan DecodedLog {
 		defer close(ch)
 
 		var (
-			ConditionalTokensConditionPreparationIdx                         int
-			ConditionalTokensConditionResolutionIdx                          int
-			ConditionalTokensPositionSplitIdx                                int
-			ConditionalTokensPositionsMergeIdx                               int
-			ConditionalTokensPayoutRedemptionIdx                             int
-			ExchangeOrderFilledIdx                                           int
-			NegRiskExchangeOrderFilledIdx                                    int
-			NegRiskAdapterMarketPreparedIdx                                  int
-			NegRiskAdapterQuestionPreparedIdx                                int
-			NegRiskAdapterPositionSplitIdx                                   int
-			NegRiskAdapterPositionsMergeIdx                                  int
-			NegRiskAdapterPositionsConvertedIdx                              int
-			NegRiskAdapterPayoutRedemptionIdx                                int
-			FixedProductMarketMakerFactoryFixedProductMarketMakerCreationIdx int
-			FixedProductMarketMakerFPMMBuyIdx                                int
-			FixedProductMarketMakerFPMMSellIdx                               int
-			FixedProductMarketMakerFPMMFundingAddedIdx                       int
-			FixedProductMarketMakerFPMMFundingRemovedIdx                     int
-		)
+`)
+	// Per-event cursors into the proto columns, generated from THIS project's
+	// events (previously hardcoded to the polymarket example, which left the idx
+	// vars undefined/unused for every other project and broke compilation).
+	for _, ev := range events {
+		fmt.Fprintf(buf, "\t\t\t%sIdx int\n", ev.GoTypeName)
+	}
+	fmt.Fprint(buf, `		)
 
 		for _, typ := range b.Sequence {
 			switch EventType(typ) {
