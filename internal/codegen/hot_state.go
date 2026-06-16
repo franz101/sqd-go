@@ -63,7 +63,7 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 		`"sync/atomic"`:                                        "",
 		`"github.com/ClickHouse/ch-go"`:                        "",
 		`"github.com/ClickHouse/ch-go/proto"`:                  "",
-		`"github.com/franz101/sqd-go/internal/coldcache"`:      "",
+		`"github.com/franz101/sqd-go/coldcache"`:      "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""

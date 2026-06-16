@@ -13,7 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
-	"github.com/franz101/sqd-go/internal/parser/abiunpack"
+	"github.com/franz101/sqd-go/abiunpack"
 	"github.com/holiman/uint256"
 )
 

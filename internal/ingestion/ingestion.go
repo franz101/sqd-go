@@ -19,7 +19,7 @@ import (
 	"github.com/franz101/sqd-go/internal/database"
 	"github.com/franz101/sqd-go/internal/monitoring"
 	"github.com/franz101/sqd-go/internal/parser"
-	"github.com/franz101/sqd-go/internal/parser/abiunpack"
+	"github.com/franz101/sqd-go/abiunpack"
 )
 
 // Options configures the ingestion pipeline: ClickHouse connection, page

@@ -269,8 +269,7 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/franz101/sqd-go/internal/database"
-	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/sqd"
 )
 
 // CustomProcessFn is the callback you register from your project package to
@@ -468,7 +467,7 @@ func NewProcessor(protoMode bool) (*Processor, error) {
 	}, nil
 }
 
-func (p *Processor) Process(ctx context.Context, store *database.Store, logs []ingestion.CustomLog) error {
+func (p *Processor) Process(ctx context.Context, store *sqd.Store, logs []sqd.CustomLog) error {
 	if p == nil || len(logs) == 0 {
 		return nil
 	}
@@ -666,7 +665,7 @@ func (p *Processor) CommittedBlock() uint64 {
 // advances the committed horizon. Called on clean completion / shutdown so the
 // tail (the < commit-cadence blocks since the last periodic commit) is persisted
 // and the checkpoint can advance to it. Returns the new committed horizon.
-func (p *Processor) Flush(ctx context.Context, store *database.Store, blockNumber uint64) (uint64, error) {
+func (p *Processor) Flush(ctx context.Context, store *sqd.Store, blockNumber uint64) (uint64, error) {
 	if p == nil || p.State == nil {
 		return 0, nil
 	}
@@ -761,7 +760,7 @@ func renderGenericPrefetchBlocksState(b *bytes.Buffer, cfg *config.Config, event
 	if state == nil || state.HotState == nil || len(blocks) == 0 {
 		return nil
 	}
-	// Safe nil check: store may be a non-nil interface wrapping a nil *database.Store.
+	// Safe nil check: store may be a non-nil interface wrapping a nil *sqd.Store.
 	// store.Conn() panics on nil receiver, so check the concrete value first.
 	if store == nil {
 		return nil

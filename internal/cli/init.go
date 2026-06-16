@@ -728,8 +728,7 @@ type UserPositionSchema struct {
 import (
 	"github.com/ethereum/go-ethereum/common"
 	generated "%s"
-	"github.com/franz101/sqd-go/internal/cli"
-	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/sqd"
 )
 
 // Custom schema explanation: you can access custom schema entities from state (e.g. state.UserPosition)
@@ -779,8 +778,8 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 func init() {
 	// link to cli
 	generated.CustomProcessFn = Process
-	cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-		return generated.NewProcessor(cli.GetProtoMode())
+	sqd.RegisterProcessor(generated.ProjectName, func() (sqd.Processor, error) {
+		return generated.NewProcessor(sqd.GetProtoMode())
 	})
 
 	// settings:
@@ -812,8 +811,7 @@ type UserPositionSchema struct {
 
 import (
 	generated "%s"
-	"github.com/franz101/sqd-go/internal/cli"
-	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/sqd"
 )
 
 // Custom schema explanation: you can access custom schema entities from state (e.g. state.UserPosition)
@@ -833,8 +831,8 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 func init() {
 	// link to cli
 	generated.CustomProcessFn = Process
-	cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-		return generated.NewProcessor(cli.GetProtoMode())
+	sqd.RegisterProcessor(generated.ProjectName, func() (sqd.Processor, error) {
+		return generated.NewProcessor(sqd.GetProtoMode())
 	})
 
 	// settings:
