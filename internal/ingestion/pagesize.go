@@ -1,5 +1,11 @@
 package ingestion
 
+import (
+	"os"
+	"strconv"
+	"time"
+)
+
 // Portal page sizing.
 //
 // The SQD portal caps each response at a "cursor size": the largest block SPAN
@@ -68,4 +74,45 @@ func clampUint64(v, lo, hi uint64) uint64 {
 		return hi
 	}
 	return v
+}
+
+// defaultTargetFetchSeconds is the wall-clock budget a single producer fetch
+// should aim to fit inside. nextPageSize alone grows the page toward the portal's
+// byte/row cap; on a dense range that cap can still be tens of thousands of blocks,
+// so one /finalized-stream request (read whole-response before any block is
+// emitted) can take many seconds, starving the consumer between bursts. Capping by
+// latency keeps each request short so progress looks continuous rather than bursty.
+const defaultTargetFetchSeconds = 6.0
+
+// clampPageForLatency shrinks `page` so a single request finishes in roughly
+// targetDur. If the just-completed fetch covered `span` blocks in `fetchDur`, the
+// page that would fetch in ~targetDur is span*targetDur/fetchDur. It ONLY ever
+// shrinks (never grows) and never below minPage. A non-positive targetDur, a fetch
+// already within target, or a zero span leaves `page` unchanged — so a fast fetch
+// (e.g. a sparse pre-deployment range) is never throttled.
+func clampPageForLatency(page, span uint64, fetchDur, targetDur time.Duration, minPage uint64) uint64 {
+	if targetDur <= 0 || fetchDur <= targetDur || span == 0 {
+		return page
+	}
+	scaled := uint64(float64(span) * targetDur.Seconds() / fetchDur.Seconds())
+	if scaled >= page {
+		return page // never grow via the latency path
+	}
+	return clampUint64(scaled, minPage, page)
+}
+
+// resolveTargetFetchDuration returns the per-fetch latency budget for the dense
+// adaptive path. SQD_TARGET_FETCH_SECONDS overrides the default; a value <= 0
+// disables the latency clamp entirely (pure byte/row-cap sizing).
+func resolveTargetFetchDuration() time.Duration {
+	secs := defaultTargetFetchSeconds
+	if v := os.Getenv("SQD_TARGET_FETCH_SECONDS"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			secs = f
+		}
+	}
+	if secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs * float64(time.Second))
 }

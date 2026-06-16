@@ -381,6 +381,15 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	var currentConsumerBlock atomic.Uint64
 	currentConsumerBlock.Store(currentBlock)
 
+	// Producer fetch instrumentation, read by logStats for honest reporting. A
+	// single dense /finalized-stream request is fetched+parsed whole before any
+	// block is emitted, so the consumer can sit idle for the length of one request;
+	// surfacing the in-flight fetch keeps a "0 blk/s" stats tick from looking like a
+	// stall. producerFetchSinceNanos is the start time of the in-flight sequential
+	// fetch (0 = none); producerFetchFrom is the block it started from.
+	var producerFetchFrom atomic.Uint64
+	var producerFetchSinceNanos atomic.Int64
+
 	type producerSignal struct {
 		forkErr *client.ForkError
 		err     error
@@ -414,6 +423,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	parallelSkipEmpties := parallelEnabled && !storeBlocks && !cfg.ShouldStoreRawLogs()
 	parallelEndpoint := chainEndpoint(chain.ID, false)
 	var parallelBound atomic.Uint64
+	// Per-fetch latency budget for the dense adaptive path (sequential cursor mode).
+	// Bounds how big a single /finalized-stream request can grow so progress stays
+	// continuous instead of arriving in multi-second bursts. 0 disables (see
+	// SQD_TARGET_FETCH_SECONDS).
+	targetFetchDur := resolveTargetFetchDuration()
 
 	var startProd func(startBlk uint64, initialParent string)
 	startProd = func(startBlk uint64, initialParent string) {
@@ -502,6 +516,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				var fromPrefetch bool
 				var prefetchedTo uint64
 				var err error
+				var lastFetchDur time.Duration
 				if prefetch != nil {
 					page, ok := prefetch.Next(pCtx)
 					if !ok {
@@ -555,8 +570,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					}
 
 					t0 := time.Now()
+					producerFetchFrom.Store(pBlock)
+					producerFetchSinceNanos.Store(t0.UnixNano())
 					response, err = fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
-					profFetchNanos.Add(int64(time.Since(t0)))
+					lastFetchDur = time.Since(t0)
+					producerFetchSinceNanos.Store(0)
+					profFetchNanos.Add(int64(lastFetchDur))
 
 					if err != nil {
 						var forkErr *client.ForkError
@@ -763,6 +782,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					if pageSize == 0 && next > batchStartBlock {
 						span := next - batchStartBlock
 						adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, span, false, minAdaptivePageSize, maxAdaptivePageSize)
+						// Bound the page by how long the request actually took: a fetch
+						// that ran past the latency budget gets a smaller next page so the
+						// consumer doesn't starve between multi-second bursts. Only shrinks,
+						// and only on the slow dense path (a fast sparse fetch is untouched).
+						adaptivePageSize = clampPageForLatency(adaptivePageSize, span, lastFetchDur, targetFetchDur, minAdaptivePageSize)
 					}
 					pBlock = next
 				} else {
@@ -794,6 +818,13 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	lastStatsTime := startTime
 	lastStatsBlocks := uint64(0)
 	lastStatsEvents := uint64(0)
+	// Chain-coverage tracking. The consumer cursor (currentConsumerBlockVal)
+	// advances on every block AND every confirmed-empty gap-skip (sparse
+	// --parallel-fetch), so its delta is the honest, mode-independent progress
+	// rate; totalBlocks counts only blocks physically present in the buffer and
+	// thus under-reports sparse mode by the empty-block ratio.
+	startConsumerBlock := currentBlock
+	lastStatsConsumer := currentBlock
 	lastCheckpoint := currentBlock
 	if lastCheckpoint > 0 {
 		lastCheckpoint--
@@ -812,14 +843,32 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		}
 		deltaBlocks := totalBlockCount - lastStatsBlocks
 		deltaEvents := totalEventCount - lastStatsEvents
-		log.Printf("Chain %d: stats %s | checkpoint: %d | next: %d | buffered: %d | +%d blocks, +%d events in %s | %.1f blk/s (avg %.1f) | total: %d blocks, %d events",
+		// Chain blocks covered this interval (and overall), including empty gaps the
+		// consumer skipped over. This is the "blk/s" an operator should compare across
+		// dense and sparse modes.
+		var coverage uint64
+		if currentConsumerBlockVal > lastStatsConsumer {
+			coverage = currentConsumerBlockVal - lastStatsConsumer
+		}
+		coverageRate := float64(coverage) / interval.Seconds()
+		avgCoverageRate := float64(currentConsumerBlockVal-startConsumerBlock) / elapsed.Seconds()
+		// A "0 covered" tick during an in-flight fetch is a long single request, not
+		// idleness — surface it so a deep dense backfill doesn't look stuck.
+		fetchNote := ""
+		if since := producerFetchSinceNanos.Load(); since != 0 {
+			if inflight := now.Sub(time.Unix(0, since)); inflight >= time.Second {
+				fetchNote = fmt.Sprintf(" | fetching from %d (%s)", producerFetchFrom.Load(), inflight.Round(time.Second))
+			}
+		}
+		log.Printf("Chain %d: stats %s | checkpoint: %d | next: %d | buffered: %d | +%d blocks, %.0f blk/s (avg %.0f) | +%d non-empty, +%d events in %s%s | total: %d blocks, %d events",
 			chain.ID, reason, lastCheckpoint, currentConsumerBlockVal, replayBuf.Len(),
-			deltaBlocks, deltaEvents, interval.Round(time.Millisecond),
-			float64(deltaBlocks)/interval.Seconds(), float64(totalBlockCount)/elapsed.Seconds(),
+			coverage, coverageRate, avgCoverageRate,
+			deltaBlocks, deltaEvents, interval.Round(time.Millisecond), fetchNote,
 			totalBlockCount, totalEventCount)
 		lastStatsTime = now
 		lastStatsBlocks = totalBlockCount
 		lastStatsEvents = totalEventCount
+		lastStatsConsumer = currentConsumerBlockVal
 		monitoring.Observe(chain.ID, totalBlockCount, totalEventCount, currentConsumerBlockVal, lastCheckpoint)
 	}
 

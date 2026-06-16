@@ -182,6 +182,19 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 		return 1
 	}
 	opts.Processor = processor
+	// A nil processor means no project package registered one in this binary — the
+	// usual cause is running a prebuilt `sqd-go` (go install …@latest) whose build
+	// tree did not include this project, so the generated package's init() →
+	// RegisterProcessor was never compiled in. Without it the run still indexes raw
+	// events, but custom state and the cold tier cannot engage (the "cold cache
+	// requested but processor does not implement ColdCacheProcessor" line downstream
+	// is this same condition). Say so up front with the fix, instead of leaving the
+	// operator to decode a cryptic capability log.
+	if processor == nil && (opts.ColdCache || hasStatefulSchema(project)) {
+		log.Printf("NOTE: no compiled processor registered for %q — custom state and the cold tier are DISABLED for this run.", project.Config.Name)
+		log.Printf("      The prebuilt binary does not contain this project's generated package. Build sqd-go from a checkout that includes %q (so its custom_processor.go init() is compiled in), then re-run, e.g.:", project.Root)
+		log.Printf("        go run . start %s        # or: go build -o sqd-go . && ./sqd-go start %s", path, path)
+	}
 	log.Printf("starting ingestion for %s (pageSize=%d)", project.Config.Name, pageSize)
 	if err := ingestion.Run(ctx, project.Config, opts); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "ingestion error: %v\n", err)
@@ -295,6 +308,23 @@ func resolveColdCache(flagOff bool, configVal *bool) bool {
 		return *configVal
 	}
 	return true
+}
+
+// hasStatefulSchema reports whether the project defines derived state — either a
+// `state:` block in config or a custom_schema.go in the project root. Such a
+// project needs its compiled processor to do anything beyond raw event indexing
+// (and to back the cold tier), so a nil processor is worth flagging loudly.
+func hasStatefulSchema(project *config.Project) bool {
+	if project == nil {
+		return false
+	}
+	if project.Config != nil && len(project.Config.State) > 0 {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(project.Root, "custom_schema.go")); err == nil {
+		return true
+	}
+	return false
 }
 
 func findComposeFile(root string) string {
