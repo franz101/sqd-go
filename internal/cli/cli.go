@@ -18,6 +18,7 @@ type parsedArgs struct {
 	restart       bool
 	noColdCache   bool
 	parallelFetch bool
+	state         bool
 	protoMode     bool
 	initSource    string
 	initABI       string
@@ -91,6 +92,8 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.noColdCache = true
 		case "--parallel-fetch":
 			p.parallelFetch = true
+		case "--state":
+			p.state = true
 		case "-p", "--pagesize":
 			i++
 			if i >= len(args) {
@@ -163,8 +166,15 @@ func Run(args []string) int {
 
 	case "start":
 		if p.project == "" {
-			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
+			fmt.Fprintln(os.Stderr, "usage: sqd-go start <project-dir|config.yaml|config.yml> [--restart] [--state] [--start-block <n>] [--end-block <n>] [--blockchain <id|name>]")
 			return 2
+		}
+		// --state regenerates the project and re-execs a binary that has the
+		// project's processor compiled in, so custom state + the PK cold cache
+		// actually run. The re-execed child carries SQD_STATE_CHILD and falls
+		// through to the normal pipeline below.
+		if p.state && os.Getenv(stateChildEnv) == "" {
+			return runStateRebuild(args, p.project)
 		}
 		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch)
 
@@ -315,6 +325,10 @@ Flags:
   --no-proto            (start/dev) Use V1 legacy parsed mode instead of proto (struct-based event
                        processing with JSON decode; useful for debugging or unvalidated contracts)
   --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default)
+  --state               (start) Regenerate the project and re-exec a binary with the project's
+                       processor compiled in, so custom state + the PK-keyed cold tier actually run
+                       in one command (no manual rebuild). Needs the Go toolchain; the project must
+                       live inside the sqd-go module and have a custom_schema.go/custom_processor.go.
   --parallel-fetch      (start/dev) Fetch the finalized backfill range with concurrent range workers,
                        paced by a shared rate limiter (the portal caps ~5 req/s). Skips empty blocks
                        (includeAllBlocks=false) unless the project stores raw blocks/logs. Tune via
@@ -328,6 +342,7 @@ Examples:
   sqd-go start examples/uniswap
   sqd-go start examples/uniswap --blockchain polygon --start-block 80000000 --restart
   sqd-go start examples/uniswap --end-block 20000835 --parallel-fetch --restart
+  sqd-go start examples/uniswap --state --restart   # run custom state + PK cold cache in one command
   sqd-go start examples/uniswap --restart
   sqd-go dev examples/uniswap --restart
   sqd-go stop

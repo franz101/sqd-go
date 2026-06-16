@@ -8,6 +8,8 @@ require (
 	github.com/ethereum/go-ethereum v1.17.3
 	github.com/holiman/uint256 v1.3.2
 	github.com/klauspost/compress v1.18.6
+	github.com/mailru/easyjson v0.7.7
+	github.com/shopspring/decimal v1.4.0
 	github.com/valyala/fastjson v1.6.10
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -34,6 +36,7 @@ require (
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-version v1.8.0 // indirect
+	github.com/josharian/intern v1.0.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect

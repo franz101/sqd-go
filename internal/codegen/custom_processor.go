@@ -266,7 +266,6 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"fmt"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
