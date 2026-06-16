@@ -38,15 +38,20 @@ type Options struct {
 	CursorMode         bool
 	ForkMode           config.ForkMode
 	CustomProcessor    CustomProcessor
-	StateRestorer      func(blockNumber uint64) error // called before fork replay to roll back processor state
+	StateRestorer      func(blockNumber uint64) error                      // called before fork replay to roll back processor state
 	StateLoader        func(ctx context.Context, blockNumber uint64) error // called on startup to load processor state from database
-	Processor          Processor                      // unified processor interface (overrides individual callbacks if set)
+	Processor          Processor                                           // unified processor interface (overrides individual callbacks if set)
 	// ColdCache enables a Pebble-backed cold tier under the hot caches (finalized
 	// backfill only). It removes the per-miss ClickHouse point-SELECT: an evicted
 	// entry is served from local disk, and on a from-genesis run a hot+cold miss is
 	// provably new so ClickHouse is skipped entirely. Default off.
 	ColdCache    bool
 	ColdCacheDir string // base directory for cold-tier files (default os.TempDir()/sqd-coldcache)
+
+	// ParallelFetch fetches the finalized backfill range with concurrent range
+	// workers (cursor mode only). The immutable finalized region is fetched out
+	// of order and re-serialized for the in-order consumer; see parallel_fetch.go.
+	ParallelFetch bool
 }
 
 const (
@@ -58,6 +63,13 @@ const (
 	targetBlocksPerSec  = 20000
 	minAdaptivePageSize = 5000
 	maxAdaptivePageSize = 100000
+
+	// Cursor-mode producers fetch through /finalized-stream while at least
+	// this many blocks below the finalized head, switching to the paced live
+	// /stream endpoint only for the final approach. Anything at or below the
+	// finalized head is immutable, so the margin just prevents endpoint
+	// flapping near the boundary.
+	finalizedCatchupMargin = 512
 )
 
 // CustomLog is a decoded EVM log passed to legacy CustomProcessor callbacks.
@@ -160,7 +172,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -168,7 +180,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -266,6 +278,17 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 	sqd := client.New(chainEndpoint(chain.ID, cursorMode))
 	defer sqd.Close()
+	// The hot /stream endpoint paces its responses for real-time consumption —
+	// fine at the head, but a deep catch-up read through it trickles in at
+	// ~200 KB/s (multi-minute fetches, ~26 blk/s). Blocks at or below the
+	// finalized head are immutable, so cursor mode fetches them from the
+	// un-paced /finalized-stream endpoint and only switches to /stream once
+	// the producer is within finalizedCatchupMargin of the finalized head.
+	var sqdFinalized *client.Client
+	if cursorMode {
+		sqdFinalized = client.New(chainEndpoint(chain.ID, false))
+		defer sqdFinalized.Close()
+	}
 	jsonl := parser.NewFastJSONLParser(1024)
 	replayBuf := NewReplayBuffer(8192) // ~8K blocks of replay capacity
 	// No-data-loss (Invariant 0): if the processor reports a durable commit
@@ -362,16 +385,35 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		forkErr *client.ForkError
 		err     error
 	}
-	type producerAdvance struct {
-		nextBlock  uint64
-		parentHash string
-	}
 	errChan := make(chan producerSignal, 1)
 	finalizedChan := make(chan *client.BlockRef, 100)
 
 	var prodCancel context.CancelFunc
 	var producerDone bool
-	var producerAdvanceChan chan producerAdvance
+
+	// Parallel fetch concurrently pulls the finalized backfill range with N range
+	// workers, paced by a shared rate limiter (the portal caps ~5 req/s). It only
+	// engages in cursor mode, and only for blocks at/below the finalized head:
+	// those are immutable, so workers fetch disjoint pages out of order without
+	// parent-hash fork detection and a reorder buffer re-serializes them. The
+	// producer self-advances across the parallel region just as it does the
+	// sequential one. parallelBound is the highest block the prefetcher produces;
+	// the consumer uses it to gate the empty-gap skip below.
+	//
+	// parallelSkipEmpties fetches with includeAllBlocks=false (sparse: matching
+	// blocks + the portal's marker), which transfers far less data but leaves
+	// block-number gaps. The consumer skips those gaps (see CeilBlock below). It is
+	// only safe when the project does not need every block — i.e. it stores neither
+	// the raw blocks table nor the raw logs table; otherwise we fetch every block.
+	parallelEnabled := parallelFetch && cursorMode
+	if parallelFetch && !cursorMode {
+		log.Printf("Chain %d: --parallel-fetch requires cursor mode; using sequential fetch", chain.ID)
+	}
+	parallelWorkers, parallelPageSize, parallelRPS := ParallelFetchSettings()
+	parallelLimiter := newRateLimiter(parallelRPS, defaultParallelBurst)
+	parallelSkipEmpties := parallelEnabled && !storeBlocks && !cfg.ShouldStoreRawLogs()
+	parallelEndpoint := chainEndpoint(chain.ID, false)
+	var parallelBound atomic.Uint64
 
 	var startProd func(startBlk uint64, initialParent string)
 	startProd = func(startBlk uint64, initialParent string) {
@@ -379,15 +421,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			prodCancel()
 		}
 		producerDone = false
-		advanceChan := make(chan producerAdvance, 1)
-		producerAdvanceChan = advanceChan
 		var prodCtx context.Context
 		prodCtx, prodCancel = context.WithCancel(ctx)
 
-		go func(pCtx context.Context, pBlock uint64, pHash string, advance <-chan producerAdvance) {
+		go func(pCtx context.Context, pBlock uint64, pHash string) {
 			var lastFinalized uint64
 			// Adaptive page sizing: when pageSize=0, use this instead of nil
 			var adaptivePageSize uint64 = minAdaptivePageSize
+			onCatchupEndpoint := false
+			// Parallel-fetch state (this producer instance only). prefetch is lazily
+			// started once the finalized head is known and the remaining region is
+			// large enough; parallelDone latches once it has run (or was declined) so
+			// the producer never re-engages it near the head.
+			var prefetch *parallelPrefetcher
+			var parallelDone bool
 			sentSignal := false
 			sendSignal := func(sig producerSignal) {
 				sentSignal = true
@@ -428,34 +475,109 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					continue
 				}
 
-				toBlockPtr, rangeLabel, ok := nextProducerRequestRange(pBlock, pageSize, adaptivePageSize, lastFinalized, effectiveEndBlock, cursorMode)
-				if !ok {
-					return
+				// Lazily engage parallel fetch once the finalized head is known and
+				// the remaining finalized region is large enough to amortize the
+				// coordination. parallelBound is published before any parallel page is
+				// produced, so the consumer's gap-skip gate is stable.
+				if parallelEnabled && prefetch == nil && !parallelDone {
+					bound, ok := parallelFinalizedBound(cursorMode, pBlock, lastFinalized, effectiveEndBlock)
+					switch {
+					case ok && bound >= pBlock+parallelMinSpan(parallelPageSize, parallelWorkers):
+						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, parallelPageSize, parallelWorkers, parallelLimiter)
+						parallelBound.Store(bound)
+						prefetch.launch(pCtx)
+						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, page %d, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, prefetch.pageSize, parallelRPS, parallelSkipEmpties)
+					case cursorMode && lastFinalized == 0:
+						// Finalized head not learned yet — the first sequential fetch
+						// will populate it. Retry on the next iteration; don't latch.
+					default:
+						// Region too small, or unbounded/non-engageable: a permanent
+						// decision, so stop checking and stay sequential.
+						parallelDone = true
+					}
 				}
 
-				t0 := time.Now()
-				response, err := sqd.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
-				profFetchNanos.Add(int64(time.Since(t0)))
+				var response client.Response
+				var rangeLabel string
+				var fromPrefetch bool
+				var prefetchedTo uint64
+				var err error
+				if prefetch != nil {
+					page, ok := prefetch.Next(pCtx)
+					if !ok {
+						// Region fully emitted (or cancelled/stalled): resume sequential
+						// from the current cursor, which the last consumed page advanced.
+						prefetch = nil
+						parallelDone = true
+						if pCtx.Err() != nil {
+							return
+						}
+						log.Printf("Chain %d: parallel fetch finished; resuming sequential fetch at block %d", chain.ID, pBlock)
+						continue
+					}
+					if page.err != nil {
+						if pCtx.Err() != nil {
+							return
+						}
+						log.Printf("Chain %d: parallel fetch error at [%d-%d]: %v; resuming sequential fetch", chain.ID, page.from, page.to, page.err)
+						prefetch = nil
+						parallelDone = true
+						pBlock = page.from
+						pHash = ""
+						continue
+					}
+					pBlock = page.from
+					pHash = "" // finalized region: no parent-hash chaining
+					response = client.Response{Raw: page.raw, Head: page.head}
+					rangeLabel = fmt.Sprintf("[%d-%d]", page.from, page.to)
+					prefetchedTo = page.to
+					fromPrefetch = true
+				} else {
+					toBlockPtr, label, ok := nextProducerRequestRange(pBlock, pageSize, adaptivePageSize, lastFinalized, effectiveEndBlock, cursorMode)
+					if !ok {
+						return
+					}
+					rangeLabel = label
 
-				if err != nil {
-					var forkErr *client.ForkError
-					if cursorMode && errors.As(err, &forkErr) {
-						sendSignal(producerSignal{forkErr: forkErr})
-						return
+					// Catch-up fetches go through /finalized-stream; the request shape
+					// (parentBlockHash, includeAllBlocks) stays identical, so fork
+					// detection and the dense replay buffer are unaffected.
+					fetchClient := sqd
+					if sqdFinalized != nil && lastFinalized > 0 && pBlock+finalizedCatchupMargin <= lastFinalized {
+						fetchClient = sqdFinalized
+						if !onCatchupEndpoint {
+							onCatchupEndpoint = true
+							log.Printf("Chain %d: catch-up fetch via finalized-stream (block %d, finalized head %d)", chain.ID, pBlock, lastFinalized)
+						}
+					} else if onCatchupEndpoint {
+						onCatchupEndpoint = false
+						log.Printf("Chain %d: within %d of finalized head %d — fetching via live stream", chain.ID, finalizedCatchupMargin, lastFinalized)
 					}
-					log.Printf("Chain %d: fetch %s error: %v, retrying...", chain.ID, rangeLabel, err)
-					// Adaptive paging back-off: a too-large range can reject/time out, so
-					// halve the page before retrying (binary-search down). Only affects the
-					// request ceiling — pBlock is unchanged, so no block is skipped.
-					if pageSize == 0 {
-						adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, 0, true, minAdaptivePageSize, maxAdaptivePageSize)
+
+					t0 := time.Now()
+					response, err = fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
+					profFetchNanos.Add(int64(time.Since(t0)))
+
+					if err != nil {
+						var forkErr *client.ForkError
+						if cursorMode && errors.As(err, &forkErr) {
+							sendSignal(producerSignal{forkErr: forkErr})
+							return
+						}
+						log.Printf("Chain %d: fetch %s error: %v, retrying...", chain.ID, rangeLabel, err)
+						// Adaptive paging back-off: a too-large range can reject/time out, so
+						// halve the page before retrying (binary-search down). Only affects the
+						// request ceiling — pBlock is unchanged, so no block is skipped.
+						if pageSize == 0 {
+							adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, 0, true, minAdaptivePageSize, maxAdaptivePageSize)
+						}
+						select {
+						case <-pCtx.Done():
+							return
+						case <-time.After(5 * time.Second):
+						}
+						continue
 					}
-					select {
-					case <-pCtx.Done():
-						return
-					case <-time.After(5 * time.Second):
-					}
-					continue
 				}
 
 				if response.Head.Finalized != nil && response.Head.Finalized.Number > lastFinalized {
@@ -464,6 +586,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 				raw := response.Raw
 				if len(raw) == 0 {
+					if fromPrefetch {
+						// Empty page (region ran past available data): self-advance;
+						// the next Next() drains and finishes the prefetcher.
+						pBlock = prefetchedTo + 1
+						continue
+					}
 					if cursorMode {
 						if !shouldWaitForEmptyCursorResponse(effectiveEndBlock) {
 							return
@@ -607,31 +735,42 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				profDecodeNanos.Add(int64(decodeDur))
 				profIters.Add(1)
 
+				if fromPrefetch {
+					// Parallel mode advances to the grid-page boundary (the prefetcher
+					// controls paging, so skip the sequential adaptive-page feedback). The
+					// last decoded block may be below prefetchedTo on a sparse tail; the
+					// page boundary is authoritative. pHash was tracked by the parse loop
+					// above for the eventual sequential handoff.
+					pBlock = prefetchedTo + 1
+					continue
+				}
 				if len(decodedBlocks) > 0 {
-					select {
-					case next := <-advance:
-						// Adaptive paging: next.nextBlock - batchStartBlock is the block
-						// span this request actually covered (including gap-skipped empty
-						// blocks). Feed it back so the page grows toward the portal's
-						// cursor cap on a sparse range (far fewer round-trips across the
-						// empty pre-deployment prefix) and tracks it on a dense one. Only
-						// the request ceiling moves; pBlock is authoritative, so no block
-						// is ever skipped.
-						if pageSize == 0 && next.nextBlock > batchStartBlock {
-							span := next.nextBlock - batchStartBlock
-							adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, span, false, minAdaptivePageSize, maxAdaptivePageSize)
-						}
-						pBlock = next.nextBlock
-						pHash = next.parentHash
-					case <-pCtx.Done():
-						return
+					// Self-advance: the producer just wrote every block of this page to
+					// the replay buffer and tracked the last block's hash in pHash, so
+					// it can fetch the next page immediately instead of blocking on a
+					// per-page handshake with the consumer. Goroutine sampling on the v2
+					// line showed that handshake left the producer idle ~50% of wall
+					// time (fetch and consume fully serialized at page boundaries). The
+					// per-block replay-buffer backpressure above already bounds how far
+					// ahead the producer can run, so it can never lap the consumer.
+					next := decodedBlocks[len(decodedBlocks)-1].number + 1
+					// Adaptive paging: next - batchStartBlock is the block span this
+					// request actually covered. Feed it back so the page grows toward the
+					// portal's cursor cap on a sparse range (far fewer round-trips across
+					// the empty pre-deployment prefix) and tracks it on a dense one. Only
+					// the request ceiling moves; pBlock is authoritative, so no block is
+					// ever skipped.
+					if pageSize == 0 && next > batchStartBlock {
+						span := next - batchStartBlock
+						adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, span, false, minAdaptivePageSize, maxAdaptivePageSize)
 					}
+					pBlock = next
 				} else {
 					// No blocks decoded, advance by 1 to retry
 					pBlock++
 				}
 			}
-		}(prodCtx, startBlk, initialParent, advanceChan)
+		}(prodCtx, startBlk, initialParent)
 	}
 
 	// Start the initial producer
@@ -700,18 +839,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		batchRawJSONL = batchRawJSONL[:0]
 		pendingBatchBlocks = 0
 	}
-	sendProducerAdvance := func(nextBlock uint64, parentHash string) error {
-		if producerAdvanceChan == nil {
-			return nil
-		}
-		select {
-		case producerAdvanceChan <- producerAdvance{nextBlock: nextBlock, parentHash: parentHash}:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
 	for {
 		if entry, ok := replayBuf.GetBlock(currentConsumerBlockVal); ok {
 			// Accumulate data for batch insertion
@@ -786,9 +913,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 				profInsertNanos.Add(int64(time.Since(insertStart)))
 
-				if err := sendProducerAdvance(entry.number+1, entry.hash); err != nil {
-					return err
-				}
+				// The producer self-advances (it tracked the last block's hash and
+				// kept fetching), so there is no per-page advance handshake to send
+				// here — the consumer just proceeds to the custom processor.
 
 				// 4. Custom Processor
 				if useParseDecodeV2 && len(batchRawJSONL) > 0 {
@@ -875,6 +1002,23 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			continue
 		}
 
+		// Sparse parallel backfill (includeAllBlocks=false) leaves block-number
+		// gaps: blocks with no matching logs are absent. When the missing block is
+		// within the parallel region and at or below the scanned high-water mark
+		// (latestBlock — the portal returns a marker block at the end of every
+		// scanned response), the gap is confirmed-empty and was never fetched, so
+		// jump to the next present block instead of waiting forever for it.
+		if parallelSkipEmpties {
+			c := currentConsumerBlockVal
+			if pb := parallelBound.Load(); pb != 0 && c <= pb && c <= replayBuf.LatestBlock() {
+				if next, ok := replayBuf.CeilBlock(c); ok {
+					currentConsumerBlockVal = next
+					currentConsumerBlock.Store(currentConsumerBlockVal)
+					continue
+				}
+			}
+		}
+
 		if producerDone {
 			// Checked the buffer, it's empty, and the producer has completed cleanly
 			break
@@ -939,7 +1083,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						}
 					}
 				}
-
 
 				replayBuf.PruneAfter(safe.Number)
 				if pendingBatchBlocks > 0 {
