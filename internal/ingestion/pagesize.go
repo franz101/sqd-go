@@ -116,3 +116,16 @@ func resolveTargetFetchDuration() time.Duration {
 	}
 	return time.Duration(secs * float64(time.Second))
 }
+
+// resolveStatsInterval returns the periodic-stats cadence used by the consumer's
+// stats ticker. SQD_STATS_INTERVAL (a Go duration such as "200ms") overrides the
+// default — handy for verbose operation and for tests whose runs are far shorter
+// than the 10s default. Unparseable values or anything below 50ms are ignored.
+func resolveStatsInterval() time.Duration {
+	if v := os.Getenv("SQD_STATS_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 50*time.Millisecond {
+			return d
+		}
+	}
+	return statsInterval
+}

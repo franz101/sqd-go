@@ -287,6 +287,9 @@ func TestIntegrationDenseSlowFetchStaysBounded(t *testing.T) {
 	// Point the producer at the fake portal and turn the per-fetch budget down so
 	// the clamp shrinks the dense page hard.
 	t.Setenv("SQD_PORTAL_ENDPOINT", srv.URL)
+	// The fake-portal run finishes in a few seconds, under the 10s default stats
+	// cadence; shorten it so periodic stats lines (the "next:" cursor) actually fire.
+	t.Setenv("SQD_STATS_INTERVAL", "200ms")
 	t.Setenv("SQD_TARGET_FETCH_SECONDS", "0.5")
 
 	// Capture the stats log so we can look for the "fetching from" note and count
@@ -359,10 +362,13 @@ func TestIntegrationDenseSlowFetchStaysBounded(t *testing.T) {
 		ClickHouseUser:     "default",
 		ClickHousePassword: password,
 		ClickHouseDatabase: dbName,
-		Restart:            true,
-		CursorMode:         true,
-		PageSize:           0, // adaptive page sizing -> exercises the clamp
-		StartBlock:         0,
+		// NOT Restart: ingestion.Run drops the whole database on restart, which
+		// would delete the usdc_transfer_events table created above (no
+		// GeneratedSQLDir here to recreate it). The per-run dbName is already fresh.
+		Restart:    false,
+		CursorMode: true,
+		PageSize:   0, // adaptive page sizing -> exercises the clamp
+		StartBlock: 0,
 	}
 
 	err = Run(ctx, cfg, opts)
