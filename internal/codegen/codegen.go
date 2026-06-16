@@ -229,27 +229,50 @@ func GenerateProject(project *config.Project) (string, error) {
 		return "", err
 	}
 
-	// Generate events_easyjson.go using easyjson CLI (runs after all other generated files are written so package compiles)
-	easyjsonCmd := exec.Command("easyjson", "-all", "events.go")
-	easyjsonCmd.Dir = goOutDir
-	var easyjsonStderr bytes.Buffer
-	easyjsonCmd.Stderr = &easyjsonStderr
-	if err := easyjsonCmd.Run(); err != nil {
-		// Fallback to /home/dev/go/bin/easyjson
-		fallbackCmd := exec.Command("/home/dev/go/bin/easyjson", "-all", "events.go")
-		fallbackCmd.Dir = goOutDir
-		fallbackCmd.Stderr = &easyjsonStderr
-		if err2 := fallbackCmd.Run(); err2 != nil {
-			if _, statErr := os.Stat(filepath.Join(project.Root, "go.mod")); os.IsNotExist(statErr) {
-				// Log warning instead of returning error if go.mod is missing (e.g. in tests)
-				fmt.Printf("WARNING: easyjson failed in non-module directory: %v (stderr: %s)\n", err2, easyjsonStderr.String())
-			} else {
-				return "", fmt.Errorf("easyjson failed: %w (stderr: %s)", err2, easyjsonStderr.String())
-			}
+	// Generate events_easyjson.go (after the other files, so the package compiles).
+	if err := runEasyjson(goOutDir); err != nil {
+		if _, statErr := os.Stat(filepath.Join(project.Root, "go.mod")); os.IsNotExist(statErr) {
+			// Some unit tests generate into a bare temp dir and never build the
+			// output; easyjson cannot resolve the package without a module, so warn
+			// and continue rather than failing those tests.
+			fmt.Printf("WARNING: easyjson skipped (no module context for %s): %v\n", goOutDir, err)
+		} else {
+			return "", fmt.Errorf("easyjson failed: %w", err)
 		}
 	}
 
 	return outPath, nil
+}
+
+// easyjsonModuleVersion pins the easyjson CLI used by the `go run` fallback to the
+// version declared in go.mod, so generated marshalers match the runtime package.
+const easyjsonModuleVersion = "v0.7.7"
+
+// runEasyjson regenerates events_easyjson.go in dir. It prefers an installed
+// `easyjson` binary (fast path for dev machines) and otherwise runs the pinned
+// CLI via `go run`, which needs no separate install — important for CI and for
+// `--state` standalone builds in a clean environment (a notebook).
+func runEasyjson(dir string) error {
+	if path, err := exec.LookPath("easyjson"); err == nil {
+		if runErr := runCmdIn(dir, path, "-all", "events.go"); runErr == nil {
+			return nil
+		}
+		// An installed binary that failed (e.g. version skew) falls through to
+		// the module-pinned `go run` below.
+	}
+	return runCmdIn(dir, "go", "run", "github.com/mailru/easyjson/easyjson@"+easyjsonModuleVersion, "-all", "events.go")
+}
+
+// runCmdIn runs name with args in dir, surfacing stderr on failure.
+func runCmdIn(dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s: %w (stderr: %s)", name, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 func buildHotStateTables(customTables []customTableSpec, cfg *config.Config, events []eventSpec) []customTableSpec {
