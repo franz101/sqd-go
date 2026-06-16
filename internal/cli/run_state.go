@@ -6,8 +6,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/franz101/sqd-go/internal/codegen"
 	"github.com/franz101/sqd-go/internal/config"
@@ -128,7 +130,21 @@ func runStateRebuild(args []string, projectPath string) int {
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	child.Env = append(os.Environ(), stateChildEnv+"=1")
-	if err := child.Run(); err != nil {
+	if err := child.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "--state: start run failed: %v\n", err)
+		return 1
+	}
+	// Forward termination signals to the child so Ctrl-C / SIGTERM (and `timeout`)
+	// stop the indexer cleanly instead of orphaning it past this process's exit.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		for s := range sigCh {
+			_ = child.Process.Signal(s)
+		}
+	}()
+	if err := child.Wait(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return ee.ExitCode()
