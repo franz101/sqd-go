@@ -143,11 +143,11 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	}
 	defer conn.Close()
 
-	// A reorg-time reload rebuilds hot state from rolled-back ClickHouse. Any cold
-	// tier attached now holds entries for blocks > the rollback point, which would
-	// be stale; detach it so post-reload misses fall back to ClickHouse (correct).
-	// At startup this is a no-op (cold is enabled after this call).
-	_ = s.HotState.CloseColdCache()
+	// Keep any attached cold tier: resume recovery opens it before this call so
+	// Recover can rebuild Pebble directly from ClickHouse instead of churning every
+	// row through the bounded hot ring. Rollback callers must close/reopen cold
+	// before invoking LoadFromClickHouse if the existing tier may contain stale
+	// post-rollback entries.
 	if err := s.HotState.Recover(ctx, conn, db); err != nil {
 		return fmt.Errorf("load state: recover hot state at block %d: %w", blockNumber, err)
 	}

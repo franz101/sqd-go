@@ -105,7 +105,11 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 		end, err := strconv.ParseUint(endBlockStr, 10, 64)
 		if err == nil {
 			for i := range cfg.Chains {
-				cfg.Chains[i].EndBlock = &end
+				if end == 0 {
+					cfg.Chains[i].EndBlock = nil
+				} else {
+					cfg.Chains[i].EndBlock = &end
+				}
 			}
 		}
 	}

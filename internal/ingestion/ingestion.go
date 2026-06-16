@@ -200,6 +200,23 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		currentBlock = flagStartBlock
 	}
 	state := NewForkTracker(forkMode)
+	if coldCache {
+		if cc, ok := proc.(ColdCacheProcessor); ok {
+			_, hasAny, err := store.LastBlock(ctx, chain.ID)
+			if err != nil {
+				return fmt.Errorf("cold cache: probe last block: %w", err)
+			}
+			authoritative := !hasAny
+			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
+			if err := cc.EnableColdCache(dir, authoritative); err != nil {
+				return fmt.Errorf("enable cold cache: %w", err)
+			}
+			defer func() { _ = cc.CloseColdCache() }()
+			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
+		} else {
+			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
+		}
+	}
 	if cursorMode {
 		if restart {
 			log.Printf("Chain %d: restart mode; starting from configured block %d", chain.ID, currentBlock)
@@ -308,31 +325,6 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	if sc, ok := proc.(SnapshotController); ok {
 		snapshotController = sc
 		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
-	}
-	// Cold tier (Pebble): an evicted hot entry is served from local disk instead of
-	// a ClickHouse point-SELECT. Authoritative iff ClickHouse holds no rows for this
-	// chain at start (fresh / --restart): a hot+cold miss is then provably new and
-	// the per-miss SELECT is skipped entirely. On resume-with-data it stays
-	// non-authoritative — still serving re-referenced evictions from disk, but never
-	// skipping a needed lookup. Reorg-safe: any state recovery (RestoreToBlock /
-	// LoadFromDatabase) detaches the cold tier, so post-reorg reads fall back to the
-	// rolled-back ClickHouse.
-	if coldCache {
-		if cc, ok := proc.(ColdCacheProcessor); ok {
-			_, hasAny, err := store.LastBlock(ctx, chain.ID)
-			if err != nil {
-				return fmt.Errorf("cold cache: probe last block: %w", err)
-			}
-			authoritative := !hasAny
-			dir := filepath.Join(coldDir, fmt.Sprintf("chain-%d", chain.ID))
-			if err := cc.EnableColdCache(dir, authoritative); err != nil {
-				return fmt.Errorf("enable cold cache: %w", err)
-			}
-			defer func() { _ = cc.CloseColdCache() }()
-			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
-		} else {
-			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
-		}
 	}
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
 	useParseDecodeV2 := os.Getenv("SQD_PARSE_DECODE_V2") != "" && fastJSONLOK
@@ -1103,6 +1095,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				restoredBlock, err := proc.RestoreToBlock(safe.Number)
 				if err != nil {
 					log.Printf("[LOAD STATE] Processor state restore to block %d failed: %v. Attempting fallback state load from ClickHouse database...", safe.Number, err)
+					if cc, ok := proc.(ColdCacheProcessor); ok {
+						_ = cc.CloseColdCache()
+					}
 					if err := proc.LoadFromDatabase(ctx, safe.Number); err != nil {
 						return fmt.Errorf("restore processor state after fork at %d: %w", safe.Number, err)
 					}
@@ -1115,6 +1110,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						entry, ok := replayBuf.GetBlock(bNum)
 						if !ok {
 							log.Printf("[ROLLBACK] Replay buffer cache miss for block %d during catch up. Attempting fallback state load from ClickHouse database...", bNum)
+							if cc, ok := proc.(ColdCacheProcessor); ok {
+								_ = cc.CloseColdCache()
+							}
 							if err := proc.LoadFromDatabase(ctx, safe.Number); err != nil {
 								return fmt.Errorf("restore processor state after fork at %d: %w", safe.Number, err)
 							}
