@@ -22,7 +22,7 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/mailru/easyjson/jlexer"
-	"github.com/franz101/sqd-go/internal/parser/abiunpack"
+	"github.com/franz101/sqd-go/abiunpack"
 )
 
 type InsertBatches struct {

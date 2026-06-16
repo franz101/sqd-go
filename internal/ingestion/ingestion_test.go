@@ -14,7 +14,7 @@ import (
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/parser"
-	"github.com/franz101/sqd-go/internal/parser/abiunpack"
+	"github.com/franz101/sqd-go/abiunpack"
 )
 
 func TestNextRequestRangeCursorCapsToLocalEnd(t *testing.T) {

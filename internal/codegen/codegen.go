@@ -746,7 +746,7 @@ func generateGoCode(cfg *config.Config, events []eventSpec) ([]byte, error) {
 	if len(events) > 0 {
 		imports = append(imports, `"fmt"`)
 		imports = append(imports, `"github.com/ethereum/go-ethereum/common"`)
-		imports = append(imports, `"github.com/franz101/sqd-go/internal/parser/abiunpack"`)
+		imports = append(imports, `"github.com/franz101/sqd-go/abiunpack"`)
 	}
 	if hasUint256Type(events) {
 		imports = append(imports, `"github.com/holiman/uint256"`)

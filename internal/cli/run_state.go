@@ -3,11 +3,14 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -19,26 +22,34 @@ import (
 // directly instead of rebuilding again (preventing an infinite regen loop).
 const stateChildEnv = "SQD_STATE_CHILD"
 
+// sqdModulePath is the module the in-module project packages (and the public sqd
+// facade they import) belong to.
+const sqdModulePath = "github.com/franz101/sqd-go"
+
+// sqdGoDirective is the language version the scaffolded standalone go.mod
+// declares; it matches the sqd-go module's own go directive.
+const sqdGoDirective = "1.25"
+
 // runStateRebuild implements `sqd-go start --state <project>`.
 //
 // The prebuilt `sqd-go` binary (go install …@latest) contains no project
 // package, so its processor registry is empty: a custom_schema/state project's
 // derived state and its PK-keyed cold tier never engage (processorForProject
-// returns nil → a no-op ProcessorFunc). The historical workaround was to
-// regenerate the project AND rebuild the binary by hand — the "generate twice".
+// returns nil → a no-op ProcessorFunc). --state collapses the historical
+// "generate twice" workaround into one command: it regenerates the project's Go
+// package, writes a tiny runner main that blank-imports it (so its init() →
+// sqd.RegisterProcessor is compiled in), builds that runner, and execs it as a
+// normal `start` run.
 //
-// --state collapses that into one command: it (1) regenerates the project's Go
-// package (the codegen Processor with EnableColdCache keyed on each entity PK),
-// (2) writes a tiny runner `main` that blank-imports the project package so its
-// init() → cli.RegisterProcessor is compiled in, (3) `go build`s that runner, and
-// (4) execs it as a normal `start` run. The child's processorForProject now finds
-// the registered processor, so custom state and the cold cache work.
-//
-// Pre-req: the project lives inside the sqd-go module (its scaffolded
-// custom_processor.go imports internal/cli, which only resolves in-module) and
-// has a Go package at its root (a custom_schema.go / custom_processor.go). An
-// events-only contract-import project has neither a stateful entity nor a root
-// package, so --state reports that and exits.
+// Two layouts are supported:
+//   - in-module: the project lives inside a sqd-go checkout. The runner is built
+//     as an in-module package.
+//   - standalone: a clean env (e.g. a notebook holding only custom_schema.go +
+//     custom_processor.go, no go.mod). --state scaffolds a self-contained module
+//     that requires sqd-go and builds the project against the public sqd /
+//     abiunpack / coldcache packages. This is why generated code must not import
+//     the module's internal/ packages — Go forbids importing another module's
+//     internal/ tree.
 func runStateRebuild(args []string, projectPath string) int {
 	project, err := config.LoadProject(projectPath)
 	if err != nil {
@@ -66,31 +77,30 @@ func runStateRebuild(args []string, projectPath string) int {
 		return 1
 	}
 
-	moduleRoot, modulePath, err := moduleInfo(projRoot)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "--state: %v\n", err)
-		return 1
+	moduleRoot, modulePath, modErr := moduleInfo(projRoot)
+	if modErr == nil && modulePath == sqdModulePath {
+		// Project lives inside a sqd-go checkout.
+		return runStateInModule(args, project, projRoot, moduleRoot, modulePath)
 	}
-	if modulePath != sqdModulePath {
-		fmt.Fprintf(os.Stderr, "--state: project must live inside the sqd-go module (found module %q at %s).\n", modulePath, moduleRoot)
-		fmt.Fprintln(os.Stderr, "  Its generated custom_processor.go imports internal/cli, which only resolves in-module. Place the project inside a sqd-go checkout.")
-		return 1
-	}
+	// Clean env: no enclosing sqd-go module (no go.mod, or a different module).
+	return runStateStandalone(args, project, projRoot, moduleRoot, modulePath, modErr)
+}
+
+// runStateInModule builds the project as an in-module package of a sqd-go
+// checkout and execs the resulting runner.
+func runStateInModule(args []string, project *config.Project, projRoot, moduleRoot, modulePath string) int {
 	importPath, err := projectImportPath(modulePath, moduleRoot, projRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "--state: %v\n", err)
 		return 1
 	}
 
-	// 1. Regenerate the project's Go package (Processor with EnableColdCache, etc.).
 	log.Printf("--state: regenerating %s", project.Root)
 	if _, err := codegen.GenerateProject(project); err != nil {
 		fmt.Fprintf(os.Stderr, "codegen: %v\n", err)
 		return 1
 	}
 
-	// 2. Write the runner main into a non-dotted temp dir inside the module (the go
-	// tool ignores dirs starting with '.' or '_', so .sqd cannot host it).
 	runnerDir, err := os.MkdirTemp(moduleRoot, "sqdrun")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "--state: create runner dir: %v\n", err)
@@ -102,29 +112,138 @@ func runStateRebuild(args []string, projectPath string) int {
 		return 1
 	}
 
-	// 3. Build the runner (imports the project package → init() registers the processor).
+	log.Printf("--state: building %s (project %s)", project.Config.Name, importPath)
+	binPath, rc := buildRunner(runnerDir, nil)
+	if rc != 0 {
+		return rc
+	}
+	defer os.Remove(binPath)
+
+	log.Printf("--state: launching processor-enabled run")
+	return execStateChild(binPath, filterFlag(args, "--state"))
+}
+
+// runStateStandalone makes a clean-env project (notebook layout) buildable by
+// turning it into a self-contained module that requires sqd-go, then runs the
+// usual regenerate → runner → build → exec flow against the public packages.
+//
+// The dependency closure has to be resolved before codegen runs, because the
+// easyjson step shells out to `go run` inside the project module; GOFLAGS=-mod=mod
+// lets the toolchain populate go.sum from the warm module cache on the fly.
+func runStateStandalone(args []string, project *config.Project, projRoot, moduleRoot, modulePath string, modErr error) int {
+	// The project's generated package import is the contract the module path must
+	// satisfy (so "<base>/generated" resolves to the codegen output).
+	importBase, err := generatedImportBase(projRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "--state: %v\n", err)
+		return 1
+	}
+
+	// SQD_GO_REPLACE points the sqd-go require at a local checkout (dev/CI); a
+	// real notebook fetches the installed version from the proxy instead.
+	sqdReplace := strings.TrimSpace(os.Getenv("SQD_GO_REPLACE"))
+	sqdVer := "v0.0.0"
+	if sqdReplace == "" {
+		sqdVer = sqdModuleVersion()
+	}
+
+	if modErr != nil {
+		// No enclosing module: root the module at projRoot so importBase resolves
+		// to ./generated.
+		moduleRoot = projRoot
+		modulePath = importBase
+		if err := writeStandaloneGoMod(projRoot, importBase, sqdVer, sqdReplace); err != nil {
+			fmt.Fprintf(os.Stderr, "--state: scaffold go.mod: %v\n", err)
+			return 1
+		}
+		log.Printf("--state: scaffolded go.mod (module %s, require %s %s) for standalone build", importBase, sqdModulePath, sqdVer)
+	} else {
+		log.Printf("--state: %s is module %q (not the sqd-go module); building it standalone against %s %s", project.Config.Name, modulePath, sqdModulePath, sqdVer)
+	}
+
+	importPath, err := projectImportPath(modulePath, moduleRoot, projRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "--state: %v\n", err)
+		return 1
+	}
+
+	env := append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod")
+
+	// Seed the module graph so codegen's easyjson bootstrap can compile.
+	if rc := runGoCmd(moduleRoot, env, "get", sqdModulePath+"@"+sqdVer); rc != 0 {
+		fmt.Fprintf(os.Stderr, "--state: could not resolve %s@%s; check network/GOPROXY, or set SQD_GO_REPLACE to a local sqd-go checkout\n", sqdModulePath, sqdVer)
+		return rc
+	}
+
+	// codegen runs easyjson in-process; it inherits GOFLAGS/GOWORK from the env.
+	restore := setenvTemp(map[string]string{"GOWORK": "off", "GOFLAGS": "-mod=mod"})
+	log.Printf("--state: regenerating %s", project.Root)
+	_, genErr := codegen.GenerateProject(project)
+	restore()
+	if genErr != nil {
+		fmt.Fprintf(os.Stderr, "codegen: %v\n", genErr)
+		return 1
+	}
+
+	runnerDir, err := os.MkdirTemp(moduleRoot, "sqdrun")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "--state: create runner dir: %v\n", err)
+		return 1
+	}
+	defer os.RemoveAll(runnerDir)
+	if err := os.WriteFile(filepath.Join(runnerDir, "main.go"), []byte(runnerMainSource(importPath)), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "--state: write runner: %v\n", err)
+		return 1
+	}
+
+	// Resolve go.sum for the generated code's deps (clickhouse, pebble, easyjson)
+	// now that every package — including the runner — is on disk.
+	if rc := runGoCmd(moduleRoot, env, "mod", "tidy"); rc != 0 {
+		return rc
+	}
+
+	log.Printf("--state: building %s (module %s, project %s)", project.Config.Name, modulePath, importPath)
+	binPath, rc := buildRunner(runnerDir, env)
+	if rc != 0 {
+		return rc
+	}
+	defer os.Remove(binPath)
+
+	log.Printf("--state: launching processor-enabled run")
+	return execStateChild(binPath, filterFlag(args, "--state"))
+}
+
+// buildRunner compiles the runner package in runnerDir to a temp binary. env, if
+// non-nil, overrides the build environment (used by the standalone path for
+// GOFLAGS=-mod=mod). Returns the binary path and a CLI return code (0 on success).
+func buildRunner(runnerDir string, env []string) (string, int) {
 	bin, err := os.CreateTemp("", "sqd-state-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "--state: create binary temp: %v\n", err)
-		return 1
+		return "", 1
 	}
 	binPath := bin.Name()
 	_ = bin.Close()
-	defer os.Remove(binPath)
 
-	log.Printf("--state: building %s (project %s)", project.Config.Name, importPath)
 	build := exec.Command("go", "build", "-o", binPath, ".")
 	build.Dir = runnerDir
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "--state: go build failed: %v\n", err)
-		return 1
+	if env != nil {
+		build.Env = env
 	}
+	if err := build.Run(); err != nil {
+		_ = os.Remove(binPath)
+		fmt.Fprintf(os.Stderr, "--state: go build failed: %v\n", err)
+		return "", 1
+	}
+	return binPath, 0
+}
 
-	// 4. Exec the freshly built binary as a normal `start` run (without --state).
-	childArgs := filterFlag(args, "--state")
-	log.Printf("--state: launching processor-enabled run")
+// execStateChild runs the freshly built binary as a normal `start` run and
+// forwards termination signals so Ctrl-C / SIGTERM (and `timeout`) stop the
+// indexer cleanly instead of orphaning it past this process's exit.
+func execStateChild(binPath string, childArgs []string) int {
 	child := exec.Command(binPath, childArgs...)
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
@@ -134,8 +253,6 @@ func runStateRebuild(args []string, projectPath string) int {
 		fmt.Fprintf(os.Stderr, "--state: start run failed: %v\n", err)
 		return 1
 	}
-	// Forward termination signals to the child so Ctrl-C / SIGTERM (and `timeout`)
-	// stop the indexer cleanly instead of orphaning it past this process's exit.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -155,9 +272,109 @@ func runStateRebuild(args []string, projectPath string) int {
 	return 0
 }
 
-// sqdModulePath is the module the in-module project packages (and their internal/cli
-// import) belong to. Kept as a const so projectImportPath/moduleInfo are checkable.
-const sqdModulePath = "github.com/franz101/sqd-go"
+// runGoCmd runs a `go` subcommand in dir with env, streaming output. Returns a
+// CLI return code (0 on success).
+func runGoCmd(dir string, env []string, args ...string) int {
+	cmd := exec.Command("go", args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "--state: `go %s` failed: %v\n", strings.Join(args, " "), err)
+		return 1
+	}
+	return 0
+}
+
+// writeStandaloneGoMod scaffolds a module rooted at dir that requires sqd-go.
+// sqdReplace, if set, adds a replace directive pointing at a local checkout.
+func writeStandaloneGoMod(dir, modulePath, sqdVer, sqdReplace string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "module %s\n\ngo %s\n\nrequire %s %s\n", modulePath, sqdGoDirective, sqdModulePath, sqdVer)
+	if sqdReplace != "" {
+		fmt.Fprintf(&b, "\nreplace %s => %s\n", sqdModulePath, filepath.ToSlash(sqdReplace))
+	}
+	return os.WriteFile(filepath.Join(dir, "go.mod"), []byte(b.String()), 0o644)
+}
+
+// sqdModuleVersion reports the sqd-go version the running binary was built from,
+// so the scaffolded module requires a matching release. Falls back to "latest"
+// for `go run`/devel builds with no recorded version.
+func sqdModuleVersion() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "latest"
+	}
+	if bi.Main.Path == sqdModulePath && isUsableVersion(bi.Main.Version) {
+		return bi.Main.Version
+	}
+	for _, dep := range bi.Deps {
+		if dep.Path == sqdModulePath && isUsableVersion(dep.Version) {
+			return dep.Version
+		}
+	}
+	return "latest"
+}
+
+func isUsableVersion(v string) bool {
+	return v != "" && v != "(devel)"
+}
+
+// generatedImportBase returns the import path prefix of the project's generated
+// package (the "<base>" in `import "<base>/generated"`) by scanning the root Go
+// files. The scaffolded module path must equal this so the import resolves.
+func generatedImportBase(projRoot string) (string, error) {
+	entries, err := os.ReadDir(projRoot)
+	if err != nil {
+		return "", err
+	}
+	fset := token.NewFileSet()
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, perr := parser.ParseFile(fset, filepath.Join(projRoot, name), nil, parser.ImportsOnly)
+		if perr != nil {
+			continue
+		}
+		for _, imp := range f.Imports {
+			p := strings.Trim(imp.Path.Value, `"`)
+			if base, ok := strings.CutSuffix(p, "/generated"); ok {
+				return base, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("could not find the project's generated package import in %s\n"+
+		"  a stateful project's custom_processor.go must import its generated package, e.g.\n"+
+		"    generated \"myproject/generated\"\n"+
+		"  with `myproject` matching the project's module/package name", projRoot)
+}
+
+// setenvTemp sets the given environment variables and returns a function that
+// restores their prior values.
+func setenvTemp(kv map[string]string) func() {
+	type prev struct {
+		val string
+		set bool
+	}
+	saved := make(map[string]prev, len(kv))
+	for k, v := range kv {
+		cur, ok := os.LookupEnv(k)
+		saved[k] = prev{val: cur, set: ok}
+		_ = os.Setenv(k, v)
+	}
+	return func() {
+		for k, p := range saved {
+			if p.set {
+				_ = os.Setenv(k, p.val)
+			} else {
+				_ = os.Unsetenv(k)
+			}
+		}
+	}
+}
 
 // projectHasRootGoPackage reports whether dir contains at least one Go source file
 // directly (a custom_schema.go / custom_processor.go), i.e. the project root is an
@@ -246,10 +463,10 @@ import (
 
 	_ %q
 
-	"github.com/franz101/sqd-go/internal/cli"
+	"github.com/franz101/sqd-go/sqd"
 )
 
-func main() { os.Exit(cli.Run(os.Args[1:])) }
+func main() { os.Exit(sqd.Run(os.Args[1:])) }
 `, projectImportPath)
 }
 

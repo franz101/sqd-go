@@ -22,7 +22,7 @@ import (
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/holiman/uint256"
-	"github.com/franz101/sqd-go/internal/parser/abiunpack"
+	"github.com/franz101/sqd-go/abiunpack"
 )
 
 // ProtoEventBlock holds parsed events in columnar format.
