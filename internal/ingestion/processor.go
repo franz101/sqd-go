@@ -2,6 +2,7 @@ package ingestion
 
 import (
 	"context"
+	"time"
 
 	"github.com/franz101/sqd-go/internal/database"
 )
@@ -58,6 +59,29 @@ type Flusher interface {
 // mode where reorg recovery may need them.
 type SnapshotController interface {
 	SetSnapshotsEnabled(enabled bool)
+}
+
+// ProcessorProfileReporter optionally exposes processor-specific cumulative
+// timings. The ingestion loop samples it at the normal stats interval and logs
+// deltas, keeping domain instrumentation out of the generic hot path.
+type ProcessorProfileReporter interface {
+	ProcessorProfile() ProcessorProfile
+}
+
+type ProcessorProfile struct {
+	ConditionResolveDuration time.Duration
+	ConditionRoundTrips      int64
+	FPMMResolveDuration      time.Duration
+	FPMMRoundTrips           int64
+}
+
+func (p ProcessorProfile) Delta(previous ProcessorProfile) ProcessorProfile {
+	return ProcessorProfile{
+		ConditionResolveDuration: nonNegativeDurationDelta(p.ConditionResolveDuration, previous.ConditionResolveDuration),
+		ConditionRoundTrips:      maxInt64(p.ConditionRoundTrips-previous.ConditionRoundTrips, 0),
+		FPMMResolveDuration:      nonNegativeDurationDelta(p.FPMMResolveDuration, previous.FPMMResolveDuration),
+		FPMMRoundTrips:           maxInt64(p.FPMMRoundTrips-previous.FPMMRoundTrips, 0),
+	}
 }
 
 // ColdCacheProcessor is optionally implemented by processors that keep a

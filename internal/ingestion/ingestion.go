@@ -313,6 +313,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// On crash the run resumes from durable state and re-fetches the cheap gap.
 	committedReporter, _ := proc.(CommitHorizonReporter)
 	flusher, _ := proc.(Flusher)
+	processorProfileReporter, _ := proc.(ProcessorProfileReporter)
 	// durableCheckpoint is the highest block number written to sync_state so far.
 	var durableCheckpoint uint64
 	// Fork-recovery snapshots are only needed near/above the finalized head
@@ -810,6 +811,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	lastStatsTime := startTime
 	lastStatsBlocks := uint64(0)
 	lastStatsEvents := uint64(0)
+	lastProfileTotals := profileTotals{}
+	lastProcessorProfile := ProcessorProfile{}
 	// Chain-coverage tracking. The consumer cursor (currentConsumerBlockVal)
 	// advances on every block AND every confirmed-empty gap-skip (sparse
 	// --parallel-fetch), so its delta is the honest, mode-independent progress
@@ -857,6 +860,41 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			coverage, coverageRate, avgCoverageRate,
 			deltaBlocks, deltaEvents, interval.Round(time.Millisecond), fetchNote,
 			totalBlockCount, totalEventCount)
+		currentProfileTotals := profileTotals{
+			fetch:                time.Duration(profFetchNanos.Load()),
+			parse:                time.Duration(profParseNanos.Load()),
+			decode:               time.Duration(profDecodeNanos.Load()),
+			marshal:              time.Duration(profMarshalNanos.Load()),
+			insert:               time.Duration(profInsertNanos.Load()),
+			custom:               time.Duration(profCustomNanos.Load()),
+			consumerWait:         time.Duration(profConsumerWaitNanos.Load()),
+			producerBackpressure: time.Duration(profProducerBackpressureNanos.Load()),
+			iterations:           profIters.Load(),
+		}
+		profileDelta := currentProfileTotals.delta(lastProfileTotals)
+		log.Printf("Chain %d: profile %s | fetch=%s parse=%s decode=%s marshal=%s insert=%s custom=%s | consumer_wait=%s producer_backpressure=%s | parse_iterations=%d",
+			chain.ID, reason,
+			profileDelta.fetch.Round(time.Millisecond),
+			profileDelta.parse.Round(time.Millisecond),
+			profileDelta.decode.Round(time.Millisecond),
+			profileDelta.marshal.Round(time.Millisecond),
+			profileDelta.insert.Round(time.Millisecond),
+			profileDelta.custom.Round(time.Millisecond),
+			profileDelta.consumerWait.Round(time.Millisecond),
+			profileDelta.producerBackpressure.Round(time.Millisecond),
+			profileDelta.iterations)
+		lastProfileTotals = currentProfileTotals
+		if processorProfileReporter != nil {
+			currentProcessorProfile := processorProfileReporter.ProcessorProfile()
+			processorDelta := currentProcessorProfile.Delta(lastProcessorProfile)
+			log.Printf("Chain %d: processor profile %s | condition_resolve=%s condition_round_trips=%d | fpmm_resolve=%s fpmm_round_trips=%d",
+				chain.ID, reason,
+				processorDelta.ConditionResolveDuration.Round(time.Millisecond),
+				processorDelta.ConditionRoundTrips,
+				processorDelta.FPMMResolveDuration.Round(time.Millisecond),
+				processorDelta.FPMMRoundTrips)
+			lastProcessorProfile = currentProcessorProfile
+		}
 		lastStatsTime = now
 		lastStatsBlocks = totalBlockCount
 		lastStatsEvents = totalEventCount
@@ -1200,6 +1238,46 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	}
 
 	return nil
+}
+
+type profileTotals struct {
+	fetch                time.Duration
+	parse                time.Duration
+	decode               time.Duration
+	marshal              time.Duration
+	insert               time.Duration
+	custom               time.Duration
+	consumerWait         time.Duration
+	producerBackpressure time.Duration
+	iterations           int64
+}
+
+func (p profileTotals) delta(previous profileTotals) profileTotals {
+	return profileTotals{
+		fetch:                nonNegativeDurationDelta(p.fetch, previous.fetch),
+		parse:                nonNegativeDurationDelta(p.parse, previous.parse),
+		decode:               nonNegativeDurationDelta(p.decode, previous.decode),
+		marshal:              nonNegativeDurationDelta(p.marshal, previous.marshal),
+		insert:               nonNegativeDurationDelta(p.insert, previous.insert),
+		custom:               nonNegativeDurationDelta(p.custom, previous.custom),
+		consumerWait:         nonNegativeDurationDelta(p.consumerWait, previous.consumerWait),
+		producerBackpressure: nonNegativeDurationDelta(p.producerBackpressure, previous.producerBackpressure),
+		iterations:           maxInt64(p.iterations-previous.iterations, 0),
+	}
+}
+
+func nonNegativeDurationDelta(current, previous time.Duration) time.Duration {
+	if current < previous {
+		return 0
+	}
+	return current - previous
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func printProfile(fetch, parse, decode, marshal, insert, custom, consumerWait, producerBackpressure time.Duration, iters int, totalBlocks, totalEvents uint64, startTime time.Time, memBefore, memAfter runtime.MemStats) {
