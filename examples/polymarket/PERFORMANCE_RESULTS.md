@@ -1305,3 +1305,54 @@ recovery integration, benefiting a path the 0xf benchmark doesn't exercise. The
 experiment (`BenchmarkColdStore_*`) is retained as the evidence; building the
 production store is a scoped follow-up to validate on a real backfill.
 
+## COLD-2 — `flatcold` in-RAM backend, flag-gated, drop-in (implemented)
+
+Built the option-A store from COLD-1: `coldcache/flatcold.go`, a **CLOCK
+(second-chance) cache over flat key/value byte buffers with a chained hash
+index** — the same structure the generated hot ring uses, generalized to opaque
+fixed-size records. Selected at runtime with **`SQD_COLDCACHE_BACKEND=flat`**
+(Pebble stays the default); `coldcache.Store` dispatches every method to it, so
+it is a true drop-in — no codegen or generated-code change. Design choices and
+why (informed by Firedancer's `groove`):
+
+- **In-RAM, no mmap.** Sidesteps Windows portability *and* the Go-specific
+  trap where a page fault on mmap'd memory opaquely stalls the OS thread. True
+  overflow (beyond the budget) falls through to the existing batched ClickHouse
+  resolver — correct, not lossy.
+- **Bounded + TTL.** Hard-capped at `capacity` slots; CLOCK eviction keeps the
+  working set. Because the processor writes in block order, insertion-order
+  eviction approximates a block-height TTL for free.
+- **Offset-addressed flat buffers** (`slotKey`/`slotVal`), no per-entry
+  allocation, fixed layout — the "offsets not pointers" discipline that lets the
+  same idea later move to disk/shared memory (cf. `fd_groove_volume`).
+- **Thread-safe** (one mutex) so parallel cold-recovery can write it; a
+  lock-free / sharded index (cf. `fd_map_slot_para`) is the documented next step.
+- **Fast hash**: word-at-a-time FNV + avalanche (mixes every key byte, ~6
+  multiplies for a 52-byte key instead of 52).
+
+**Tests first (TDD)** — `coldcache/flatcold_test.go`: round-trip, update,
+delete + slot reuse, miss, bounded-capacity, CLOCK second-chance (a referenced
+key survives churn), hash-collision probe chains, a 20k-op map-oracle, and the
+flag path through `Store`. `go test -race` clean. The **generated cache's real
+cold round-trip passes on the flat backend** (`SQD_COLDCACHE_BACKEND=flat
+TestC6UserPositionColdRoundTrip`: 200 distinct positions evicted from a
+capacity-4 hot ring, all retrieved via flatcold).
+
+**A/B vs Pebble** (`BenchmarkColdStore_*`, 400k fixed-size entries, thread-safe
+flatcold as shipped):
+
+| Op | Pebble | flatcold | Speedup |
+|---|---:|---:|---:|
+| `GetInto` | ~2,400 ns, 39 B/op | **~70–140 ns, 0 B** | **~17–25×** |
+| `Put` (with CLOCK eviction) | ~1,100 ns, 4 B/op | **~145 ns, 0 B** | **~7–8×** |
+
+(Absolute numbers are noisy under the live indexer; the order-of-magnitude gap
+and the zero allocations are the signal.)
+
+**Status**: implemented, tested, flag-gated, A/B-proven; Pebble remains the
+default. The honest caveat from COLD-1 stands — the cold tier is idle in the 0xf
+replay, so the end-to-end payoff must be confirmed on a from-genesis full-chain
+backfill (where the working set exceeds the hot ring). Next steps if pursued:
+disk-backed segments via `ReadAt`/`WriteAt` (portable) for working sets beyond
+RAM, and a sharded/lock-free index for the recovery path.
+
