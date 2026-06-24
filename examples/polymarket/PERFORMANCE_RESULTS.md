@@ -1161,3 +1161,36 @@ insertion handled by the proto path>`, with a counter confirming both
 | C2 collection-ID fast path | **Implemented** | −210k `big.Int.Bytes` alloc objects in the realistic e2e |
 | C3 Update* mutex | Measured, not removed | ~4 ns/op uncontended; gated on concurrency testing |
 
+---
+
+# confirm_optimization branch — parse-path allocation squeeze
+
+After C1 was found non-applicable, the realistic profile was used to find the
+largest *validatable* allocation source on the processor hot path (the parser /
+parse-path target the doc already names). `common.FromHex` was **44%** of all
+allocations in the realistic e2e.
+
+## HEX-1 — zero-allocation hex decode in generated `Process`: implemented
+
+The generated proto-mode `Processor.Process` converts every CustomLog's hex
+string fields into `common.Hash`/`common.Address` via `common.HexToHash` /
+`common.HexToAddress`, each of which allocates an intermediate `[]byte` through
+`common.FromHex`. Added `hexToHash` / `hexToAddress` helpers to the codegen
+template (`internal/codegen/custom_processor.go`) that decode straight into the
+fixed-size array with `hex.Decode` + `unsafe.Slice` (a read-only view of the
+immutable input string — no copy), with a fallback to the stdlib helper for any
+unexpected length. Applied to `BlockHash`, `ContractAddress`, `TransactionHash`
+and every topic, in both the proto and non-proto code paths.
+
+- **Equivalence**: `TestHexHelpersEquivalence` checks the algorithm against
+  `common.HexToHash` / `HexToAddress` for 0x / no-0x / upper / lower / full /
+  short / empty / odd inputs.
+- **Realistic e2e profile diff** (`pprof -base`): `encoding/hex.DecodeString`
+  **−3,291,462** alloc objects (`HexToHash` −2,789,233, `HexToAddress`
+  −501,862). **Total allocations 18,954,540 → 15,702,697 (−3.25M, −17.2%).**
+- **Correctness**: e2e totals byte-identical.
+
+**Retained.** Remaining `common.FromHex` after this change is the variable-length
+`FromHex(lg.Data)` (~0.5M) plus `AppendFromLog`'s inline constant topic hashing
+(next).
+
