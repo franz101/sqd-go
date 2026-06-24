@@ -1,3 +1,9 @@
+//go:build bitcask
+
+// This manual A/B benchmark compares Pebble against bitcask. It requires the
+// optional go.mills.io/bitcask/v2 module, so it is gated behind the `bitcask`
+// build tag (run with `go test -tags bitcask ./coldcache`). Without the tag the
+// rest of the coldcache tests build and run normally.
 package coldcache
 
 import (
@@ -11,41 +17,8 @@ import (
 	bitcask "go.mills.io/bitcask/v2"
 )
 
-const keySize = 52  // 20 + 32 bytes for User + TokenID
-const valueSize = 152 // size of posLike struct
-
-// randKey generates a random key of keySize bytes.
-func randKey(r *rand.Rand) []byte {
-	k := make([]byte, keySize)
-	r.Read(k)
-	return k
-}
-
-// randValue generates a random posLike value.
-func randValue(r *rand.Rand) []byte {
-	var v posLike
-	r.Read(v.User[:])
-	r.Read(v.TokenID[:])
-	for i := range v.Amount {
-		v.Amount[i] = r.Uint64()
-	}
-	for i := range v.AvgPrice {
-		v.AvgPrice[i] = r.Uint64()
-	}
-	for i := range v.RealizedPnL {
-		v.RealizedPnL[i] = r.Uint64()
-	}
-	for i := range v.TotalBought {
-		v.TotalBought[i] = r.Uint64()
-	}
-	v.UpdatedAtBlock = r.Uint64()
-	v.UpdatedAt = r.Int63()
-	v.BlockNumber = r.Uint64()
-	v.TxIndex = r.Uint64()
-	v.LogIndex = r.Uint64()
-	v.Tombstone = r.Intn(2) == 1
-	return bytesOf(&v)
-}
+// keySize, valueSize, randKey and randValue are shared helpers defined in the
+// untagged bench_helpers_test.go.
 
 // targetSizeGB returns the target size in GB for the benchmark (default 12GB).
 func targetSizeGB() int {

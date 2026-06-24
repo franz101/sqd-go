@@ -145,11 +145,6 @@ type ProtoEventBlock struct {
 	fmt.Fprint(&buf, "\tdefault:\n\t\treturn false\n\t}\n")
 	fmt.Fprint(&buf, "}\n\n")
 
-	fmt.Fprint(&buf, "// AppendFromLog decodes a raw log directly into columns without heap allocations.\n")
-	fmt.Fprint(&buf, "func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.Hash, data []byte, meta EventMeta) bool {\n")
-	fmt.Fprint(&buf, "	if len(topics) == 0 {\n		return false\n	}\n")
-	fmt.Fprint(&buf, "	topic0 := topics[0]\n")
-
 	// Group events by lowercased topic0 to handle shared topic0s across
 	// different contracts (e.g. ExchangeOrderFilled + NegRiskExchangeOrderFilled
 	// both emit OrderFilled with the same topic0 but different contract addresses).
@@ -175,31 +170,37 @@ type ProtoEventBlock struct {
 		}
 	}
 
-	for _, grp := range ordered {
-		evs := grp.events
-
-		// Determine if this group needs address checks.
-		hasAddrChecks := false
-		for _, ev := range evs {
-			if len(ev.ContractAddress) > 0 {
-				hasAddrChecks = true
-				break
+	// Precompute the dispatch topic0 hashes and contract addresses once at package
+	// init, instead of re-hashing/-decoding the string constants (and
+	// allocating address.Hex()/toLowerASCII) on every AppendFromLog call — that
+	// per-call common.HexToHash + checksum-hex was a large share of processor
+	// allocations on the real corpus.
+	for gi, grp := range ordered {
+		fmt.Fprintf(&buf, "var _aflTopic%d = common.HexToHash(%q)\n", gi, grp.events[0].Topic0)
+		for ei, ev := range grp.events {
+			for ai, addr := range ev.ContractAddress {
+				fmt.Fprintf(&buf, "var _aflAddr%d_%d_%d = common.HexToAddress(%q)\n", gi, ei, ai, addr)
 			}
 		}
+	}
+	fmt.Fprint(&buf, "\n")
 
-		firstEv := evs[0]
-		fmt.Fprintf(&buf, "	if topic0 == common.HexToHash(%q) {\n", firstEv.Topic0)
+	fmt.Fprint(&buf, "// AppendFromLog decodes a raw log directly into columns without heap allocations.\n")
+	fmt.Fprint(&buf, "func (b *ProtoEventBlock) AppendFromLog(address common.Address, topics []common.Hash, data []byte, meta EventMeta) bool {\n")
+	fmt.Fprint(&buf, "	if len(topics) == 0 {\n		return false\n	}\n")
+	fmt.Fprint(&buf, "	topic0 := topics[0]\n")
 
-		if hasAddrChecks {
-			fmt.Fprint(&buf, "		addressLower := toLowerASCII(address.Hex())\n")
-		}
+	for gi, grp := range ordered {
+		evs := grp.events
 
-		for _, ev := range evs {
+		fmt.Fprintf(&buf, "	if topic0 == _aflTopic%d {\n", gi)
+
+		for ei, ev := range evs {
 			extraIndent := ""
 			if len(ev.ContractAddress) > 0 {
 				var addrExprs []string
-				for _, addr := range ev.ContractAddress {
-					addrExprs = append(addrExprs, fmt.Sprintf("addressLower == %q", strings.ToLower(addr)))
+				for ai := range ev.ContractAddress {
+					addrExprs = append(addrExprs, fmt.Sprintf("address == _aflAddr%d_%d_%d", gi, ei, ai))
 				}
 				fmt.Fprintf(&buf, "		if %s {\n", strings.Join(addrExprs, " || "))
 				extraIndent = "	"

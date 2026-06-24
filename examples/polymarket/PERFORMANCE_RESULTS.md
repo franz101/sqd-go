@@ -876,3 +876,483 @@ Added comprehensive edge case tests in `custom_processor_math_test.go`:
 
 **Decision**: Retained. Eliminates unnecessary atomic operations per single-writer contract. Improvement would be visible in cold cache scenarios (not measured in warm cache benchmark). The contract is documented in filter.go comments.
 
+---
+
+# confirm_optimization branch — findings C4–C10
+
+Work on the `confirm_optimization` branch. The seven findings (C4–C10) were each
+**statically confirmed against the actual code first**, then validated on a
+**realistic** stack per the request: proto-mode processor + Pebble cold cache +
+an isolated, disposable ClickHouse — never the live `polymarket` database.
+
+## Validation harness (realistic: cold cache + ClickHouse)
+
+- **Fixture**: the full `wallet_0xf05b67_full` offline block range (Polygon
+  33,605,403 → 40,206,663), copied into `tmp/wallet_0xf05b67_full/` (2,540
+  `*.jsonl.zstd` files, 53 MiB).
+- **ClickHouse**: an **isolated, volume-less** container (`sqd-confirm-ch`,
+  ports 9003/8135) holding only the default system databases — zero risk to the
+  live `polymarket` data. Each test creates and drops its own timestamped
+  `confirm_opt_*` database.
+- **Harness** (git-ignored, under `examples/polymarket/confirm_opt_*_test.go`): a
+  realistic replay that parses every block and feeds it to
+  `proc.Process(ctx, store, logs)` with the cold cache enabled, then asserts the
+  wallet's exact positions.
+
+Baseline (unmodified templates), realistic cold-cache + ClickHouse replay:
+
+| Metric | Value |
+|---|---|
+| Blocks / events | 268,626 / 506,599 |
+| Process time | ~129 s |
+| Positions | 4 |
+| Realized / Holdings / Net | 37.876088169187416774 / 313.683532169187415452376136 / 351.559620338374832226376136 |
+
+These exact totals are the correctness gate; every change below reproduces them
+**byte-for-byte**.
+
+### Realistic allocation profile (the reprioritization)
+
+A `-memprofile` of the baseline realistic backfill (`-memprofilerate=4096`)
+reordered the findings by actual blast radius:
+
+| Finding | In realistic 0xf backfill | Evidence |
+|---|---|---|
+| **C8** (Position `Get` `&val` escape) | **Top in-scope allocator** | `PositionState.Get` 513k alloc objects + cache get |
+| **C5** (array `ColStr` encoding) | Minor — not in hot path | array string helpers absent from top-40; order fills (dominant) carry no array columns |
+| **C4** (resolver dedup map/slice) | Small **and bypassed** | `ColdAuthoritative()` short-circuits the resolver in the from-genesis backfill (`0 round-trips`) |
+| **C6 / C7** (cold tier) | **Idle** | the 0xf working set fits the 65,536-slot hot ring → zero evictions, zero `coldcache` allocations |
+
+## C10 — dead shopspring fallback counters: removed
+
+The 12 `fallback*` counters plus `getFallbackCounters` / `resetFallbackCounters`
+in `custom_processor.go` were confirmed **never incremented** (`grep` for
+`fallback[A-Z].*++` → 0; WISH-003A had already replaced the fallbacks with early
+returns). Removed (≈46 lines). `go build` + `go vet` clean; e2e totals unchanged.
+
+## C6 — cold fallback uses `GetInto` (no per-hit alloc): implemented
+
+The generated clock-cache cold read fallback (`hot_state.go`) was switched from
+the value-returning `cold.Get` (which does `make([]byte, len(v))` per hit,
+`coldcache.go:334`) to `cold.GetInto`, which copies straight into the fixed-size
+value. Applies to the two pointer-free cold entities (UserPositions,
+FixedProductMarketMakers).
+
+Clean A/B (`coldcache` package, hot key present):
+
+| Method | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `Get` (old) | 283 | 240 | **1** |
+| `GetInto` (new) | 240 | **0** | **0** |
+
+Correctness: `TestGetIntoMatchesGet` (byte-identical to `Get`) and
+`TestC6UserPositionColdRoundTrip` (200 distinct keys through a capacity-4 ring,
+every evicted position round-trips back via `GetInto`) pass. e2e totals
+unchanged. **Blast radius**: cold-tier hits — frequent during cold recovery /
+large-working-set backfill; idle when the working set fits the hot ring (as in
+the 0xf replay). **Retained.**
+
+## C4 — resolver reuses dedup scratch across `Resolve`: implemented
+
+`renderBatchResolver` (`hot_state.go`) now keeps `uniqueKeys`, `uniqueList` and
+`foundKeys` on the resolver struct and `clear()`s them per call instead of
+`make()`-ing fresh maps + slice each `Resolve`; `r.misses` is truncated
+(`[:0]`) rather than set to `nil`. The resolver is single-owner (consumer
+goroutine, per GEN-003B), so no synchronization is needed.
+
+A/B (`BenchmarkConditionResolve`, 8-key batch, identical ClickHouse round-trip):
+
+| Version | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| pre-C4 (per-call alloc) | ~1.50 ms | 13,228 | 151 |
+| C4 (scratch reuse) | ~1.55 ms | **12,266** | **143** |
+
+**−8 allocs/op, −960 B/op per `Resolve`** (the round-trip dominates wall time).
+`TestConditionResolverReuseCorrectness` passes (dedup + tombstone correct across
+two reuse rounds). **Blast radius**: warm-restart / reorg replay; **bypassed
+entirely** in the authoritative from-genesis backfill (measured: 0 round-trips).
+**Retained.**
+
+## C8 — value-semantics get avoids the per-update heap escape: implemented
+
+`UserPositionState.Get` returns `&val` (a local), which forces one
+`MemoryUserPosition` heap allocation per call whenever the pointer crosses a
+function boundary. The dominant order-fill update path
+(`getUserPosition` → mutate → `Save`) did exactly that on every fill. Added
+`getUserPositionValue` (returns the position **by value**) and converted
+`updateUserPositionWithBuyD256` / `updateUserPositionWithSellD256` to keep the
+position on their own stack and write it back with `Save(&up)`. `Save` only
+writes through the pointer and passes `*value` **by value** into
+`UpdateMemoryUserPosition`, so it never retains the pointer.
+
+- **Escape analysis** (`-gcflags=-m`): no `moved to heap: up` in the two D256
+  update functions — `up` stays on the stack.
+- **Micro A/B** (noinline boundary mirroring the real call):
+  pointer-returning get = **2.00** allocs/op, value-returning get = **1.00**
+  allocs/op (removes exactly the `&val` escape).
+- **Realistic e2e profile diff** (`pprof -base`): `PositionState.Get`
+  **−453,358** alloc objects; **−441,115 total** alloc objects (19.68M → 19.24M).
+- **Correctness**: e2e totals byte-identical.
+
+`TestC8ValueGetAvoidsEscape` guards the win. **Retained.**
+
+> Follow-up observed (out of C4–C10 scope): a residual ~1 alloc/op remains at the
+> cache-level `*ClockCache.Get` even on a hot hit (~660k objects in the realistic
+> profile, unchanged by C8). Worth a separate look.
+
+## C7 — eviction spill via reused write batch: measured, not implemented
+
+Finding premise: per-key eviction `Put` (`db.Set`) allocates a fresh Pebble
+batch each vs a reused `WriteBatch`. **The premise does not hold** — Pebble pools
+its internal batches:
+
+| Spill path | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| per-key `Put` (current) | ~3.7–4.8 k | ~20 | **0** |
+| reused `WriteBatch.Put` (proposed) | ~4.8–8.0 k | 1,064 | **0** |
+
+The current path is already 0 allocs/op; the batched path is **not faster** for
+the spill pattern and accumulates a buffer. Worse, the `WriteBatch` is a
+**non-indexed** Pebble batch, so a just-evicted dirty key would be invisible to
+the cold `Get` re-reference until flush — a read-after-evict data-loss hazard,
+exactly the correctness-model territory the project already deferred ("Commit
+batch reuse", "Dirty bitmap"). **Not implemented; documented.** Benchmarks
+(`BenchmarkEvictionSpill_*`) retained in `coldcache`.
+
+## C5 — array column string encoding: chased, documented (measured trade-off)
+
+`clickHouseUint256Array` / `clickHouseHashArray` / `clickHouseAddressArray`
+build a string per row via `strings.Builder`. Cost for the common 2-element
+payout array: **~30 ns/op, 24 B/op, 1 alloc/op** (`BenchmarkC5PayoutArrayEncoding`).
+
+- The realistic profile confirms this is **not** a hot allocator: the dominant
+  event (order fill) carries no array columns; only the rarer
+  funding/payout/split/merge events do.
+- TASK-004 already benchmarked **native binary arrays** and reverted them
+  (strings are faster for 2–10 elements).
+- A **new** angle (untried by TASK-004): keep the proven-faster string *format*
+  but build into a reused scratch buffer + `proto.ColStr.AppendBytes`, removing
+  the final per-row string allocation. Limitation: `uint256.Int` has no
+  append-style decimal formatter (only `Dec()`/`String()`, which allocate per
+  element), so a *full* zero-alloc encode would require a custom 256-bit
+  append-decimal — significant code for a bounded, not-hot win.
+
+**Decision**: not implemented. The string encoding is a measured, bounded
+trade-off; the buffer-reuse refinement is noted as a possible future micro-opt.
+
+## Summary
+
+| Finding | Disposition | Measured effect |
+|---|---|---|
+| C4 resolver dedup reuse | **Implemented** | −8 allocs/op, −960 B/op per Resolve (warm-restart/reorg path) |
+| C5 array string encoding | Documented | bounded, not hot; binary already rejected (TASK-004) |
+| C6 cold `GetInto` | **Implemented** | 1→0 allocs/op (240→0 B) per cold hit |
+| C7 eviction batch | Measured, not implemented | per-key Put already 0 allocs; batch unsafe (read-after-evict) |
+| C8 value-semantics get | **Implemented** | −453k Position.Get allocs (−441k total) in realistic e2e |
+| C10 dead counters | **Removed** | −46 lines dead code |
+
+All implemented changes reproduce the exact 0xf totals
+(37.876088169187416774 / 313.683532169187415452376136 /
+351.559620338374832226376136). `go vet`, `go test ./internal/codegen`, and
+`go test ./coldcache` pass.
+
+---
+
+# confirm_optimization branch — findings C1–C3
+
+Second batch, validated on the same realistic harness (cold cache + isolated
+disposable ClickHouse + full 0xf05b67 replay).
+
+## C2 — hot handlers use the zero-alloc collection-ID fast path: implemented
+
+Four hot sites passed `indexSetBig[i]` (`*big.Int`) into `getCollectionID`,
+which routes through `bigIntTo32Bytes` → `v.Bytes()` (a `[]byte` allocation per
+call) on every split / merge / CTF-redemption / FPMM outcome:
+
+- `handlePositionSplit`, `handlePositionsMerge` (2 outcomes/event)
+- `handlePayoutRedemptionCTF` (per payout)
+- `getFixedProductMarketMakerPositionID` (per FPMM buy/sell/funding)
+
+All four now call the existing zero-alloc `getCollectionIDForOutcome(outcome)`,
+which indexes the precomputed `collectionIndexWords[outcome]` (`[32]byte`,
+no `big.Int`, no `.Bytes()`). The now-dead `indexSetBig` table was removed.
+
+- **Equivalence**: `TestC2CollectionIDEquivalence` proves
+  `getCollectionIDForOutcome(i)` is **byte-identical** to the old
+  `getCollectionID(1<<i)` for every outcome and condition (same index word →
+  same cache key → same ID).
+- **Realistic e2e profile diff** (`pprof -base`): `math/big.(*Int).Bytes`
+  **−210,328** alloc objects; `bigIntTo32Bytes` / `getCollectionID` no longer
+  appear as allocators.
+- **Correctness**: e2e totals byte-identical.
+
+`FEEDBACK.md` had claimed this migration was already done ("all use
+`getCollectionIDForOutcome` now") — the code contradicted it; now applied.
+**Retained.**
+
+## C3 — `HotState.Update*` per-Save mutex: measured, audited, not removed
+
+Every `state.*.Save()` → `UpdateMemoryUserPosition` takes `s.mu.Lock()` on the
+hottest write path.
+
+**Audit**: `s.mu` is acquired only by `Update*`, `Commit`, and the mark-dirty
+helpers — all on the single consumer goroutine. `recoverColdParallel` writes
+independent Pebble batches and never touches the hot ring or the dirty maps
+(matches GEN-003B). So the lock is **uncontended** in steady state.
+
+**Cost** (`BenchmarkUserPositionSave`, A/B by stripping the lock from the
+generated `UpdateMemoryUserPosition`):
+
+| Save | ns/op | allocs/op |
+|---|---:|---:|
+| with mutex (current) | ~59 | 0 |
+| without mutex | ~55 | 0 |
+
+**~4 ns/op (~7%), no allocation change.** A marginal CPU win against a real
+data-race hazard if the single-owner contract is ever violated (the exported
+`Update*`/`Commit` can be called by external code; the contract is
+single-owner-but-exported, exactly the GEN-003B caution). The change was staged
+on a separate `perf/cold-recovery-bloom` branch and still needs the full
+recovery/commit/rollback concurrency model + `-race` validation.
+
+**Decision**: not removed here. The marginal win does not justify the
+correctness risk without the gated concurrency testing. Documented with the
+audit + measurement so it can be finished safely on the perf branch.
+
+## C1 — redundant ABI decode in the proto-only producer: confirmed, not applicable here
+
+The producer's `ParseWithLine` callback ABI-decodes every log and does two
+`strings.Clone`, building `entry.events`. With `store_raw_logs: false`,
+`entry.events` is **not** inserted (`InsertLogs` is gated on
+`ShouldStoreRawLogs()`), and in a true proto-only run the consumer re-decodes
+the raw line via `ProcessJSONL` — so the generic decode is redundant.
+
+**But this redundancy does not occur in this checkout**, for two reasons found
+during confirmation:
+
+1. **No `ProcessJSONL` path here.** This polymarket example does **not**
+   implement `FastJSONLProcessor` (no `ProcessJSONL`), and `SQD_PARSE_DECODE_V2`
+   is unset, so `useParseDecodeV2` is **always false**. The consumer uses
+   `proc.Process(batchCustomLogs)` (proto decoding happens *inside* `Process`
+   from the CustomLogs), so the producer's decode feeds `blockCustomLogs` and is
+   **consumed**.
+2. **Typed-event insertion is ungated.** `buildTypedTableIndex` creates a
+   `<contract>_<event>_events` table for every configured event, and the
+   consumer's typed-event insertion loop is **not** gated by any config. The
+   same decode also populates `entry.typedEvents`. A safe skip therefore also
+   requires proving that, in a real proto-only config, typed-event insertion is
+   handled by the proto path rather than the producer's `blockTypedEvents` —
+   otherwise the typed tables silently stop being written.
+
+**Decision**: not implemented. C1 is a real optimization for the AHH/live
+proto-only (`ProcessJSONL`) ingestion path, but in this tree the skip would be
+dead, unexercisable code in core ingestion, and its safety depends on the typed-
+event-insertion behavior of a config that does not exist here. Recommend
+implementing + validating in the tree that runs proto-only mode, gating the skip
+on `useParseDecodeV2 && !ShouldStoreRawLogs() && <no typed tables, or typed
+insertion handled by the proto path>`, with a counter confirming both
+`entry.events` and `entry.typedEvents` are unused.
+
+## Summary (C1–C3)
+
+| Finding | Disposition | Measured effect |
+|---|---|---|
+| C1 producer decode skip | Confirmed, not applicable here | redundancy requires the `ProcessJSONL` path, absent in this checkout |
+| C2 collection-ID fast path | **Implemented** | −210k `big.Int.Bytes` alloc objects in the realistic e2e |
+| C3 Update* mutex | Measured, not removed | ~4 ns/op uncontended; gated on concurrency testing |
+
+---
+
+# confirm_optimization branch — parse-path allocation squeeze
+
+After C1 was found non-applicable, the realistic profile was used to find the
+largest *validatable* allocation source on the processor hot path (the parser /
+parse-path target the doc already names). `common.FromHex` was **44%** of all
+allocations in the realistic e2e.
+
+## HEX-1 — zero-allocation hex decode in generated `Process`: implemented
+
+The generated proto-mode `Processor.Process` converts every CustomLog's hex
+string fields into `common.Hash`/`common.Address` via `common.HexToHash` /
+`common.HexToAddress`, each of which allocates an intermediate `[]byte` through
+`common.FromHex`. Added `hexToHash` / `hexToAddress` helpers to the codegen
+template (`internal/codegen/custom_processor.go`) that decode straight into the
+fixed-size array with `hex.Decode` + `unsafe.Slice` (a read-only view of the
+immutable input string — no copy), with a fallback to the stdlib helper for any
+unexpected length. Applied to `BlockHash`, `ContractAddress`, `TransactionHash`
+and every topic, in both the proto and non-proto code paths.
+
+- **Equivalence**: `TestHexHelpersEquivalence` checks the algorithm against
+  `common.HexToHash` / `HexToAddress` for 0x / no-0x / upper / lower / full /
+  short / empty / odd inputs.
+- **Realistic e2e profile diff** (`pprof -base`): `encoding/hex.DecodeString`
+  **−3,291,462** alloc objects (`HexToHash` −2,789,233, `HexToAddress`
+  −501,862). **Total allocations 18,954,540 → 15,702,697 (−3.25M, −17.2%).**
+- **Correctness**: e2e totals byte-identical.
+
+**Retained.** Remaining `common.FromHex` after this change is the variable-length
+`FromHex(lg.Data)` (~0.5M) plus `AppendFromLog`'s inline constant topic hashing
+(next).
+
+## HEX-2 — hoist `AppendFromLog` dispatch constants to package vars: implemented
+
+After HEX-1, the largest remaining allocator was the generated `AppendFromLog`
+dispatch (`internal/codegen/views.go`): each call re-ran `common.HexToHash("0x…")`
+for the topic0 comparison **and** `toLowerASCII(address.Hex())` for the contract
+address comparison, per event group, per log. The codegen template now:
+
+- precomputes one `_aflTopicN = common.HexToHash(...)` and
+  `_aflAddrN_M_K = common.HexToAddress(...)` package var per dispatch constant
+  (hashed/decoded once at init), and
+- compares the address by value (`address == _aflAddrN_M_K`) instead of building
+  and lowercasing the checksum hex string on every call.
+
+- **Realistic e2e profile diff** (`pprof -base`): `hex.DecodeString`
+  **−4,546,618**, `common.Address.Hex`/`.hex`/`checksumHex` **−1.27M**.
+  **Total allocations 15,702,697 → 9,623,824 (−6.08M, −38.7%).**
+- **Correctness**: e2e totals byte-identical; `go test ./internal/codegen` passes.
+
+### Parse-path squeeze — cumulative
+
+| Stage | Total alloc objects (realistic e2e) | Δ |
+|---|---:|---:|
+| Before (post C2/C4/C6/C8) | 18,954,540 | — |
+| + HEX-1 (Process hex helpers) | 15,702,697 | −17.2% |
+| + HEX-2 (AppendFromLog hoist) | 9,623,824 | −38.7% |
+| **Cumulative** | **9,623,824** | **−49.2%** |
+
+Both changes are codegen-template-only, reproduce the exact 0xf totals, and the
+remaining `common.FromHex(lg.Data)` (variable-length log data) is the next
+candidate (it needs a reusable decode buffer whose lifetime matches
+`AppendFromLog`, so it is left for a separately-validated change).
+
+## HEX-3 — clock-cache `Get` key no longer escapes to the heap: implemented
+
+The C8 follow-up: the generated `*ClockCache.Get` cold branch passed `&key` to
+`unsafe.Slice` for the cold lookup. Go's escape analysis is flow-insensitive, so
+that single `&key` forced the `key` parameter (a 52-byte
+`UserPositionsClockKey`) onto the heap on **every** `Get` — including hot hits
+that never reach the cold branch (`-gcflags=-m`: `moved to heap: key`). The
+template now copies `key` into a local inside the cold branch (`k := key`) and
+takes `&k`, containing the escape to the cold-miss path.
+
+- **Escape analysis**: `moved to heap: key` is gone for `Get`.
+- **Alloc test** (`TestC8ValueGetAvoidsEscape`): the value-get path dropped from
+  **1.00 → 0.00 allocs/op** — the hot order-fill position read is now fully
+  allocation-free (combined with C8).
+- **Realistic e2e profile diff**: `UserPositionsClockCache.Get` **−599,536**,
+  `FixedProductMarketMakersClockCache.Get` **−105,268**.
+  **Total allocations 9,623,824 → 8,864,393 (−759k, −7.9%).**
+- **Correctness**: e2e byte-identical; `go test ./internal/codegen` and
+  `go test -race` (cache) pass.
+
+### Parse-path + cache squeeze — cumulative
+
+| Stage | Total alloc objects (realistic e2e) | Δ vs before |
+|---|---:|---:|
+| Before (post C2/C4/C6/C8) | 18,954,540 | — |
+| + HEX-1 (Process hex helpers) | 15,702,697 | −17.2% |
+| + HEX-2 (AppendFromLog hoist) | 9,623,824 | −38.7% |
+| + HEX-3 (Get key escape) | 8,864,393 | −7.9% |
+| **Cumulative** | **8,864,393** | **−53.2%** |
+
+The largest remaining allocator is `internal/parser.bytesToString` (~37%): the
+JSONL parser materializes each log's address/topics/data as fresh strings that
+the processor then hex-decodes. Eliminating it means a zero-copy parser→processor
+interface (return byte views into the raw buffer) — a core-parser change outside
+this codegen-only sweep, noted as the next target.
+
+## COLD-1 — can a custom store beat Pebble for the cold tier? (experiment)
+
+Question: the cold tier already (de)serializes with pure unsafe memcpy
+(`unsafe.Slice(&value)` in / `copy(dst, v)` out), so is **Pebble itself** the
+cost? The cold tier needs none of what Pebble provides — no range scans, no
+ordered iteration, no crash durability (ClickHouse is the source of truth, writes
+are `NoSync`). The keys/values are fixed-size, pointer-free, layout known at
+codegen time. So a fixed-slot open-addressing hash table over a flat buffer
+(unsafe slot access) should win.
+
+`coldcache/flatstore_bench_test.go` benchmarks both on the cold access pattern
+(400k fixed-size entries, point lookups):
+
+| Op | Pebble | flat store | Speedup |
+|---|---:|---:|---:|
+| `GetInto` (copy out) | ~2,100 ns, 33 B/op | **~80 ns, 0 B** | **~26×** |
+| `Peek` (zero-copy view) | — | **~48 ns, 0 B** | ~44× |
+| `Put` | ~1,600 ns, 4 B/op | **~70 ns, 0 B** | **~23×** |
+
+The ~2µs is Pebble's warm LSM machinery (the data fits its block cache); the flat
+store is a hash + 1–2 linear probes + memcpy. **Confirmed: Pebble is the
+bottleneck on the cold path, not serialization.**
+
+**Caveats before a production swap:**
+- The cold tier is **idle in the 0xf workload** (working set fits the 65,536-slot
+  hot ring) — so this is a dense-backfill / cold-recovery win, not a steady-state
+  one. It must be validated on a from-genesis full-chain backfill.
+- The flat store must be **mmap-backed** to exceed RAM and to spill to disk;
+  warm (page-resident) access matches the in-memory numbers above, a page fault
+  costs one disk read (vs Pebble's potential multi-SST read).
+- Its weakness is **growth**: at high load factor it must rehash, which for a
+  multi-GB table is a stop-the-world pause. Mitigation: pre-size from a config
+  estimate, shard by key prefix (also lets parallel cold-recovery write disjoint
+  shards lock-free), grow by doubling.
+- **Deletes** (rollback) need tombstones or backward-shift; **no crash
+  durability** is required (rebuild from ClickHouse on restart).
+
+**Assessment**: the speedup is large and real, but a production version is a
+~300–500-line mmap-backed sharded store with growth + delete handling + cold-
+recovery integration, benefiting a path the 0xf benchmark doesn't exercise. The
+experiment (`BenchmarkColdStore_*`) is retained as the evidence; building the
+production store is a scoped follow-up to validate on a real backfill.
+
+## COLD-2 — `flatcold` in-RAM backend, flag-gated, drop-in (implemented)
+
+Built the option-A store from COLD-1: `coldcache/flatcold.go`, a **CLOCK
+(second-chance) cache over flat key/value byte buffers with a chained hash
+index** — the same structure the generated hot ring uses, generalized to opaque
+fixed-size records. Selected at runtime with **`SQD_COLDCACHE_BACKEND=flat`**
+(Pebble stays the default); `coldcache.Store` dispatches every method to it, so
+it is a true drop-in — no codegen or generated-code change. Design choices and
+why (informed by Firedancer's `groove`):
+
+- **In-RAM, no mmap.** Sidesteps Windows portability *and* the Go-specific
+  trap where a page fault on mmap'd memory opaquely stalls the OS thread. True
+  overflow (beyond the budget) falls through to the existing batched ClickHouse
+  resolver — correct, not lossy.
+- **Bounded + TTL.** Hard-capped at `capacity` slots; CLOCK eviction keeps the
+  working set. Because the processor writes in block order, insertion-order
+  eviction approximates a block-height TTL for free.
+- **Offset-addressed flat buffers** (`slotKey`/`slotVal`), no per-entry
+  allocation, fixed layout — the "offsets not pointers" discipline that lets the
+  same idea later move to disk/shared memory (cf. `fd_groove_volume`).
+- **Thread-safe** (one mutex) so parallel cold-recovery can write it; a
+  lock-free / sharded index (cf. `fd_map_slot_para`) is the documented next step.
+- **Fast hash**: word-at-a-time FNV + avalanche (mixes every key byte, ~6
+  multiplies for a 52-byte key instead of 52).
+
+**Tests first (TDD)** — `coldcache/flatcold_test.go`: round-trip, update,
+delete + slot reuse, miss, bounded-capacity, CLOCK second-chance (a referenced
+key survives churn), hash-collision probe chains, a 20k-op map-oracle, and the
+flag path through `Store`. `go test -race` clean. The **generated cache's real
+cold round-trip passes on the flat backend** (`SQD_COLDCACHE_BACKEND=flat
+TestC6UserPositionColdRoundTrip`: 200 distinct positions evicted from a
+capacity-4 hot ring, all retrieved via flatcold).
+
+**A/B vs Pebble** (`BenchmarkColdStore_*`, 400k fixed-size entries, thread-safe
+flatcold as shipped):
+
+| Op | Pebble | flatcold | Speedup |
+|---|---:|---:|---:|
+| `GetInto` | ~2,400 ns, 39 B/op | **~70–140 ns, 0 B** | **~17–25×** |
+| `Put` (with CLOCK eviction) | ~1,100 ns, 4 B/op | **~145 ns, 0 B** | **~7–8×** |
+
+(Absolute numbers are noisy under the live indexer; the order-of-magnitude gap
+and the zero allocations are the signal.)
+
+**Status**: implemented, tested, flag-gated, A/B-proven; Pebble remains the
+default. The honest caveat from COLD-1 stands — the cold tier is idle in the 0xf
+replay, so the end-to-end payoff must be confirmed on a from-genesis full-chain
+backfill (where the working set exceeds the hot ring). Next steps if pursued:
+disk-backed segments via `ReadAt`/`WriteAt` (portable) for working sets beyond
+RAM, and a sharded/lock-free index for the recovery path.
+

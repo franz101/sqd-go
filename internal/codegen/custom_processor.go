@@ -263,14 +263,51 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 
 	b.WriteString(`import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
 	"time"
+	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/sqd"
 )
+
+// hexToHash / hexToAddress decode a 0x-prefixed fixed-length hex string straight
+// into the result array, with no intermediate []byte allocation (common.HexToHash
+// and common.HexToAddress allocate via common.FromHex). They fall back to the
+// stdlib helpers for any unexpected length. unsafe.Slice hands hex.Decode a
+// read-only view of the immutable input string, so there is no string->[]byte copy.
+func hexToHash(s string) common.Hash {
+	body := s
+	if len(body) >= 2 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X') {
+		body = body[2:]
+	}
+	if len(body) != 2*common.HashLength {
+		return common.HexToHash(s)
+	}
+	var h common.Hash
+	if _, err := hex.Decode(h[:], unsafe.Slice(unsafe.StringData(body), len(body))); err != nil {
+		return common.HexToHash(s)
+	}
+	return h
+}
+
+func hexToAddress(s string) common.Address {
+	body := s
+	if len(body) >= 2 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X') {
+		body = body[2:]
+	}
+	if len(body) != 2*common.AddressLength {
+		return common.HexToAddress(s)
+	}
+	var a common.Address
+	if _, err := hex.Decode(a[:], unsafe.Slice(unsafe.StringData(body), len(body))); err != nil {
+		return common.HexToAddress(s)
+	}
+	return a
+}
 
 // CustomProcessFn is the callback you register from your project package to
 // run custom business logic on each block. Assign it in an init() function:
@@ -518,15 +555,15 @@ func (p *Processor) Process(ctx context.Context, store *sqd.Store, logs []sqd.Cu
 			meta := EventMeta{
 				BlockNumber:      lg.BlockNumber,
 				BlockTimestamp:   lg.BlockTimestamp,
-				BlockHash:        common.HexToHash(lg.BlockHash),
-				ContractAddress:  common.HexToAddress(lg.ContractAddress),
-				TransactionHash:  common.HexToHash(lg.TransactionHash),
+				BlockHash:        hexToHash(lg.BlockHash),
+				ContractAddress:  hexToAddress(lg.ContractAddress),
+				TransactionHash:  hexToHash(lg.TransactionHash),
 				TransactionIndex: lg.TransactionIndex,
 				LogIndex:         lg.LogIndex,
 			}
 			topics := make([]common.Hash, len(lg.Topics))
 			for i, t := range lg.Topics {
-				topics[i] = common.HexToHash(t)
+				topics[i] = hexToHash(t)
 			}
 			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, common.FromHex(lg.Data), meta)
 		}
@@ -565,9 +602,9 @@ func (p *Processor) Process(ctx context.Context, store *sqd.Store, logs []sqd.Cu
 		meta := EventMeta{
 			BlockNumber:      lg.BlockNumber,
 			BlockTimestamp:   lg.BlockTimestamp,
-			BlockHash:        common.HexToHash(lg.BlockHash),
-			ContractAddress:  common.HexToAddress(lg.ContractAddress),
-			TransactionHash:  common.HexToHash(lg.TransactionHash),
+			BlockHash:        hexToHash(lg.BlockHash),
+			ContractAddress:  hexToAddress(lg.ContractAddress),
+			TransactionHash:  hexToHash(lg.TransactionHash),
 			TransactionIndex: lg.TransactionIndex,
 			LogIndex:         lg.LogIndex,
 		}

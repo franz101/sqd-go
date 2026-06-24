@@ -497,9 +497,15 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 		}
 	}
 	if c.cold != nil {
-		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
-			var v %[3]s
-			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+		// GetInto copies the stored bytes straight into v (a fixed-size value
+		// whose layout matches the bytes written on eviction), avoiding the
+		// per-hit []byte allocation that the value-returning cold.Get does. key is
+		// copied to a local first: taking &key directly forces the key parameter
+		// to the heap on EVERY Get (escape analysis is flow-insensitive), including
+		// hot hits that never reach this cold branch. &k keeps the escape contained.
+		k := key
+		var v %[3]s
+		if found, _ := c.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))); found {
 			c.SetByKey(key, v)
 			if c.metrics != nil {
 				c.metrics.ColdHits++
@@ -1600,6 +1606,17 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(cacheType)
 	b.WriteString("\n\tmisses []")
 	b.WriteString(keyType)
+	// C4: per-Resolve scratch reused across blocks (cleared, not reallocated).
+	// The resolver is single-owner (consumer goroutine; see GEN-003B), so no
+	// synchronization is needed on these.
+	b.WriteString("\n\tuniqueKeys map[")
+	b.WriteString(keyType)
+	b.WriteString("]struct{}")
+	b.WriteString("\n\tuniqueList []")
+	b.WriteString(keyType)
+	b.WriteString("\n\tfoundKeys map[")
+	b.WriteString(keyType)
+	b.WriteString("]struct{}")
 	b.WriteString("\n\tmetricsEnabled bool\n\tmetrics BatchResolverMetrics\n}\n\n")
 
 	b.WriteString("func New")
@@ -1662,18 +1679,19 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(resolverType)
 	b.WriteString(") Resolve(ctx context.Context, conn *ch.Client, db string) error {\n")
 	b.WriteString("\tif len(r.misses) == 0 {\n\t\treturn nil\n\t}\n\n")
-	b.WriteString("\tuniqueKeys := make(map[")
+	b.WriteString("\tif r.uniqueKeys == nil {\n\t\tr.uniqueKeys = make(map[")
 	b.WriteString(keyType)
-	b.WriteString("]struct{})\n")
-	b.WriteString("\tvar uniqueList []")
-	b.WriteString(keyType)
-	b.WriteString("\n\tfor _, key := range r.misses {\n")
-	b.WriteString("\t\tif _, ok := uniqueKeys[key]; !ok {\n")
-	b.WriteString("\t\t\tuniqueKeys[key] = struct{}{}\n")
+	b.WriteString("]struct{})\n\t}\n")
+	b.WriteString("\tclear(r.uniqueKeys)\n")
+	b.WriteString("\tuniqueList := r.uniqueList[:0]\n")
+	b.WriteString("\tfor _, key := range r.misses {\n")
+	b.WriteString("\t\tif _, ok := r.uniqueKeys[key]; !ok {\n")
+	b.WriteString("\t\t\tr.uniqueKeys[key] = struct{}{}\n")
 	b.WriteString("\t\t\tuniqueList = append(uniqueList, key)\n")
 	b.WriteString("\t\t}\n")
 	b.WriteString("\t}\n")
-	b.WriteString("\tr.misses = nil\n\n")
+	b.WriteString("\tr.uniqueList = uniqueList\n")
+	b.WriteString("\tr.misses = r.misses[:0]\n\n")
 	b.WriteString("\tif len(uniqueList) == 0 {\n\t\treturn nil\n\t}\n\n")
 	b.WriteString("\tif r.metricsEnabled {\n")
 	b.WriteString("\t\tr.metrics.UniqueMisses += uint64(len(uniqueList))\n")
@@ -1752,9 +1770,11 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	}
 	b.WriteString("\t}\n")
 
-	b.WriteString("\tfoundKeys := make(map[")
+	b.WriteString("\tif r.foundKeys == nil {\n\t\tr.foundKeys = make(map[")
 	b.WriteString(keyType)
-	b.WriteString("]struct{})\n")
+	b.WriteString("]struct{})\n\t}\n")
+	b.WriteString("\tclear(r.foundKeys)\n")
+	b.WriteString("\tfoundKeys := r.foundKeys\n")
 	b.WriteString("\tq := ch.Query{\n")
 	b.WriteString("\t\tBody:   queryStr,\n")
 	b.WriteString("\t\tResult: results,\n")
