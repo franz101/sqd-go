@@ -142,6 +142,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				}
 				l.Delim('[')
 				for !l.IsDelim(']') {
+					topics = [4]string{} // Reset topics array to prevent stale data from previous log
 					l.Delim('{')
 					dataHex = ""
 					var topicIdx int
@@ -187,9 +188,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					meta := EventMeta{
 						BlockNumber:      blockNum,
 						BlockTimestamp:   time.Unix(int64(blockTimestamp), 0).UTC(),
-						BlockHash:        common.HexToHash(blockHash),
-						ContractAddress:  common.HexToAddress(address),
-						TransactionHash:  common.HexToHash(txHash),
+						BlockHash:        abiunpack.HashFromHex(blockHash),
+						ContractAddress:  abiunpack.AddressFromHex(address),
+						TransactionHash:  abiunpack.HashFromHex(txHash),
 						TransactionIndex: txIndex,
 						LogIndex:         logIndex,
 					}
