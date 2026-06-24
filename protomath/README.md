@@ -67,7 +67,7 @@ Hardware: Intel i7-8700, linux/amd64.
 Focused math benchmark:
 
 ```text
-go test ./drafts/protomath -run '^$' -bench 'BenchmarkDiv1e18' -benchmem -benchtime=10x -count=3
+go test ./protomath -run '^$' -bench 'BenchmarkDiv1e18' -benchmem -benchtime=10x -count=3
 ```
 
 Mean result:
@@ -84,8 +84,8 @@ Real workload shape:
 
 ```text
 5000 blocks * 2000 tx/block = 10,000,000 rows
-go test ./drafts/protomath -run '^$' -bench 'BenchmarkStreamBlocks_(ProtoSubtype|Holiman)$' -benchmem -benchtime=1x -count=3
-timeout 30s env PROTO_MATH_DECIMAL_BLOCKS=5000 go test ./drafts/protomath -run '^$' -bench 'BenchmarkStreamBlocks_ShopDecimal$' -benchmem -benchtime=1x -count=1
+go test ./protomath -run '^$' -bench 'BenchmarkStreamBlocks_(ProtoSubtype|Holiman)$' -benchmem -benchtime=1x -count=3
+timeout 30s env PROTO_MATH_DECIMAL_BLOCKS=5000 go test ./protomath -run '^$' -bench 'BenchmarkStreamBlocks_ShopDecimal$' -benchmem -benchtime=1x -count=1
 ```
 
 Mean/direct result:
@@ -102,7 +102,7 @@ shopspring decimal and avoids roughly 4.56 GB of per-pass allocation churn.
 Decimal256 operator benchmark:
 
 ```text
-go test ./drafts/protomath -run '^$' -bench 'Benchmark(Decimal256|ShopDecimal)_(Add|Mul|Div)$' -benchmem -benchtime=10x -count=3
+go test ./protomath -run '^$' -bench 'Benchmark(Decimal256|ShopDecimal)_(Add|Mul|Div)$' -benchmem -benchtime=10x -count=3
 ```
 
 Mean result:
@@ -126,7 +126,7 @@ Position pipeline benchmark:
 100k cached positions + 200k incoming order events
 Task 1: lookup + update position math
 Task 2: build ClickHouse insert columns
-go test ./drafts/protomath -run '^$' -bench 'BenchmarkPositions(Task1|Task2|E2E)' -benchmem -benchtime=1x -count=3
+go test ./protomath -run '^$' -bench 'BenchmarkPositions(Task1|Task2|E2E)' -benchmem -benchtime=1x -count=3
 ```
 
 Mean result:
@@ -148,7 +148,7 @@ columns are ready for ch-go insertion without converting from heap decimals.
 Actual ClickHouse insert benchmark is opt-in:
 
 ```text
-PROTO_MATH_CLICKHOUSE_BENCH=1 go test ./drafts/protomath -run '^$' -bench 'BenchmarkPositionsE2E_(ProtoMath|ShopDecimal)_ClickHouseInsert$' -benchmem -benchtime=1x -count=1
+PROTO_MATH_CLICKHOUSE_BENCH=1 go test ./protomath -run '^$' -bench 'BenchmarkPositionsE2E_(ProtoMath|ShopDecimal)_ClickHouseInsert$' -benchmem -benchtime=1x -count=1
 ```
 
 Result on the same machine, using a Memory table:
@@ -168,7 +168,7 @@ through a local `ColRaw` wrapper whose type is `Decimal256(18)`.
 The chDB parity tests are opt-in because they require the native chDB runtime:
 
 ```text
-go test -tags chdb ./drafts/protomath
+go test -tags chdb ./protomath
 ```
 
 These tests compare the wrapper against ClickHouse semantics through

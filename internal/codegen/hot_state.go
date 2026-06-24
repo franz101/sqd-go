@@ -237,7 +237,7 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 			case strings.Contains(field.Type, "decimal."):
 				imports[`"github.com/shopspring/decimal"`] = ""
 			case strings.Contains(field.Type, "protomath."):
-				imports[`"github.com/franz101/sqd-go/drafts/protomath"`] = ""
+				imports[`"github.com/franz101/sqd-go/protomath"`] = ""
 			}
 		}
 	}

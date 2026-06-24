@@ -11,7 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
-	"github.com/franz101/sqd-go/drafts/protomath"
+	"github.com/franz101/sqd-go/protomath"
 	generated "github.com/franz101/sqd-go/examples/polymarket/generated"
 	"github.com/franz101/sqd-go/internal/cli"
 	"github.com/franz101/sqd-go/internal/ingestion"
@@ -769,6 +769,9 @@ func handleFixedProductMarketMakerCreation(state *generated.State, ev *generated
 	if len(ev.ConditionIds) == 0 {
 		return
 	}
+	if cond, ok := state.Condition.Get(ev.ConditionIds[0]); ok && cond.OutcomeSlotCount != 2 {
+		return
+	}
 	fpmm := &generated.FixedProductMarketMaker{
 		ID:              ev.FixedProductMarketMaker,
 		ConditionID:     ev.ConditionIds[0],
@@ -782,7 +785,7 @@ func handleFPMMBuy(state *generated.State, ev *generated.FixedProductMarketMaker
 		return
 	}
 	fpmm, ok := state.FixedProductMarketMaker.Get(fpmmAddr)
-	if !ok {
+	if !ok || !isBinaryFPMM(state, fpmm) {
 		return
 	}
 	outcomeIndex, ok := outcomeIndexUint8(ev.OutcomeIndex)
@@ -812,7 +815,7 @@ func handleFPMMSell(state *generated.State, ev *generated.FixedProductMarketMake
 		return
 	}
 	fpmm, ok := state.FixedProductMarketMaker.Get(fpmmAddr)
-	if !ok {
+	if !ok || !isBinaryFPMM(state, fpmm) {
 		return
 	}
 	outcomeIndex, ok := outcomeIndexUint8(ev.OutcomeIndex)
@@ -840,7 +843,7 @@ func handleFPMMFundingAdded(state *generated.State, ev *generated.FixedProductMa
 		return
 	}
 	fpmm, ok := state.FixedProductMarketMaker.Get(fpmmAddr)
-	if !ok {
+	if !ok || !isBinaryFPMM(state, fpmm) {
 		return
 	}
 
@@ -876,7 +879,10 @@ func handleFPMMFundingAdded(state *generated.State, ev *generated.FixedProductMa
 		totalSpendWei = ev.AmountsAdded[1]
 	}
 	totalSpend, okT := usdcRawToDec18(&totalSpendWei)
-	sharesMinted, okS := rawIntToDec18(&ev.SharesMinted)
+	// Polymarket FPMM LP shares use the same 1e6 subgraph scale as outcome
+	// tokens. Treating them as exponent-0 integers makes LP positions 1e6 too
+	// large (confirmed by real wallet 0x3889...1499 history).
+	sharesMinted, okS := usdcRawToDec18(&ev.SharesMinted)
 	tokenCost, okTC := amount.Mul(price, scale)
 	if !okT || !okS || !okTC {
 		// Unreachable overflow: funding calculation exceeds scale-18 range
@@ -903,7 +909,7 @@ func handleFPMMFundingRemoved(state *generated.State, ev *generated.FixedProduct
 		return
 	}
 	fpmm, ok := state.FixedProductMarketMaker.Get(fpmmAddr)
-	if !ok {
+	if !ok || !isBinaryFPMM(state, fpmm) {
 		return
 	}
 
@@ -933,7 +939,7 @@ func handleFPMMFundingRemoved(state *generated.State, ev *generated.FixedProduct
 	var lpSalePrice, sharesBurnt protomath.Decimal256
 	if hasShares {
 		collRemoved, okCR := usdcRawToDec18(&ev.CollateralRemovedFromFeePool)
-		sb, okSB := rawIntToDec18(&ev.SharesBurnt)
+		sb, okSB := usdcRawToDec18(&ev.SharesBurnt)
 		net, okNet := collRemoved.Sub(tokensCost)
 		if !okCR || !okSB || !okNet {
 			// Unreachable overflow: LP share calculation exceeds scale-18 range
@@ -959,12 +965,20 @@ func handleFPMMFundingRemoved(state *generated.State, ev *generated.FixedProduct
 
 // unreachable Decimal256 overflow path.
 
+func isBinaryFPMM(state *generated.State, fpmm *generated.FixedProductMarketMaker) bool {
+	if state == nil || fpmm == nil {
+		return false
+	}
+	cond, ok := state.Condition.Get(fpmm.ConditionID)
+	return !ok || cond.OutcomeSlotCount == 2
+}
+
 func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokensPositionSplit) {
 	if isIgnoredStakeholder(ev.Stakeholder) {
 		return
 	}
-	_, ok := state.Condition.Get(ev.ConditionID)
-	if !ok {
+	cond, ok := state.Condition.Get(ev.ConditionID)
+	if !ok || cond.OutcomeSlotCount != 2 {
 		return
 	}
 
@@ -990,8 +1004,8 @@ func handlePositionsMerge(state *generated.State, ev *generated.ConditionalToken
 	if isIgnoredStakeholder(ev.Stakeholder) {
 		return
 	}
-	_, ok := state.Condition.Get(ev.ConditionID)
-	if !ok {
+	cond, ok := state.Condition.Get(ev.ConditionID)
+	if !ok || cond.OutcomeSlotCount != 2 {
 		return
 	}
 
@@ -1148,12 +1162,13 @@ func handleQuestionPrepared(state *generated.State, ev *generated.NegRiskAdapter
 		}
 	}
 
-	idx := ev.Index
-	if idx.IsZero() || !isOneHot(&idx) {
+	// NegRiskAdapter emits a zero-based sequential question index, not a
+	// one-hot index set. Real markets contain indices 0,1,2,...; interpreting
+	// them as bitmasks retained only powers of two and truncated large markets.
+	if ev.Index.BitLen() > 32 {
 		return
 	}
-	bit := idx.BitLen() - 1
-	questionIndex := uint32(bit)
+	questionIndex := uint32(ev.Index.Uint64())
 
 	if questionIndex >= uint32(len(nr.QuestionIDs)) {
 		expanded := make([]common.Hash, questionIndex+1)
@@ -1169,10 +1184,10 @@ func handleQuestionPrepared(state *generated.State, ev *generated.NegRiskAdapter
 }
 
 func handleConditionPreparation(state *generated.State, ev *generated.ConditionalTokensConditionPreparation) {
-	outcomes := uint8(ev.OutcomeSlotCount.Uint64())
-	if outcomes != 2 {
+	if ev.OutcomeSlotCount.IsZero() || ev.OutcomeSlotCount.BitLen() > 8 {
 		return
 	}
+	outcomes := uint8(ev.OutcomeSlotCount.Uint64())
 	cond := &generated.Condition{
 		ID:               ev.ConditionID,
 		Oracle:           ev.Oracle,
@@ -1207,7 +1222,7 @@ func handlePayoutRedemptionCTF(state *generated.State, ev *generated.Conditional
 		return
 	}
 	cond, ok := state.Condition.Get(ev.ConditionID)
-	if !ok || !cond.Resolved {
+	if !ok || !cond.Resolved || cond.OutcomeSlotCount != 2 {
 		return
 	}
 
