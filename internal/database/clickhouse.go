@@ -840,14 +840,6 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 		if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("rollback %s: %w", table.Name, err)
 		}
-		// Call OPTIMIZE TABLE FINAL on the touched table
-		optQ := fmt.Sprintf("OPTIMIZE TABLE %s.%s FINAL", quoteIdent(s.db), quoteIdent(table.Name))
-		if rollbackSQL {
-			log.Printf("[ROLLBACK] optimize table %q: %s", table.Name, optQ)
-		}
-		if err := s.conn.Do(ctx, ch.Query{Body: optQ}); err != nil {
-			return fmt.Errorf("optimize %s: %w", table.Name, err)
-		}
 	}
 
 	// Delete from sync_state where last_block > lastBlock
@@ -858,15 +850,13 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 	if err := s.conn.Do(ctx, ch.Query{Body: syncQ}); err != nil {
 		return fmt.Errorf("rollback sync_state: %w", err)
 	}
-	optSyncQ := fmt.Sprintf("OPTIMIZE TABLE %s.sync_state FINAL", quoteIdent(s.db))
-	if rollbackSQL {
-		log.Printf("[ROLLBACK] optimize sync_state: %s", optSyncQ)
-	}
-	if err := s.conn.Do(ctx, ch.Query{Body: optSyncQ}); err != nil {
-		return fmt.Errorf("optimize sync_state: %w", err)
-	}
 
-	log.Printf("[ROLLBACK] issued lightweight delete and optimize final for %d table(s) and sync_state with blocks > %d in %s", len(tables), lastBlock, time.Since(start).Round(time.Millisecond))
+	// No OPTIMIZE TABLE FINAL: the no-duplicates invariant (prune block_number >
+	// lastBlock before re-insert) means a lightweight DELETE leaves every table
+	// correct. OPTIMIZE FINAL rewrites whole tables — the 42 GiB
+	// exchange_order_filled_events optimize alone took 8.5+ min — which is what
+	// made rollback take 9+ minutes. Background merges compact parts async.
+	log.Printf("[ROLLBACK] issued lightweight delete for %d table(s) and sync_state with blocks > %d in %s", len(tables), lastBlock, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 

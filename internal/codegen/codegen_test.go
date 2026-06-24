@@ -248,7 +248,7 @@ type MemoryMarketSchema struct {
 	assertContains(t, hotState, "func NewHotState(capacity uint64) *HotState")
 }
 
-func TestGenerateDefaultForkUsesCollapsingMergeTreeAndManifest(t *testing.T) {
+func TestGenerateDefaultForkUsesPlainMergeTreeAndManifest(t *testing.T) {
 	root := t.TempDir()
 	configYAML := []byte(`name: hot_lbtc
 store_raw_logs: true
@@ -275,18 +275,20 @@ chains:
 		t.Fatalf("manifest fork = %q, want default", manifest.Fork)
 	}
 
+	// No duplicates are possible (prune > lastBlock before re-insert), so event
+	// tables are plain MergeTree with no sign column.
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
-	assertContains(t, schema, "sign Int8 DEFAULT 1")
-	assertContains(t, schema, ") ENGINE = CollapsingMergeTree(sign)")
+	assertNotContains(t, schema, "sign Int8")
+	assertContains(t, schema, ") ENGINE = MergeTree()")
 	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `hot_lbtc`.`lbtc_transfer_events`")
 	assertContains(t, schema, "PRIMARY KEY (`from`, `to`, block_number, transaction_index, log_index)")
 
 	views := readText(t, filepath.Join(root, ".sqd", "generated", "views.sql"))
-	assertContains(t, views, "FROM `hot_lbtc`.logs FINAL")
-	assertContains(t, views, "AND sign = 1")
+	assertNotContains(t, views, "FINAL")
+	assertNotContains(t, views, "sign = 1")
 }
 
-func TestGenerateImplicitDefaultForkUsesCollapsingMergeTree(t *testing.T) {
+func TestGenerateImplicitDefaultForkUsesPlainMergeTree(t *testing.T) {
 	root := t.TempDir()
 	configYAML := []byte(`name: ring_lbtc
 chains:
@@ -305,7 +307,7 @@ chains:
 	}
 
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
-	assertContains(t, schema, ") ENGINE = CollapsingMergeTree(sign)")
+	assertContains(t, schema, ") ENGINE = MergeTree()")
 }
 
 func TestGenerateStateHandlesFromCustomSchemaAndConfig(t *testing.T) {

@@ -1534,7 +1534,18 @@ func buildTypedTableIndex(chain *config.Chain) (typedTableIndex, error) {
 			if err != nil {
 				return index, fmt.Errorf("%s.%s: %w", contract.Name, event.Event, err)
 			}
-			viewName := uniqueLower(used, toSnake(contract.Name+"_"+name))
+			// Derive the table name exactly like codegen's buildEventSpecs: honor
+			// an explicit `name:` override. Without this, an overridden event
+			// (e.g. ExchangeV2.OrderFilled named OrderFilledV2) resolves to a table
+			// name that schema.sql never created -> UNKNOWN_TABLE on insert (the
+			// crash at exchange_v2_order_filled_events). The index itself stays
+			// keyed by the base event name, which is what decoded logs carry and
+			// what lookup() receives.
+			tableNameEvent := name
+			if event.Name != nil && strings.TrimSpace(*event.Name) != "" {
+				tableNameEvent = strings.TrimSpace(*event.Name)
+			}
+			viewName := uniqueLower(used, toSnake(contract.Name + "_" + tableNameEvent))
 
 			var filteredArgs []database.TypedEventArg
 			for _, arg := range args {
