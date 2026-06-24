@@ -1262,3 +1262,46 @@ the processor then hex-decodes. Eliminating it means a zero-copy parser→proces
 interface (return byte views into the raw buffer) — a core-parser change outside
 this codegen-only sweep, noted as the next target.
 
+## COLD-1 — can a custom store beat Pebble for the cold tier? (experiment)
+
+Question: the cold tier already (de)serializes with pure unsafe memcpy
+(`unsafe.Slice(&value)` in / `copy(dst, v)` out), so is **Pebble itself** the
+cost? The cold tier needs none of what Pebble provides — no range scans, no
+ordered iteration, no crash durability (ClickHouse is the source of truth, writes
+are `NoSync`). The keys/values are fixed-size, pointer-free, layout known at
+codegen time. So a fixed-slot open-addressing hash table over a flat buffer
+(unsafe slot access) should win.
+
+`coldcache/flatstore_bench_test.go` benchmarks both on the cold access pattern
+(400k fixed-size entries, point lookups):
+
+| Op | Pebble | flat store | Speedup |
+|---|---:|---:|---:|
+| `GetInto` (copy out) | ~2,100 ns, 33 B/op | **~80 ns, 0 B** | **~26×** |
+| `Peek` (zero-copy view) | — | **~48 ns, 0 B** | ~44× |
+| `Put` | ~1,600 ns, 4 B/op | **~70 ns, 0 B** | **~23×** |
+
+The ~2µs is Pebble's warm LSM machinery (the data fits its block cache); the flat
+store is a hash + 1–2 linear probes + memcpy. **Confirmed: Pebble is the
+bottleneck on the cold path, not serialization.**
+
+**Caveats before a production swap:**
+- The cold tier is **idle in the 0xf workload** (working set fits the 65,536-slot
+  hot ring) — so this is a dense-backfill / cold-recovery win, not a steady-state
+  one. It must be validated on a from-genesis full-chain backfill.
+- The flat store must be **mmap-backed** to exceed RAM and to spill to disk;
+  warm (page-resident) access matches the in-memory numbers above, a page fault
+  costs one disk read (vs Pebble's potential multi-SST read).
+- Its weakness is **growth**: at high load factor it must rehash, which for a
+  multi-GB table is a stop-the-world pause. Mitigation: pre-size from a config
+  estimate, shard by key prefix (also lets parallel cold-recovery write disjoint
+  shards lock-free), grow by doubling.
+- **Deletes** (rollback) need tombstones or backward-shift; **no crash
+  durability** is required (rebuild from ClickHouse on restart).
+
+**Assessment**: the speedup is large and real, but a production version is a
+~300–500-line mmap-backed sharded store with growth + delete handling + cold-
+recovery integration, benefiting a path the 0xf benchmark doesn't exercise. The
+experiment (`BenchmarkColdStore_*`) is retained as the evidence; building the
+production store is a scoped follow-up to validate on a real backfill.
+
