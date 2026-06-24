@@ -202,6 +202,7 @@ feed:
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
 		`"context"`:                              "",
+		`"encoding/binary"`:                      "",
 		`"fmt"`:                                  "",
 		`"strings"`:                              "",
 		`"sync"`:                                 "",
@@ -321,11 +322,18 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	// Cache struct. The index is a pointer-free chained hash over an arena (A3):
 	// buckets[h] = ring index of a chain head (-1 = empty); next[ringIdx] = next
 	// ring index in the same bucket (-1 = end). Replaces a sync.Map[key]idx whose
-	// boxed key+idx interfaces were ~3 GC-scanned objects per live entry. Single
-	// writer (one processor goroutine) => the index needs no locking; the CLOCK
-	// entry flags stay atomic so concurrent readers (if ever reintroduced) still see
-	// torn-free flag transitions.
+	// boxed key+idx interfaces were ~3 GC-scanned objects per live entry. The
+	// runtime uses one processor owner after startup. Atomics on slot flags do not
+	// make the full cache concurrent-safe because the index and values are plain;
+	// they remain because the measured atomic-free candidate was not a consistent
+	// full-workload improvement.
 	fmt.Fprintf(b, `type %[1]s struct {
+	// buckets, next, ring form a fixed-size clock replacement cache.
+	// SINGLE-OWNER CONTRACT: This cache is NOT thread-safe. All operations
+	// must occur from a single goroutine (the processor). Concurrent access
+	// will corrupt the linked-list structures and cause data races.
+	// The atomics used for entry flags (inUse, referenced) protect only
+	// the per-slot state, NOT the cache index structures.
 	buckets  []int32
 	next     []int32
 	ring     []%[2]s
@@ -335,7 +343,8 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	size     uint64
 	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
 	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
-	cold *coldcache.Store
+	cold    *coldcache.Store
+	metrics *BatchResolverMetrics
 }
 
 func New%[1]s(capacity uint64) *%[1]s {
@@ -364,11 +373,19 @@ func New%[1]s(capacity uint64) *%[1]s {
 
 `, spec.cacheType, spec.entryType)
 
-	// keyHash folds every key field's bytes (all keys are common.Hash/Address byte
-	// arrays) into a bucket index.
+	// keyHash folds fixed-width keys by machine words. Hash and address keys are
+	// already uniformly distributed, so byte-at-a-time FNV adds work without
+	// improving the cache index distribution.
 	fmt.Fprintf(b, "func (c *%s) keyHash(key %s) uint32 {\n\th := uint64(1469598103934665603)\n", spec.cacheType, spec.keyType)
 	for _, field := range keyFields {
-		fmt.Fprintf(b, "\th = clockHash64(h, key.%s[:])\n", field.Name)
+		switch field.Type {
+		case "common.Address":
+			fmt.Fprintf(b, "\th = clockHash20(h, key.%s[:])\n", field.Name)
+		case "common.Hash":
+			fmt.Fprintf(b, "\th = clockHash32(h, key.%s[:])\n", field.Name)
+		default:
+			fmt.Fprintf(b, "\th = clockHashBytes(h, key.%s[:])\n", field.Name)
+		}
 	}
 	b.WriteString("\treturn uint32(h^(h>>32)) & c.mask\n}\n\n")
 
@@ -473,6 +490,9 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			atomic.StoreUint32(&e.referenced, 1)
+			if c.metrics != nil {
+				c.metrics.HotHits++
+			}
 			return e.value, true
 		}
 	}
@@ -481,6 +501,9 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 			var v %[3]s
 			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
 			c.SetByKey(key, v)
+			if c.metrics != nil {
+				c.metrics.ColdHits++
+			}
 			return v, true
 		}
 	}
@@ -497,6 +520,9 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
+		if c.metrics != nil {
+			c.metrics.HotHits++
+		}
 		return e.value, true
 	}
 	return %[3]s{}, false
@@ -978,7 +1004,35 @@ func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec, events []e
 	// + next []int32 chain), so the GC scans two flat integer slices instead of the
 	// millions of boxed interface objects a sync.Map[key]idx allocated.
 	b.WriteString(`
-func clockHash64(seed uint64, b []byte) uint64 {
+// BatchResolverMetrics are cumulative until SnapshotAndResetMetrics is called.
+// Resolver access follows the processor's single-owner state contract.
+type BatchResolverMetrics struct {
+	HotHits      uint64
+	ColdHits     uint64
+	DBFallbacks  uint64
+	QueuedMisses uint64
+	UniqueMisses uint64
+	RoundTrips   uint64
+}
+
+func clockHashWord(seed, word uint64) uint64 {
+	return (seed ^ word) * 1099511628211
+}
+
+func clockHash20(seed uint64, b []byte) uint64 {
+	h := clockHashWord(seed, binary.LittleEndian.Uint64(b[0:8]))
+	h = clockHashWord(h, binary.LittleEndian.Uint64(b[8:16]))
+	return clockHashWord(h, uint64(binary.LittleEndian.Uint32(b[16:20])))
+}
+
+func clockHash32(seed uint64, b []byte) uint64 {
+	h := clockHashWord(seed, binary.LittleEndian.Uint64(b[0:8]))
+	h = clockHashWord(h, binary.LittleEndian.Uint64(b[8:16]))
+	h = clockHashWord(h, binary.LittleEndian.Uint64(b[16:24]))
+	return clockHashWord(h, binary.LittleEndian.Uint64(b[24:32]))
+}
+
+func clockHashBytes(seed uint64, b []byte) uint64 {
 	h := seed
 	for _, x := range b {
 		h ^= uint64(x)
@@ -1546,7 +1600,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(cacheType)
 	b.WriteString("\n\tmisses []")
 	b.WriteString(keyType)
-	b.WriteString("\n}\n\n")
+	b.WriteString("\n\tmetricsEnabled bool\n\tmetrics BatchResolverMetrics\n}\n\n")
 
 	b.WriteString("func New")
 	b.WriteString(resolverType)
@@ -1560,14 +1614,49 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
+	b.WriteString(") Lookup(key ")
+	b.WriteString(keyType)
+	b.WriteString(") (")
+	b.WriteString(valueType)
+	b.WriteString(", bool) {\n")
+	b.WriteString("\treturn r.cache.Get(key)\n}\n\n")
+
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
 	b.WriteString(") Queue(key ")
 	b.WriteString(keyType)
-	b.WriteString(") {\n\tif _, ok := r.cache.Get(key); !ok {\n\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
+	b.WriteString(") {\n\tif _, ok := r.Lookup(key); !ok {\n")
+	b.WriteString("\t\tif r.metricsEnabled {\n\t\t\tr.metrics.QueuedMisses++\n\t\t}\n")
+	b.WriteString("\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
 
 	b.WriteString("// Pending reports how many missed keys are queued for the next Resolve.\n")
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
 	b.WriteString(") Pending() int {\n\treturn len(r.misses)\n}\n\n")
+
+	b.WriteString("// EnableMetrics toggles resolver counters for a bounded observation interval.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") EnableMetrics(enabled bool) {\n")
+	b.WriteString("\tr.metricsEnabled = enabled\n")
+	b.WriteString("\tif enabled {\n\t\tr.cache.metrics = &r.metrics\n\t} else {\n\t\tr.cache.metrics = nil\n\t}\n")
+	b.WriteString("}\n\n")
+
+	b.WriteString("// MetricsEnabled reports whether resolver counters are active.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") MetricsEnabled() bool {\n\treturn r.metricsEnabled\n}\n\n")
+
+	b.WriteString("// Metrics returns cumulative single-owner resolver counters.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") Metrics() BatchResolverMetrics {\n\treturn r.metrics\n}\n\n")
+
+	b.WriteString("// SnapshotAndResetMetrics returns the current counters and starts a new interval.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") SnapshotAndResetMetrics() BatchResolverMetrics {\n")
+	b.WriteString("\tmetrics := r.metrics\n\tr.metrics = BatchResolverMetrics{}\n\treturn metrics\n}\n\n")
 
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
@@ -1586,6 +1675,10 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\t}\n")
 	b.WriteString("\tr.misses = nil\n\n")
 	b.WriteString("\tif len(uniqueList) == 0 {\n\t\treturn nil\n\t}\n\n")
+	b.WriteString("\tif r.metricsEnabled {\n")
+	b.WriteString("\t\tr.metrics.UniqueMisses += uint64(len(uniqueList))\n")
+	b.WriteString("\t\tr.metrics.DBFallbacks += uint64(len(uniqueList))\n")
+	b.WriteString("\t}\n\n")
 
 	keyFields := spec.table.keyFields()
 	if len(keyFields) > 1 {
@@ -1709,6 +1802,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\t\t\treturn nil\n")
 	b.WriteString("\t\t},\n")
 	b.WriteString("\t}\n")
+	b.WriteString("\tif r.metricsEnabled {\n\t\tr.metrics.RoundTrips++\n\t}\n")
 	b.WriteString("\tif err := conn.Do(ctx, q); err != nil {\n\t\treturn err\n\t}\n")
 	b.WriteString("\tfor _, key := range uniqueList {\n")
 	b.WriteString("\t\tif _, found := foundKeys[key]; !found {\n")
