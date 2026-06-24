@@ -947,7 +947,7 @@ func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokens
 	}
 
 	for outcomeIndex := uint8(0); outcomeIndex < 2; outcomeIndex++ {
-		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[outcomeIndex])
+		collID := getCollectionIDForOutcome(common.Hash{}, ev.ConditionID, outcomeIndex)
 		posID := getPositionID(ev.CollateralToken, collID)
 		updateUserPositionWithBuyD256(state, ev.Stakeholder, posID, fiftyCentsD256, amount, protomath.Decimal256{}, ev.EventMeta)
 	}
@@ -972,7 +972,7 @@ func handlePositionsMerge(state *generated.State, ev *generated.ConditionalToken
 	}
 
 	for outcomeIndex := uint8(0); outcomeIndex < 2; outcomeIndex++ {
-		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[outcomeIndex])
+		collID := getCollectionIDForOutcome(common.Hash{}, ev.ConditionID, outcomeIndex)
 		posID := getPositionID(ev.CollateralToken, collID)
 		updateUserPositionWithSellD256(state, ev.Stakeholder, posID, fiftyCentsD256, amount, ev.EventMeta)
 	}
@@ -1185,7 +1185,7 @@ func handlePayoutRedemptionCTF(state *generated.State, ev *generated.Conditional
 	}
 
 	for i := range cond.Payouts {
-		collID := getCollectionID(common.Hash{}, ev.ConditionID, indexSetBig[i])
+		collID := getCollectionIDForOutcome(common.Hash{}, ev.ConditionID, uint8(i))
 		posID := getPositionID(ev.CollateralToken, collID)
 
 		up := getUserPosition(state, ev.Redeemer, posID)
@@ -1283,19 +1283,6 @@ var (
 	oneE12U256 = uint256.NewInt(1_000_000_000_000)
 	oneE18U256 = uint256.NewInt(1_000_000_000_000_000_000)
 )
-
-// indexSetBig holds the constant index-set masks (1<<i) as preallocated
-// big.Ints. getCollectionID only reads its indexSet argument, and the
-// processor is single-goroutine, so sharing one pointer per index removes a
-// uint256.Lsh + big.Int(ToBig) allocation from every split / merge / redemption
-// outcome iteration — the masks are always small constants (1, 2, 4, …).
-var indexSetBig = func() [64]*big.Int {
-	var a [64]*big.Int
-	for i := range a {
-		a[i] = new(big.Int).Lsh(big.NewInt(1), uint(i))
-	}
-	return a
-}()
 
 var collectionIndexWords = func() [64][32]byte {
 	var words [64][32]byte
@@ -1631,7 +1618,7 @@ func getUserPosition(state *generated.State, user common.Address, tokenID uint25
 }
 
 func getFixedProductMarketMakerPositionID(fpmm *generated.FixedProductMarketMaker, outcomeIndex uint8) uint256.Int {
-	collID := getCollectionID(common.Hash{}, fpmm.ConditionID, indexSetBig[outcomeIndex])
+	collID := getCollectionIDForOutcome(common.Hash{}, fpmm.ConditionID, outcomeIndex)
 	return getPositionID(fpmm.CollateralToken, collID)
 }
 

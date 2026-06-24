@@ -1056,3 +1056,108 @@ All implemented changes reproduce the exact 0xf totals
 351.559620338374832226376136). `go vet`, `go test ./internal/codegen`, and
 `go test ./coldcache` pass.
 
+---
+
+# confirm_optimization branch — findings C1–C3
+
+Second batch, validated on the same realistic harness (cold cache + isolated
+disposable ClickHouse + full 0xf05b67 replay).
+
+## C2 — hot handlers use the zero-alloc collection-ID fast path: implemented
+
+Four hot sites passed `indexSetBig[i]` (`*big.Int`) into `getCollectionID`,
+which routes through `bigIntTo32Bytes` → `v.Bytes()` (a `[]byte` allocation per
+call) on every split / merge / CTF-redemption / FPMM outcome:
+
+- `handlePositionSplit`, `handlePositionsMerge` (2 outcomes/event)
+- `handlePayoutRedemptionCTF` (per payout)
+- `getFixedProductMarketMakerPositionID` (per FPMM buy/sell/funding)
+
+All four now call the existing zero-alloc `getCollectionIDForOutcome(outcome)`,
+which indexes the precomputed `collectionIndexWords[outcome]` (`[32]byte`,
+no `big.Int`, no `.Bytes()`). The now-dead `indexSetBig` table was removed.
+
+- **Equivalence**: `TestC2CollectionIDEquivalence` proves
+  `getCollectionIDForOutcome(i)` is **byte-identical** to the old
+  `getCollectionID(1<<i)` for every outcome and condition (same index word →
+  same cache key → same ID).
+- **Realistic e2e profile diff** (`pprof -base`): `math/big.(*Int).Bytes`
+  **−210,328** alloc objects; `bigIntTo32Bytes` / `getCollectionID` no longer
+  appear as allocators.
+- **Correctness**: e2e totals byte-identical.
+
+`FEEDBACK.md` had claimed this migration was already done ("all use
+`getCollectionIDForOutcome` now") — the code contradicted it; now applied.
+**Retained.**
+
+## C3 — `HotState.Update*` per-Save mutex: measured, audited, not removed
+
+Every `state.*.Save()` → `UpdateMemoryUserPosition` takes `s.mu.Lock()` on the
+hottest write path.
+
+**Audit**: `s.mu` is acquired only by `Update*`, `Commit`, and the mark-dirty
+helpers — all on the single consumer goroutine. `recoverColdParallel` writes
+independent Pebble batches and never touches the hot ring or the dirty maps
+(matches GEN-003B). So the lock is **uncontended** in steady state.
+
+**Cost** (`BenchmarkUserPositionSave`, A/B by stripping the lock from the
+generated `UpdateMemoryUserPosition`):
+
+| Save | ns/op | allocs/op |
+|---|---:|---:|
+| with mutex (current) | ~59 | 0 |
+| without mutex | ~55 | 0 |
+
+**~4 ns/op (~7%), no allocation change.** A marginal CPU win against a real
+data-race hazard if the single-owner contract is ever violated (the exported
+`Update*`/`Commit` can be called by external code; the contract is
+single-owner-but-exported, exactly the GEN-003B caution). The change was staged
+on a separate `perf/cold-recovery-bloom` branch and still needs the full
+recovery/commit/rollback concurrency model + `-race` validation.
+
+**Decision**: not removed here. The marginal win does not justify the
+correctness risk without the gated concurrency testing. Documented with the
+audit + measurement so it can be finished safely on the perf branch.
+
+## C1 — redundant ABI decode in the proto-only producer: confirmed, not applicable here
+
+The producer's `ParseWithLine` callback ABI-decodes every log and does two
+`strings.Clone`, building `entry.events`. With `store_raw_logs: false`,
+`entry.events` is **not** inserted (`InsertLogs` is gated on
+`ShouldStoreRawLogs()`), and in a true proto-only run the consumer re-decodes
+the raw line via `ProcessJSONL` — so the generic decode is redundant.
+
+**But this redundancy does not occur in this checkout**, for two reasons found
+during confirmation:
+
+1. **No `ProcessJSONL` path here.** This polymarket example does **not**
+   implement `FastJSONLProcessor` (no `ProcessJSONL`), and `SQD_PARSE_DECODE_V2`
+   is unset, so `useParseDecodeV2` is **always false**. The consumer uses
+   `proc.Process(batchCustomLogs)` (proto decoding happens *inside* `Process`
+   from the CustomLogs), so the producer's decode feeds `blockCustomLogs` and is
+   **consumed**.
+2. **Typed-event insertion is ungated.** `buildTypedTableIndex` creates a
+   `<contract>_<event>_events` table for every configured event, and the
+   consumer's typed-event insertion loop is **not** gated by any config. The
+   same decode also populates `entry.typedEvents`. A safe skip therefore also
+   requires proving that, in a real proto-only config, typed-event insertion is
+   handled by the proto path rather than the producer's `blockTypedEvents` —
+   otherwise the typed tables silently stop being written.
+
+**Decision**: not implemented. C1 is a real optimization for the AHH/live
+proto-only (`ProcessJSONL`) ingestion path, but in this tree the skip would be
+dead, unexercisable code in core ingestion, and its safety depends on the typed-
+event-insertion behavior of a config that does not exist here. Recommend
+implementing + validating in the tree that runs proto-only mode, gating the skip
+on `useParseDecodeV2 && !ShouldStoreRawLogs() && <no typed tables, or typed
+insertion handled by the proto path>`, with a counter confirming both
+`entry.events` and `entry.typedEvents` are unused.
+
+## Summary (C1–C3)
+
+| Finding | Disposition | Measured effect |
+|---|---|---|
+| C1 producer decode skip | Confirmed, not applicable here | redundancy requires the `ProcessJSONL` path, absent in this checkout |
+| C2 collection-ID fast path | **Implemented** | −210k `big.Int.Bytes` alloc objects in the realistic e2e |
+| C3 Update* mutex | Measured, not removed | ~4 ns/op uncontended; gated on concurrency testing |
+
