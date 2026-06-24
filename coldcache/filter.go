@@ -2,7 +2,6 @@ package coldcache
 
 import (
 	"encoding/binary"
-	"sync/atomic"
 )
 
 // negFilter is a fixed-size, in-memory *blocked* Bloom filter used as a NEGATIVE
@@ -99,7 +98,7 @@ func (f *negFilter) add(key []byte) {
 	blk := &f.blocks[h&f.blockMask]
 	for i := uint(0); i < f.k; i++ {
 		bit := (h>>9 + uint64(i)*g) & (blockBits - 1)
-		atomic.OrUint64(&blk[bit>>6], 1<<(bit&63))
+		blk[bit>>6] |= 1 << (bit & 63)
 	}
 }
 
@@ -108,7 +107,7 @@ func (f *negFilter) mayContain(key []byte) bool {
 	blk := &f.blocks[h&f.blockMask]
 	for i := uint(0); i < f.k; i++ {
 		bit := (h>>9 + uint64(i)*g) & (blockBits - 1)
-		if atomic.LoadUint64(&blk[bit>>6])&(1<<(bit&63)) == 0 {
+		if blk[bit>>6]&(1<<(bit&63)) == 0 {
 			return false
 		}
 	}

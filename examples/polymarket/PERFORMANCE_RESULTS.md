@@ -849,3 +849,30 @@ Added comprehensive edge case tests in `custom_processor_math_test.go`:
 
 **Decision**: Retained. This is a correctness fix with no measurable performance impact on normal workload. Prevents O(N) collisions for collections with different parents.
 
+
+---
+
+## TASK-012: Remove bloom filter atomics — retained
+
+**Scope**: Performance optimization to eliminate atomic operations in single-writer bloom filter
+
+**Problem**: Bloom filter used `atomic.OrUint64` and `atomic.LoadUint64` despite contract stating single-writer (processor goroutine only).
+
+**Solution**: Removed atomic operations. Changed to direct bitwise operations: `blk[bit>>6] |= 1 << (bit & 63)`
+
+**Correctness**:
+- [x] 0xf replay passed (219,492 blocks, 506,599 events)
+- [x] Realized: 37.876088169187416774, Holdings: 313.683532169187415452376136, Net: 351.559620338374832226376136
+- [x] Runtime: 2.44s
+
+**Micro-benchmark** (200-block corpus):
+
+| Benchmark | Baseline median | Without atomics median | Delta |
+|---|---:|---:|---:|
+| ProcessProtoWarmState | 58.2 ms | 58.6 ms | ±0.7% (noise) |
+| ParseAndProcessProtoReuse | 188.0 ms | 186.7 ms | ±0.7% (noise) |
+| Bytes/op | 22,095,472 | 22,133,808 | +38,336 |
+| Allocs/op | 311,320 | 311,321 | +1 |
+
+**Decision**: Retained. Eliminates unnecessary atomic operations per single-writer contract. Improvement would be visible in cold cache scenarios (not measured in warm cache benchmark). The contract is documented in filter.go comments.
+
