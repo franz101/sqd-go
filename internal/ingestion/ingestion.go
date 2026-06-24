@@ -507,10 +507,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					bound, ok := parallelFinalizedBound(cursorMode, pBlock, lastFinalized, effectiveEndBlock)
 					switch {
 					case ok && bound >= pBlock+parallelMinSpan(parallelPageSize, parallelWorkers):
-						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, parallelPageSize, parallelWorkers, parallelLimiter)
+						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, uint64(parallelPageSize), parallelWorkers, parallelLimiter)
 						parallelBound.Store(bound)
 						prefetch.launch(pCtx)
-						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, page %d, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, prefetch.pageSize, parallelRPS, parallelSkipEmpties)
+						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, parallelRPS, parallelSkipEmpties)
 					case cursorMode && lastFinalized == 0:
 						// Finalized head not learned yet — the first sequential fetch
 						// will populate it. Retry on the next iteration; don't latch.
@@ -544,7 +544,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						if pCtx.Err() != nil {
 							return
 						}
-						log.Printf("Chain %d: parallel fetch error at [%d-%d]: %v; resuming sequential fetch", chain.ID, page.from, page.to, page.err)
+						log.Printf("Chain %d: parallel fetch error at [%d-%d]: %v; resuming sequential fetch", chain.ID, page.from, page.coveredTo, page.err)
 						prefetch = nil
 						parallelDone = true
 						pBlock = page.from
@@ -554,8 +554,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					pBlock = page.from
 					pHash = "" // finalized region: no parent-hash chaining
 					response = client.Response{Raw: page.raw, Head: page.head}
-					rangeLabel = fmt.Sprintf("[%d-%d]", page.from, page.to)
-					prefetchedTo = page.to
+					rangeLabel = fmt.Sprintf("[%d-%d]", page.from, page.coveredTo)
+					prefetchedTo = page.coveredTo
 					fromPrefetch = true
 				} else {
 					toBlockPtr, label, ok := nextProducerRequestRange(pBlock, pageSize, adaptivePageSize, lastFinalized, effectiveEndBlock, cursorMode)

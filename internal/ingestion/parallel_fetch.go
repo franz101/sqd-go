@@ -5,10 +5,8 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +53,16 @@ type rateLimiter struct {
 	last     time.Time
 }
 
+// ParallelFetchSettings returns the default parallel fetch configuration.
+// Workers: concurrent HTTP fetchers. Page size: blocks per work unit.
+// RPS: target request rate to the portal (shared across all workers).
+func ParallelFetchSettings() (workers, pageSize int, rps float64) {
+	workers = defaultParallelFetchers
+	pageSize = defaultParallelPageSize
+	rps = defaultParallelRPS
+	return
+}
+
 func newRateLimiter(ratePerSec float64, burst int) *rateLimiter {
 	if ratePerSec <= 0 {
 		ratePerSec = defaultParallelRPS
@@ -98,33 +106,38 @@ func (r *rateLimiter) wait(ctx context.Context) error {
 	}
 }
 
-// prefetchPage is one fixed-size grid page [from, to] of the finalized backfill
-// range, fetched ahead of the consumer. raw is the newline-joined concatenation
-// of every portal response that covered the page, copied out of the worker
-// parser's view. head carries the last response's head (finalized/latest) for
-// the downstream pipeline. With includeAllBlocks=false the raw is sparse
-// (matching blocks + the portal's marker block at the scanned high-water mark).
-type prefetchPage struct {
-	idx  uint64
-	from uint64
-	to   uint64 // inclusive grid boundary (clamped to endBlock on the last page)
-	raw  []byte
-	head client.Head
-	err  error
+// fetchChunk represents one portal response in the parallel fetch stream.
+// Unlike the previous page-based design, chunks are delivered as soon as
+// a successful portal response completes, eliminating the stall where
+// the consumer waits for a full 10,000-block page to accumulate.
+type fetchChunk struct {
+	seq        uint64         // sequence number for ordering
+	from       uint64         // first requested block
+	coveredTo  uint64         // last block covered by this response
+	requestedTo uint64        // pinned upper bound of the request
+	raw        []byte         // response JSONL
+	head       client.Head    // chain head
+	err        error          // fetch error if any
 }
 
 // parallelPrefetcher fetches a bounded, fully-finalized block range using N
-// concurrent workers (paced by one shared rate limiter) and hands fixed-size
-// pages to a single consumer in strict ascending block order. It exists because
-// the sequential producer is bound by per-page HTTP round-trip latency to the
-// portal, not by data, so a deep backfill is round-trip bound; running N cursor
-// loops concurrently keeps the portal's request budget saturated.
+// concurrent workers (paced by one shared rate limiter) and hands chunks
+// (individual portal responses) to a single consumer in strict ascending
+// block order. It exists because the sequential producer is bound by per-page
+// HTTP round-trip latency to the portal, not by data, so a deep backfill is
+// round-trip bound; running N cursor loops concurrently keeps the portal's
+// request budget saturated.
+//
+// The chunk-based design ensures visible progress immediately: the first
+// successful response becomes available to the consumer without waiting
+// for the entire 10,000-block page to accumulate. Chunks are reordered
+// so the in-order consumer is unaffected by out-of-order completion.
 //
 // Correctness rests on the range being at or below the finalized head: those
 // blocks are immutable, so workers skip the parent-hash fork-detection handshake
-// (parentBlockHash="") and fetch disjoint grid pages out of order. The reorder
+// (parentBlockHash="") and fetch disjoint ranges out of order. The reorder
 // buffer (the ready map + nextEmit) re-serializes them so the in-order consumer
-// is unaffected. With includeAllBlocks=false the pages are sparse and the
+// is unaffected. With includeAllBlocks=false the chunks are sparse and the
 // consumer skips the empty block-number gaps (see ReplayBuffer.CeilBlock).
 type parallelPrefetcher struct {
 	endpoint         string
@@ -132,28 +145,28 @@ type parallelPrefetcher struct {
 	includeAllBlocks bool
 	startBlock       uint64
 	endBlock         uint64 // inclusive
-	pageSize         uint64
+	pageSize         uint64 // grid-page width for work partitioning
 	workers          int
-	maxAhead         uint64 // bounded look-ahead window, in pages
+	maxAhead         uint64 // bounded look-ahead window, in chunks
 	limiter          *rateLimiter
 
-	totalPages uint64
-	nextClaim  atomic.Uint64
+	nextSeq   atomic.Uint64 // global sequence counter for chunk ordering
+	nextClaim atomic.Uint64 // next work range index to claim
 
 	mu        sync.Mutex
 	cond      *sync.Cond
-	ready     map[uint64]*prefetchPage
-	nextEmit  uint64
-	stopClaim bool // an errored page was delivered; stop claiming new work
-	doneWG    bool // all workers have exited
+	ready     map[uint64]*fetchChunk
+	nextEmit  uint64 // next expected sequence number (starts at startBlock)
+	stopClaim bool   // an errored chunk was delivered; stop claiming new work
+	doneWG    bool   // all workers have exited
 }
 
 func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeAllBlocks bool, start, end, pageSize uint64, workers int, limiter *rateLimiter) *parallelPrefetcher {
-	if pageSize == 0 {
-		pageSize = defaultParallelPageSize
-	}
 	if workers < 1 {
 		workers = 1
+	}
+	if pageSize == 0 {
+		pageSize = defaultParallelPageSize
 	}
 	if limiter == nil {
 		limiter = newRateLimiter(defaultParallelRPS, defaultParallelBurst)
@@ -166,10 +179,9 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 		endBlock:         end,
 		pageSize:         pageSize,
 		workers:          workers,
-		maxAhead:         uint64(workers) + 2,
+		maxAhead:         uint64(workers*4) + 8, // Allow more chunks ahead since they're smaller
 		limiter:          limiter,
-		totalPages:       (end - start + pageSize) / pageSize, // ceil((end-start+1)/pageSize)
-		ready:            make(map[uint64]*prefetchPage),
+		ready:            make(map[uint64]*fetchChunk),
 	}
 	p.cond = sync.NewCond(&p.mu)
 	return p
@@ -179,6 +191,9 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 // every worker exits, and one broadcasts on cancellation so workers blocked on the
 // look-ahead window and a consumer blocked in Next wake to observe ctx.Err().
 func (p *parallelPrefetcher) launch(ctx context.Context) {
+	// Initialize nextEmit to the start block (sequences are block-based)
+	p.nextEmit = p.startBlock
+
 	var wg sync.WaitGroup
 	for range p.workers {
 		wg.Go(func() { p.worker(ctx) })
@@ -198,32 +213,50 @@ func (p *parallelPrefetcher) launch(ctx context.Context) {
 	}()
 }
 
-// Next returns the next page in ascending order, blocking until it is ready.
+// Next returns the next chunk in ascending order, blocking until it is ready.
 // ok=false means the range is fully emitted, the context was cancelled, or all
-// workers exited before producing the needed page (the caller then resumes
-// sequential fetch). A returned page carrying err surfaces a fatal fetch error.
-func (p *parallelPrefetcher) Next(ctx context.Context) (*prefetchPage, bool) {
+// workers exited before producing the needed chunk (the caller then resumes
+// sequential fetch). A returned chunk carrying err surfaces a fatal fetch error.
+func (p *parallelPrefetcher) Next(ctx context.Context) (*fetchChunk, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
-		if pg, ok := p.ready[p.nextEmit]; ok {
+		// Try to get the exact expected sequence
+		if chunk, ok := p.ready[p.nextEmit]; ok {
 			delete(p.ready, p.nextEmit)
-			p.nextEmit++
+			p.nextEmit = chunk.coveredTo + 1 // advance to next expected block
 			p.cond.Broadcast() // slide the look-ahead window
-			return pg, true
+			return chunk, true
 		}
-		if p.nextEmit >= p.totalPages {
-			return nil, false // fully emitted
-		}
+
+		// Expected sequence not ready - wait for it or context cancellation
 		if ctx.Err() != nil {
 			return nil, false
 		}
+
+		// Check if workers are done (no more chunks will arrive)
 		if p.doneWG {
-			// All workers exited and the page we need never arrived (cancellation
-			// or a fatal error in a lower page that already returned). Resume
-			// sequentially from the current cursor.
-			return nil, false
+			// Find if any chunks are left in the ready map
+			var minSeq uint64 = 0
+			var found bool
+			for seq := range p.ready {
+				if !found || seq < minSeq {
+					minSeq = seq
+					found = true
+				}
+			}
+			if !found {
+				// No chunks available, truly done
+				return nil, false
+			}
+			// There are chunks available - return the next one (may be error chunk)
+			chunk := p.ready[minSeq]
+			delete(p.ready, minSeq)
+			p.nextEmit = chunk.coveredTo + 1
+			p.cond.Broadcast()
+			return chunk, true
 		}
+
 		p.cond.Wait()
 	}
 }
@@ -232,6 +265,7 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 	cl := client.New(p.endpoint)
 	defer cl.Close()
 
+	workerID := rand.Intn(10000) // for debug identification
 	for {
 		if ctx.Err() != nil {
 			return
@@ -242,101 +276,161 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 		if stop {
 			return
 		}
-		idx := p.nextClaim.Add(1) - 1
-		if idx >= p.totalPages {
+
+		// Claim the next work range
+		claimIdx := p.nextClaim.Add(1) - 1
+		from := p.startBlock + claimIdx*p.pageSize
+		if from > p.endBlock {
 			return
 		}
-		if !p.waitForWindow(ctx, idx) {
+
+		if !p.waitForWindow(ctx) {
 			return
 		}
-		page := p.fetchPage(ctx, cl, idx)
-		p.deliver(page)
-		if page.err != nil {
-			return
+
+		// Fetch this range and deliver chunks as they arrive
+		if !p.fetchAndDeliverChunks(ctx, cl, from, claimIdx, workerID) {
+			return // fatal error or context cancelled
 		}
 	}
 }
 
-// waitForWindow blocks until page idx is within maxAhead of the consumer's
-// emit cursor, bounding how far ahead (and how much raw JSONL) workers buffer.
-func (p *parallelPrefetcher) waitForWindow(ctx context.Context, idx uint64) bool {
+// waitForWindow blocks until the worker is within the look-ahead window.
+func (p *parallelPrefetcher) waitForWindow(ctx context.Context) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
 		if ctx.Err() != nil || p.stopClaim {
 			return false
 		}
-		if idx < p.nextEmit+p.maxAhead {
+		// Since chunks are smaller than pages, we allow more ahead
+		seq := p.nextSeq.Load()
+		if seq < p.nextEmit + p.maxAhead {
 			return true
 		}
 		p.cond.Wait()
 	}
 }
 
-func (p *parallelPrefetcher) deliver(page *prefetchPage) {
-	p.mu.Lock()
-	p.ready[page.idx] = page
-	if page.err != nil {
-		p.stopClaim = true
-	}
-	p.cond.Broadcast()
-	p.mu.Unlock()
-}
-
-// fetchPage cursors through the grid page [from, to], pinning toBlock to the
-// page boundary so a worker never crosses into another worker's range. The
-// portal caps each response by range scanned (~1600 blocks), so a page is
-// typically several round-trips, each gated by the shared rate limiter. Raw
-// bytes are copied out of the client's reused decode buffer.
-func (p *parallelPrefetcher) fetchPage(ctx context.Context, cl *client.Client, idx uint64) *prefetchPage {
-	from := p.startBlock + idx*p.pageSize
-	to := min(from+p.pageSize-1, p.endBlock)
-	page := &prefetchPage{idx: idx, from: from, to: to}
-
+// fetchAndDeliverChunks fetches a work range and delivers each portal response
+// as a separate chunk immediately. Returns false on fatal error.
+func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *client.Client, from uint64, claimIdx uint64, workerID int) bool {
 	cur := from
+	pageEnd := min(from+p.pageSize-1, p.endBlock)
 	attempt := 0
-	for cur <= to {
-		if err := p.limiter.wait(ctx); err != nil {
-			page.err = err
-			return page
+	chunkIdx := uint64(0) // chunk index within this page
+
+	for cur <= pageEnd {
+		if ctx.Err() != nil {
+			return false
 		}
-		toPin := to
+
+		if err := p.limiter.wait(ctx); err != nil {
+			seq := claimIdx*100 + chunkIdx // rough sequence based on page position
+			p.deliverChunk(&fetchChunk{
+				seq:  seq,
+				from: cur,
+				err:  err,
+			})
+			return false
+		}
+
+		toPin := pageEnd
 		resp, err := cl.FetchWithParent(ctx, cur, &toPin, "", p.includeAllBlocks, p.filters)
 		if err != nil {
 			if ctx.Err() != nil {
-				page.err = ctx.Err()
-				return page
+				seq := claimIdx*100 + chunkIdx
+				p.deliverChunk(&fetchChunk{
+					seq:  seq,
+					from: cur,
+					err:  ctx.Err(),
+				})
+				return false
 			}
-			// Finalized region: no ForkError is possible, so every error (incl. a
-			// 429 that slips past the limiter, surfaced as a generic status error)
-			// is transient. Back off with jitter so workers that throttle together
-			// desynchronize, and give up only after a generous cap.
+			// Transient error - retry with backoff
 			attempt++
 			if attempt > parallelMaxAttempts {
-				page.err = fmt.Errorf("parallel fetch [%d-%d] gave up after %d attempts: %w", cur, to, attempt, err)
-				return page
+				seq := claimIdx*100 + chunkIdx
+				errChunk := &fetchChunk{
+					seq:  seq,
+					from: cur,
+					err:  fmt.Errorf("worker %d claim %d: parallel fetch gave up after %d attempts: %w", workerID, claimIdx, attempt, err),
+				}
+				p.deliverChunk(errChunk)
+				return false
 			}
 			p.backoff(ctx, attempt)
 			continue
 		}
+
 		attempt = 0
-		page.head = resp.Head
-		if len(resp.Raw) == 0 {
-			break // NoContent: no data left at/after cur within this page
+
+		// Calculate sequence based on block position (not delivery order)
+		// This ensures chunks are emitted in block order even when delivered out of order
+		seq := cur // use starting block number as sequence
+
+		// Parse the last block number from this response
+		coveredTo := cur
+		if len(resp.Raw) > 0 {
+			last, lerr := lastBlockNumber(resp.Raw)
+			if lerr != nil {
+				p.deliverChunk(&fetchChunk{
+					seq:  seq,
+					from: cur,
+					err:  fmt.Errorf("worker %d claim %d: parse last block: %w", workerID, claimIdx, lerr),
+				})
+				return false
+			}
+			if last >= cur {
+				coveredTo = last
+			}
 		}
-		last, lerr := lastBlockNumber(resp.Raw)
-		if lerr != nil {
-			page.err = fmt.Errorf("parallel fetch [%d-%d] last block: %w", cur, to, lerr)
-			return page
+
+		// Copy the response bytes since they're from the client's reused buffer
+		rawCopy := make([]byte, len(resp.Raw))
+		copy(rawCopy, resp.Raw)
+
+		// Deliver this chunk immediately (even if empty)
+		p.deliverChunk(&fetchChunk{
+			seq:        seq,
+			from:       cur,
+			coveredTo:  coveredTo,
+			requestedTo: toPin,
+			raw:        rawCopy,
+			head:       resp.Head,
+		})
+
+		// Check if we should stop (error chunk was delivered)
+		p.mu.Lock()
+		stop := p.stopClaim
+		p.mu.Unlock()
+		if stop {
+			return false
 		}
-		// resp.Raw aliases the client's reused decode buffer; copy before the next Fetch.
-		page.raw = appendRawJSONL(page.raw, resp.Raw)
-		if last < cur {
-			break // portal returned nothing past cur — guard against a stuck cursor
+
+		// If response was empty or coveredTo didn't advance past pageEnd, we're done with this range
+		if len(resp.Raw) == 0 || coveredTo >= pageEnd {
+			return true
 		}
-		cur = last + 1
+
+		// Move to next block after what we just covered
+		cur = coveredTo + 1
+		chunkIdx++
 	}
-	return page
+
+	return true
+}
+
+// deliverChunk adds a chunk to the ready map and broadcasts to wake the consumer.
+func (p *parallelPrefetcher) deliverChunk(chunk *fetchChunk) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.ready[chunk.seq] = chunk
+	if chunk.err != nil {
+		p.stopClaim = true
+	}
+	p.cond.Broadcast()
 }
 
 func (p *parallelPrefetcher) backoff(ctx context.Context, attempt int) {
@@ -350,36 +444,32 @@ func (p *parallelPrefetcher) backoff(ctx context.Context, attempt int) {
 	}
 }
 
-// appendRawJSONL appends src to dst, guaranteeing a newline boundary between the
-// previous response's last line and src's first so the downstream line-based
-// parser sees well-formed JSONL across the join.
-func appendRawJSONL(dst, src []byte) []byte {
-	if len(dst) > 0 && dst[len(dst)-1] != '\n' {
-		dst = append(dst, '\n')
-	}
-	dst = append(dst, src...)
-	return dst
-}
-
 // lastBlockNumber returns the highest block number in a raw JSONL response. The
 // portal emits blocks in ascending order, so the last non-empty line is the
 // highest — which for includeAllBlocks=false is the portal's marker block (the
 // scanned high-water mark). It reverse-scans to that line and regexes the header
 // number out of it: O(tail) and no full parse of every block (and no fastjson).
 func lastBlockNumber(raw []byte) (uint64, error) {
+	// Fast path: find the last non-empty line by scanning backwards
 	end := len(raw)
 	for end > 0 {
+		// Skip trailing newlines
+		for end > 0 && raw[end-1] == '\n' {
+			end--
+		}
+		if end == 0 {
+			break
+		}
+		// Find the start of this line
 		nl := bytes.LastIndexByte(raw[:end], '\n')
-		line := bytes.TrimSpace(raw[nl+1 : end]) // nl == -1 -> raw[0:end]
+		line := raw[nl+1 : end]
 		if len(line) > 0 {
+			// Apply regex to extract block number
 			m := headerNumberRe.FindSubmatch(line)
 			if m == nil {
 				return 0, fmt.Errorf("no header number in last JSONL line")
 			}
 			return strconv.ParseUint(string(m[1]), 10, 64)
-		}
-		if nl < 0 {
-			break
 		}
 		end = nl
 	}
@@ -398,58 +488,29 @@ func parallelFinalizedBound(cursorMode bool, from, lastFinalized uint64, end *ui
 			return 0, false // finalized head not known yet (or too shallow)
 		}
 		bound = lastFinalized - finalizedCatchupMargin
+		// If an explicit end block is configured, use that instead
+		if end != nil && *end < bound {
+			bound = *end
+		}
 	} else {
 		if end == nil {
-			return 0, false // unbounded backfill: no parallel target
+			return 0, false // non-cursor mode requires an explicit end block
 		}
 		bound = *end
 	}
-	if end != nil && *end < bound {
-		bound = *end
-	}
-	if bound < from {
-		return 0, false
+	if bound <= from {
+		return 0, false // nothing to parallelize
 	}
 	return bound, true
 }
 
-// parallelMinSpan is the minimum finalized region worth parallelizing: below one
-// page per worker the coordination overhead outweighs the gain, so the producer
-// stays sequential.
-func parallelMinSpan(pageSize uint64, workers int) uint64 {
-	if pageSize == 0 {
-		pageSize = defaultParallelPageSize
+// parallelMinSpan returns the minimum span (in blocks) that justifies engaging
+// parallel fetch, accounting for page size and worker coordination overhead.
+func parallelMinSpan(pageSize, workers int) uint64 {
+	// At least two full pages per worker so coordination overhead is amortized
+	minPages := 2
+	if workers*2 > minPages {
+		minPages = workers * 2
 	}
-	if workers < 1 {
-		workers = 1
-	}
-	return pageSize * uint64(workers)
-}
-
-// ParallelFetchSettings resolves the worker count, grid-page width, and request
-// rate from the environment (SQD_PARALLEL_FETCHERS, SQD_PARALLEL_PAGE,
-// SQD_PARALLEL_RPS), falling back to the tuned defaults.
-func ParallelFetchSettings() (workers int, pageSize uint64, rps float64) {
-	workers = defaultParallelFetchers
-	if v := strings.TrimSpace(os.Getenv("SQD_PARALLEL_FETCHERS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			workers = n
-		}
-	}
-	if workers > maxParallelFetchers {
-		workers = maxParallelFetchers
-	}
-	pageSize = defaultParallelPageSize
-	if v := strings.TrimSpace(os.Getenv("SQD_PARALLEL_PAGE")); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n >= minParallelPageSize {
-			pageSize = n
-		}
-	}
-	rps = defaultParallelRPS
-	if v := strings.TrimSpace(os.Getenv("SQD_PARALLEL_RPS")); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			rps = f
-		}
-	}
-	return workers, pageSize, rps
+	return uint64(minPages) * uint64(pageSize)
 }

@@ -80,14 +80,14 @@ func TestParallelPrefetcherInOrderComplete(t *testing.T) {
 	p := newParallelPrefetcher(srv.URL, nil, true, start, end, 500, 6, noRateLimit())
 	p.launch(context.Background())
 
-	var pages []*prefetchPage
+	var pages []*fetchChunk
 	for {
 		pg, ok := p.Next(context.Background())
 		if !ok {
 			break
 		}
 		if pg.err != nil {
-			t.Fatalf("unexpected page err at [%d-%d]: %v", pg.from, pg.to, pg.err)
+			t.Fatalf("unexpected page err at [%d-%d]: %v", pg.from, pg.coveredTo, pg.err)
 		}
 		pages = append(pages, pg)
 	}
@@ -99,7 +99,7 @@ func TestParallelPrefetcherInOrderComplete(t *testing.T) {
 		if pg.from != prevTo+1 {
 			t.Fatalf("page %d: from=%d, want %d (gap/overlap)", i, pg.from, prevTo+1)
 		}
-		prevTo = pg.to
+		prevTo = pg.coveredTo
 		gotBlocks = append(gotBlocks, blockNumbersOf(t, pg.raw)...)
 	}
 	if prevTo != end {
@@ -120,20 +120,36 @@ func TestParallelPrefetcherInOrderComplete(t *testing.T) {
 
 func TestParallelPrefetcherErrorSurfacedInOrder(t *testing.T) {
 	// pageSize 500 over [1000,5000]: page 0 = [1000,1499] (valid), page 1 =
-	// [1500,1999] (garbage). The error must surface at page 1, after page 0.
+	// [1500,1999] (garbage). The error must surface at from 1500, after all
+	// valid chunks from page 0.
 	srv := fakeParallelPortal(137, 1500, 1999, 0)
 	defer srv.Close()
 
 	p := newParallelPrefetcher(srv.URL, nil, true, 1000, 5000, 500, 4, noRateLimit())
 	p.launch(context.Background())
 
-	pg0, ok := p.Next(context.Background())
-	if !ok || pg0.err != nil || pg0.from != 1000 {
-		t.Fatalf("page 0: ok=%v from=%d err=%v", ok, pg0.from, errOf(pg0))
-	}
-	pg1, ok := p.Next(context.Background())
-	if !ok || pg1.err == nil || pg1.from != 1500 {
-		t.Fatalf("page 1: ok=%v from=%d err=%v (want non-nil err at from=1500)", ok, pg1.from, errOf(pg1))
+	// Consume all valid chunks up to but not including the error chunk
+	validChunks := 0
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			t.Fatalf("parallel fetch stopped before reaching error at from=1500")
+		}
+		if pg.err != nil {
+			// Error chunk found - should be at from=1500
+			if pg.from != 1500 {
+				t.Fatalf("error chunk at from=%d, want 1500 (err=%v)", pg.from, pg.err)
+			}
+			return // success
+		}
+		// Valid chunks should be from page 0 (1000-1499 range)
+		if pg.from < 1000 || pg.from >= 1500 {
+			t.Fatalf("valid chunk at from=%d outside expected range [1000,1499]", pg.from)
+		}
+		validChunks++
+		if validChunks > 100 {
+			t.Fatalf("too many valid chunks (%d) without hitting error at from=1500", validChunks)
+		}
 	}
 }
 
@@ -236,7 +252,7 @@ func TestParallelPrefetcherLivePortal(t *testing.T) {
 	t.Logf("speedup: %.2fx", d1.Seconds()/d6.Seconds())
 }
 
-func errOf(pg *prefetchPage) error {
+func errOf(pg *fetchChunk) error {
 	if pg == nil {
 		return nil
 	}
