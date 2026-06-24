@@ -53,35 +53,18 @@ package generated
 }
 
 func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
-	host := os.Getenv("CLICKHOUSE_HOST")
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	port := 9000
-	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			port = p
-		}
-	}
-	user := os.Getenv("CLICKHOUSE_USER")
-	if user == "" {
-		user = "default"
-	}
+	host, user, password, _, port := envconfig.ClickHouse("default")
 	return ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
 		Database: "default",
 		User:     user,
-		Password: os.Getenv("CLICKHOUSE_PASSWORD"),
+		Password: password,
 	})
 }
 
 func recoveryRecencyClause() string {
-	v := os.Getenv("SQD_RECOVERY_MIN_BLOCK")
-	if v == "" {
-		return ""
-	}
-	mb, err := strconv.ParseUint(v, 10, 64)
-	if err != nil || mb == 0 {
+	mb := envconfig.RecoveryMinBlockNumber()
+	if mb == 0 {
 		return ""
 	}
 	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " >= " + strconv.FormatUint(mb, 10)
@@ -201,22 +184,22 @@ feed:
 
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
-		`"context"`:                              "",
-		`"encoding/binary"`:                      "",
-		`"fmt"`:                                  "",
-		`"strings"`:                              "",
-		`"sync"`:                                 "",
-		`"sync/atomic"`:                          "",
-		`"github.com/ClickHouse/ch-go"`:          "",
-		`"github.com/ClickHouse/ch-go/proto"`:    "",
-		`"github.com/franz101/sqd-go/coldcache"`: "",
+		`"context"`:                                         "",
+		`"encoding/binary"`:                                 "",
+		`"fmt"`:                                             "",
+		`"strings"`:                                         "",
+		`"sync"`:                                            "",
+		`"sync/atomic"`:                                     "",
+		`"github.com/ClickHouse/ch-go"`:                     "",
+		`"github.com/ClickHouse/ch-go/proto"`:               "",
+		`"github.com/franz101/sqd-go/coldcache"`:            "",
+		`"github.com/franz101/sqd-go/internal/envconfig"`: "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""
 		imports[`"math/big"`] = ""
 	}
 	if len(tables) > 0 {
-		imports[`"os"`] = ""
 		imports[`"strconv"`] = ""
 		imports[`"time"`] = ""
 	}

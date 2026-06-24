@@ -31,6 +31,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
 // Default off-heap budgets. Both are hard caps; steady-state RSS ≈ Cache +
@@ -122,17 +123,8 @@ func (s *Store) EnableNegativeFilter(bitBudget uint64) {
 }
 
 func defaultNegativeFilterBits() uint64 {
-	if v := os.Getenv("SQD_COLDFILTER_BITS"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-			return n
-		}
-	}
-	if v := os.Getenv("SQD_BLOOM_KEYS"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-			return n * 10
-		}
-	}
-	return 1 << 31
+	// Use envconfig for centralized environment variable management
+	return uint64(envconfig.ColdFilterSize()) * 10
 }
 
 // FilterSkips returns how many Pebble Gets the negative filter has avoided.
@@ -146,26 +138,20 @@ func (s *Store) FilterSkips() uint64 {
 // Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
 // cacheBytes/memTableBytes <= 0 fall back to the defaults.
 func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
-	if os.Getenv("SQD_COLDCACHE_BACKEND") == "flat" {
+	if envconfig.ColdCacheBackendType() == "flat" {
 		budget := cacheBytes
 		if budget <= 0 {
-			if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
-				budget = mb << 20
-			} else {
-				budget = defaultCacheBytes()
-			}
+			budget = envconfig.ColdCacheSize()
 		}
 		log.Printf("cold tier: in-RAM flat backend, budget %d MiB (SQD_COLDCACHE_BACKEND=flat)", budget>>20)
 		return &Store{flat: newFlatcoldBudget(budget), dir: dir}, nil
 	}
 	if cacheBytes <= 0 {
-		if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
-			cacheBytes = mb << 20
-		} else {
-			cacheBytes = defaultCacheBytes()
-		}
-		log.Printf("cold tier: block cache %d MiB (override with SQD_COLDCACHE_MB)", cacheBytes>>20)
+		cacheBytes = envconfig.ColdCacheSize()
+	} else {
+		cacheBytes = defaultCacheBytes()
 	}
+	log.Printf("cold tier: block cache %d MiB (override with SQD_COLDCACHE_MB)", cacheBytes>>20)
 	if memTableBytes == 0 {
 		memTableBytes = DefaultMemTableSize
 	}
@@ -187,7 +173,7 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 	}
 
 	// Apply optimization profile from environment
-	if optim := os.Getenv("SQD_COLDCACHE_OPTIM"); optim != "" {
+	if optim := envconfig.ColdCacheOptimizationProfile(); optim != "" {
 		switch optim {
 		case "largemem", "mixed":
 			// 64MB memtables with aggressive flush: +13% on mixed workloads

@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -23,6 +22,7 @@ import (
 
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
+	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
 const (
@@ -76,15 +76,10 @@ var (
 // SQD_METRICS_CH is set; otherwise it is a no-op and Observe stays inert.
 // SQD_METRICS_CH_INTERVAL (e.g. "2s") overrides the 5s sampling cadence.
 func Start(ctx context.Context, cfg Config) {
-	if os.Getenv("SQD_METRICS_CH") == "" {
+	if !envconfig.MetricsCHEnabled() {
 		return
 	}
-	interval := defaultInterval
-	if v := os.Getenv("SQD_METRICS_CH_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			interval = d
-		}
-	}
+	interval := envconfig.MetricsCHFlushInterval()
 
 	conn, err := ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
@@ -353,10 +348,9 @@ TTL toDateTime(ts) + INTERVAL ` + ttlDays() + ` DAY`
 // ttlDays returns the retention window for the metrics table (default 7 days),
 // overridable via SQD_METRICS_CH_TTL_DAYS.
 func ttlDays() string {
-	if v := os.Getenv("SQD_METRICS_CH_TTL_DAYS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return strconv.Itoa(n)
-		}
+	ttl := envconfig.MetricsCHTTL() / (24 * time.Hour)
+	if ttl <= 0 {
+		return "7"
 	}
-	return "7"
+	return strconv.Itoa(int(ttl))
 }

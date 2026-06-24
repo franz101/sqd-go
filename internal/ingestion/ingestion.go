@@ -18,6 +18,7 @@ import (
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/database"
+	"github.com/franz101/sqd-go/internal/envconfig"
 	"github.com/franz101/sqd-go/internal/monitoring"
 	"github.com/franz101/sqd-go/internal/parser"
 )
@@ -360,8 +361,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
 	}
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
-	useParseDecodeV2 := os.Getenv("SQD_PARSE_DECODE_V2") != "" && fastJSONLOK
-	if os.Getenv("SQD_PARSE_DECODE_V2") != "" && !fastJSONLOK {
+	useParseDecodeV2 := envconfig.ParseDecodeV2Enabled() && fastJSONLOK
+	if envconfig.ParseDecodeV2Enabled() && !fastJSONLOK {
 		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 requested, but processor does not implement FastJSONLProcessor; using default processor path", chain.ID)
 	}
 	if useParseDecodeV2 {
@@ -1432,7 +1433,7 @@ func minEndBlock(current *uint64, candidate uint64) *uint64 {
 func chainEndpoint(chainID uint64, hot bool) string {
 	// Allow overriding the portal endpoint (e.g. a local mock or mirror) for
 	// integration testing the full ingestion pipeline against fixture data.
-	if v := os.Getenv("SQD_PORTAL_ENDPOINT"); v != "" {
+	if v := envconfig.PortalEndpointURL(); v != "" {
 		return v
 	}
 	suffix := "/finalized-stream"

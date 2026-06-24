@@ -112,25 +112,7 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 		return nil
 	}
 
-	host := os.Getenv("CLICKHOUSE_HOST")
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	port := 9000
-	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			port = p
-		}
-	}
-	user := os.Getenv("CLICKHOUSE_USER")
-	if user == "" {
-		user = "default"
-	}
-	password := os.Getenv("CLICKHOUSE_PASSWORD")
-	db := os.Getenv("CLICKHOUSE_DATABASE")
-	if db == "" {
-		db = ProjectName
-	}
+	host, user, password, db, port := envconfig.ClickHouse(ProjectName)
 
 	conn, err := ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
@@ -331,12 +313,11 @@ func findHotStateSpec(specs []hotStateSpec, table customTableSpec) (hotStateSpec
 
 func renderStateImports(b *bytes.Buffer, handles []stateHandleSpec) {
 	imports := map[string]struct{}{
-		`"context"`:                     {},
-		`"fmt"`:                         {},
-		`"os"`:                          {},
-		`"strconv"`:                     {},
-		`"sync"`:                        {},
-		`"github.com/ClickHouse/ch-go"`: {},
+		`"context"`:                               {},
+		`"fmt"`:                                   {},
+		`"sync"`:                                  {},
+		`"github.com/ClickHouse/ch-go"`:           {},
+		`"github.com/franz101/sqd-go/internal/envconfig"`: {},
 	}
 	for _, handle := range handles {
 		for _, field := range handle.spec.table.keyFields() {

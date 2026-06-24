@@ -265,12 +265,11 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"context"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"strconv"
 	"time"
 	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/franz101/sqd-go/internal/envconfig"
 	"github.com/franz101/sqd-go/sqd"
 )
 
@@ -444,18 +443,8 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 	//     clock). Dominates at the head.
 	// This replaces the single magic block interval: the checkpoint never leads the
 	// durable horizon, and the gap is bounded in both blocks and wall-clock time.
-	maxBlocks := uint64(5000)
-	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
-		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
-			maxBlocks = parsed
-		}
-	}
-	maxInterval := 3 * time.Second
-	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
-		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
-			maxInterval = parsed
-		}
-	}
+	maxBlocks := uint64(envconfig.CommitIntervalBlocks())
+	maxInterval := time.Duration(envconfig.CommitMaxIntervalSeconds()) * time.Second
 
 	nowNanos := time.Now().UnixNano()
 	if state.lastCommitWallNanos == 0 {
@@ -470,14 +459,7 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 			return err
 		}
 
-		pruneInterval := uint64(100000)
-		if envVal := os.Getenv("CLICKHOUSE_PRUNE_INTERVAL"); envVal != "" {
-			parsed, err := strconv.ParseUint(envVal, 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid CLICKHOUSE_PRUNE_INTERVAL %q: %w", envVal, err)
-			}
-			pruneInterval = parsed
-		}
+		pruneInterval := envconfig.PruneIntervalBlocks()
 		if blockNumber >= state.LastPruneBlock+pruneInterval {
 			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
 				return fmt.Errorf("prune ClickHouse state at block %d: %w", blockNumber, err)
