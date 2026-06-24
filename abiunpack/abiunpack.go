@@ -5,6 +5,23 @@ import (
 	"github.com/holiman/uint256"
 )
 
+var hexNibble = func() [256]byte {
+	var table [256]byte
+	for i := range table {
+		table[i] = 0xff
+	}
+	for c := byte('0'); c <= '9'; c++ {
+		table[c] = c - '0'
+	}
+	for c := byte('a'); c <= 'f'; c++ {
+		table[c] = c - 'a' + 10
+	}
+	for c := byte('A'); c <= 'F'; c++ {
+		table[c] = c - 'A' + 10
+	}
+	return table
+}()
+
 // AppendHexBytes appends the bytes represented by s to dst.
 // It matches common.FromHex for valid event data, including optional 0x
 // prefixes and odd-length input, while allowing callers to reuse dst.
@@ -83,6 +100,17 @@ func AddressFromHex(s string) common.Address {
 	return common.HexToAddress(s)
 }
 
+// HashFromHex decodes a 32-byte hex string (with optional 0x prefix) into a
+// common.Hash without allocating. It falls back to common.HexToHash for
+// irregular inputs to preserve go-ethereum behavior.
+func HashFromHex(s string) common.Hash {
+	var hash common.Hash
+	if decodeCanonicalHash(s, hash[:]) {
+		return hash
+	}
+	return common.HexToHash(s)
+}
+
 func decodeCanonicalAddress(s string, dst []byte) bool {
 	if len(dst) != common.AddressLength {
 		return false
@@ -94,6 +122,30 @@ func decodeCanonicalAddress(s string, dst []byte) bool {
 		return false
 	}
 	for i := 0; i < common.AddressLength; i++ {
+		hi, ok := fromHexChar(s[i*2])
+		if !ok {
+			return false
+		}
+		lo, ok := fromHexChar(s[i*2+1])
+		if !ok {
+			return false
+		}
+		dst[i] = hi<<4 | lo
+	}
+	return true
+}
+
+func decodeCanonicalHash(s string, dst []byte) bool {
+	if len(dst) != common.HashLength {
+		return false
+	}
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		s = s[2:]
+	}
+	if len(s) != common.HashLength*2 {
+		return false
+	}
+	for i := 0; i < common.HashLength; i++ {
 		hi, ok := fromHexChar(s[i*2])
 		if !ok {
 			return false
@@ -129,40 +181,12 @@ func DecodeTopicFixedBytes(topic string, dst []byte, n int) {
 }
 
 func decodeCanonicalTopic(topic string, dst []byte) bool {
-	if len(dst) != common.HashLength {
-		return false
-	}
-	if len(topic) >= 2 && topic[0] == '0' && (topic[1] == 'x' || topic[1] == 'X') {
-		topic = topic[2:]
-	}
-	if len(topic) != common.HashLength*2 {
-		return false
-	}
-	for i := 0; i < common.HashLength; i++ {
-		hi, ok := fromHexChar(topic[i*2])
-		if !ok {
-			return false
-		}
-		lo, ok := fromHexChar(topic[i*2+1])
-		if !ok {
-			return false
-		}
-		dst[i] = hi<<4 | lo
-	}
-	return true
+	return decodeCanonicalHash(topic, dst)
 }
 
 func fromHexChar(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	default:
-		return 0, false
-	}
+	v := hexNibble[c]
+	return v, v != 0xff
 }
 
 // Word returns the 32-byte word at the given word index.
