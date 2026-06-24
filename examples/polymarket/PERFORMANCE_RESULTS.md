@@ -1194,3 +1194,35 @@ and every topic, in both the proto and non-proto code paths.
 `FromHex(lg.Data)` (~0.5M) plus `AppendFromLog`'s inline constant topic hashing
 (next).
 
+## HEX-2 — hoist `AppendFromLog` dispatch constants to package vars: implemented
+
+After HEX-1, the largest remaining allocator was the generated `AppendFromLog`
+dispatch (`internal/codegen/views.go`): each call re-ran `common.HexToHash("0x…")`
+for the topic0 comparison **and** `toLowerASCII(address.Hex())` for the contract
+address comparison, per event group, per log. The codegen template now:
+
+- precomputes one `_aflTopicN = common.HexToHash(...)` and
+  `_aflAddrN_M_K = common.HexToAddress(...)` package var per dispatch constant
+  (hashed/decoded once at init), and
+- compares the address by value (`address == _aflAddrN_M_K`) instead of building
+  and lowercasing the checksum hex string on every call.
+
+- **Realistic e2e profile diff** (`pprof -base`): `hex.DecodeString`
+  **−4,546,618**, `common.Address.Hex`/`.hex`/`checksumHex` **−1.27M**.
+  **Total allocations 15,702,697 → 9,623,824 (−6.08M, −38.7%).**
+- **Correctness**: e2e totals byte-identical; `go test ./internal/codegen` passes.
+
+### Parse-path squeeze — cumulative
+
+| Stage | Total alloc objects (realistic e2e) | Δ |
+|---|---:|---:|
+| Before (post C2/C4/C6/C8) | 18,954,540 | — |
+| + HEX-1 (Process hex helpers) | 15,702,697 | −17.2% |
+| + HEX-2 (AppendFromLog hoist) | 9,623,824 | −38.7% |
+| **Cumulative** | **9,623,824** | **−49.2%** |
+
+Both changes are codegen-template-only, reproduce the exact 0xf totals, and the
+remaining `common.FromHex(lg.Data)` (variable-length log data) is the next
+candidate (it needs a reusable decode buffer whose lifetime matches
+`AppendFromLog`, so it is left for a separately-validated change).
+
