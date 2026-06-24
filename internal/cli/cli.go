@@ -18,6 +18,7 @@ type parsedArgs struct {
 	restart       bool
 	noColdCache   bool
 	parallelFetch bool
+	prefetch      bool
 	state         bool
 	protoMode     bool
 	reindexFrom   string
@@ -93,6 +94,8 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.noColdCache = true
 		case "--parallel-fetch":
 			p.parallelFetch = true
+		case "--prefetch":
+			p.prefetch = true
 		case "--state":
 			p.state = true
 		case "-p", "--pagesize":
@@ -183,14 +186,14 @@ func Run(args []string) int {
 		if p.state && os.Getenv(stateChildEnv) == "" {
 			return runStateRebuild(args, p.project)
 		}
-		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
 
 	case "stop":
 		return runStop()
@@ -209,7 +212,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
 	}
 }
 
@@ -344,6 +347,11 @@ Flags:
 	  --reindex-from        (start/dev) Delete all blocks above the specified block using lightweight
 	                       DELETE and resume indexing from that block. Data at or below this block is
 	                       preserved. Useful for reindexing after a contract fix.
+  --prefetch            (start/dev) Two-pass batch prefetch: dispatch each block once to collect its
+                       hot-state read-set, resolve the misses in one ClickHouse SELECT per entity, then
+                       process for real against a warm cache. Collapses the lazy path's
+                       one-SELECT-per-missing-key into one per entity per block. Off by default; most
+                       useful in resume mode against a populated ClickHouse.
 
 Examples:
   sqd-go

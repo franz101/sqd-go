@@ -435,6 +435,19 @@ func renderStateHandleGetValue(b *bytes.Buffer, handle stateHandleSpec) {
 		b.WriteString(lowerFirst(field.Name))
 	}
 	b.WriteString("}\n")
+	// Prefetch dry-run: while recordMode is set, just queue the missing key for the
+	// batched ResolveAllPending and return a miss. The per-key synchronous Resolve
+	// below is skipped — that is the whole point of prefetch (one round-trip per
+	// entity per block instead of one per missing key). The second (apply) pass runs
+	// with recordMode off and keeps the lazy fallback for any key the dry run missed.
+	b.WriteString("\t\t\tif h.state.HotState.recordMode {\n")
+	b.WriteString("\t\t\t\th.state.HotState.")
+	b.WriteString(handle.spec.baseName)
+	b.WriteString("Resolver.Queue(key)\n")
+	b.WriteString("\t\t\t\treturn ")
+	b.WriteString(handle.valueName)
+	b.WriteString("{}, false\n")
+	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t\th.state.HotState.")
 	b.WriteString(handle.spec.baseName)
 	b.WriteString("Resolver.Queue(key)\n")
@@ -490,6 +503,10 @@ func renderStateHandleSave(b *bytes.Buffer, handle stateHandleSpec) {
 	b.WriteString(handle.valueName)
 	b.WriteString(", meta EventMeta) {\n")
 	b.WriteString("\tif h.state == nil || h.state.HotState == nil || value == nil {\n\t\treturn\n\t}\n")
+	// Suppress writes during the prefetch dry-run pass: the value here was computed
+	// from miss-everything reads and would corrupt state. The apply pass (recordMode
+	// off) does the real Save, so the dry run has no committed side effects.
+	b.WriteString("\tif h.state.HotState.recordMode {\n\t\treturn\n\t}\n")
 	for _, field := range handle.spec.table.Fields {
 		switch field.Name {
 		case "BlockNumber", "UpdatedAtBlock":

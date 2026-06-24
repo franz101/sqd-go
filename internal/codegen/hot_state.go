@@ -805,6 +805,14 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	b.WriteString("\t// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,\n")
 	b.WriteString("\t// so the lazy state Get skips the ClickHouse point-SELECT entirely.\n")
 	b.WriteString("\tcoldAuthoritative bool\n")
+	b.WriteString("\t// prefetchEnabled turns on the two-pass batch prefetch (--prefetch): each\n")
+	b.WriteString("\t// block is dispatched once in recordMode to collect the read-set, resolved in\n")
+	b.WriteString("\t// one round-trip per entity, then dispatched again for real against a warm cache.\n")
+	b.WriteString("\tprefetchEnabled bool\n")
+	b.WriteString("\t// recordMode is set for the duration of a prefetch dry-run pass. While set,\n")
+	b.WriteString("\t// the lazy state Get queues misses instead of resolving them synchronously,\n")
+	b.WriteString("\t// and Save is suppressed (the dry run has no committed side effects).\n")
+	b.WriteString("\trecordMode bool\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -901,6 +909,31 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 			b.WriteString(".cold != nil")
 		}
 		b.WriteString(" {\n\t\ts.coldAuthoritative = true\n\t}\n")
+	}
+	b.WriteString("\treturn nil\n}\n\n")
+
+	// Prefetch (--prefetch) plumbing. EnablePrefetch turns on the two-pass batch
+	// prefetch; SetRecordMode brackets the dry-run pass; ResolveAllPending drains
+	// every entity resolver's queued misses in one round-trip each. Default-off:
+	// callers that never enable it get byte-for-byte the prior lazy behaviour.
+	b.WriteString("func (s *HotState) EnablePrefetch(enabled bool) {\n\tif s != nil {\n\t\ts.prefetchEnabled = enabled\n\t}\n}\n\n")
+	b.WriteString("func (s *HotState) PrefetchEnabled() bool {\n\treturn s != nil && s.prefetchEnabled\n}\n\n")
+	b.WriteString("func (s *HotState) SetRecordMode(on bool) {\n\tif s != nil {\n\t\ts.recordMode = on\n\t}\n}\n\n")
+	b.WriteString("func (s *HotState) RecordMode() bool {\n\treturn s != nil && s.recordMode\n}\n\n")
+
+	// ResolveAllPending flushes every resolver's queued misses to ClickHouse in a
+	// single round-trip per entity (vs the lazy path's one round-trip per missing
+	// key). A resolver with no queued misses early-returns, so this is cheap when a
+	// block touched only a subset of entities.
+	b.WriteString("func (s *HotState) ResolveAllPending(ctx context.Context, conn *ch.Client, db string) error {\n")
+	b.WriteString("\tif s == nil || conn == nil {\n\t\treturn nil\n\t}\n")
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\tif err := s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Resolve(ctx, conn, db); err != nil {\n\t\treturn err\n\t}\n")
 	}
 	b.WriteString("\treturn nil\n}\n\n")
 

@@ -372,8 +372,25 @@ func CustomProcessing(ctx context.Context, store Store, state *State, block *Par
 		return nil
 	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily
-	// (GetUserPosition/GetCondition/...) from durable ClickHouse state.
+
+	// --prefetch: two-pass batch prefetch. Pass 1 dispatches the handler in
+	// recordMode to collect the block's read-set (every state Get queues its missing
+	// key instead of resolving it one-by-one; Save is suppressed so the dry run has
+	// no side effects), then resolves all queued keys in a single round-trip per
+	// entity. Pass 2 (below) runs for real against the now-warm cache. This collapses
+	// the lazy path's one-SELECT-per-missing-key into one SELECT per entity per block.
+	// Opt-in (EnablePrefetch); any key the dry run misses still falls back to lazy.
+	if CustomProcessFn != nil && state.HotState != nil && state.HotState.prefetchEnabled && store != nil && store.Conn() != nil {
+		state.HotState.recordMode = true
+		err := CustomProcessFn(state, block)
+		state.HotState.recordMode = false
+		if err != nil {
+			return err
+		}
+		if err := state.HotState.ResolveAllPending(ctx, store.Conn(), store.DB()); err != nil {
+			return err
+		}
+	}
 
 	// Process block
 	if CustomProcessFn != nil {
@@ -391,7 +408,21 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 		return nil
 	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily.
+
+	// --prefetch: two-pass batch prefetch (see CustomProcessing for the rationale).
+	// Pass 1 collects the read-set in recordMode and batch-resolves it; pass 2 below
+	// applies for real against the warm cache. Opt-in; lazy fallback otherwise.
+	if CustomProcessProtoFn != nil && state.HotState != nil && state.HotState.prefetchEnabled && store != nil && store.Conn() != nil {
+		state.HotState.recordMode = true
+		err := CustomProcessProtoFn(state, block)
+		state.HotState.recordMode = false
+		if err != nil {
+			return err
+		}
+		if err := state.HotState.ResolveAllPending(ctx, store.Conn(), store.DB()); err != nil {
+			return err
+		}
+	}
 
 	if CustomProcessProtoFn != nil {
 		if err := CustomProcessProtoFn(state, block); err != nil {
@@ -725,6 +756,20 @@ func (p *Processor) SetSnapshotsEnabled(enabled bool) {
 		return
 	}
 	p.State.SetSnapshotsEnabled(enabled)
+}
+
+// EnablePrefetch turns on the two-pass batch prefetch (--prefetch): each block is
+// dispatched once in recordMode to collect its read-set, resolved in one round-trip
+// per entity, then dispatched again for real against a warm cache. This trades a
+// second (cheap, CPU-only) handler pass for collapsing the lazy path's
+// one-SELECT-per-missing-key into one SELECT per entity per block — a large win when
+// cold misses dominate (resume / cursor mode against a populated ClickHouse).
+// No-op if state is nil. Requires re-runnable handlers (side effects only via Save).
+func (p *Processor) EnablePrefetch(enabled bool) {
+	if p == nil || p.State == nil || p.State.HotState == nil {
+		return
+	}
+	p.State.HotState.EnablePrefetch(enabled)
 }
 
 // EnableColdCache attaches the Pebble cold tier to the hot caches (pointer-free

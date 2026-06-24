@@ -48,6 +48,13 @@ type Options struct {
 	ColdCache    bool
 	ColdCacheDir string // base directory for cold-tier files (default os.TempDir()/sqd-coldcache)
 
+	// Prefetch enables the two-pass batch prefetch (see PrefetchProcessor): each
+	// block is dispatched once to collect its read-set, resolved in one round-trip
+	// per entity, then dispatched again against a warm cache. Collapses the lazy
+	// path's one-SELECT-per-missing-key into one SELECT per entity per block. Default
+	// off; most useful in resume/cursor mode against a populated ClickHouse.
+	Prefetch bool
+
 	// ParallelFetch fetches the finalized backfill range with concurrent range
 	// workers (cursor mode only). The immutable finalized region is fetched out
 	// of order and re-serialized for the in-order consumer; see parallel_fetch.go.
@@ -178,7 +185,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom, opts.Prefetch); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -186,7 +193,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64, prefetch bool) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -232,6 +239,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
 		} else {
 			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
+		}
+	}
+	if prefetch {
+		if pp, ok := proc.(PrefetchProcessor); ok {
+			pp.EnablePrefetch(true)
+			log.Printf("Chain %d: --prefetch enabled (two-pass batch read-set prefetch)", chain.ID)
+		} else {
+			log.Printf("Chain %d: prefetch requested but processor does not implement PrefetchProcessor", chain.ID)
 		}
 	}
 	if cursorMode {
@@ -1545,7 +1560,7 @@ func buildTypedTableIndex(chain *config.Chain) (typedTableIndex, error) {
 			if event.Name != nil && strings.TrimSpace(*event.Name) != "" {
 				tableNameEvent = strings.TrimSpace(*event.Name)
 			}
-			viewName := uniqueLower(used, toSnake(contract.Name + "_" + tableNameEvent))
+			viewName := uniqueLower(used, toSnake(contract.Name+"_"+tableNameEvent))
 
 			var filteredArgs []database.TypedEventArg
 			for _, arg := range args {

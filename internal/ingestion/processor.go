@@ -84,6 +84,17 @@ func (p ProcessorProfile) Delta(previous ProcessorProfile) ProcessorProfile {
 	}
 }
 
+// PrefetchProcessor is optionally implemented by processors that support the
+// two-pass batch prefetch (--prefetch): each block is dispatched once to collect
+// its hot-state read-set, the misses are resolved in one ClickHouse round-trip per
+// entity, then the block is dispatched again for real against the warm cache. This
+// collapses the lazy path's one-SELECT-per-missing-key into one SELECT per entity
+// per block — a large win in resume/cursor mode against a populated ClickHouse,
+// where per-key cold misses otherwise dominate. Opt-in: off by default.
+type PrefetchProcessor interface {
+	EnablePrefetch(enabled bool)
+}
+
 // ColdCacheProcessor is optionally implemented by processors that keep a
 // Pebble-backed cold tier under their hot caches. On a hot miss an evicted entry
 // is served from local disk (~8µs) instead of a ClickHouse point-SELECT (~1.9ms);
