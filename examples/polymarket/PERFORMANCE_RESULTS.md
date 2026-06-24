@@ -796,3 +796,56 @@ Added comprehensive edge case tests in `custom_processor_math_test.go`:
 
 **Decision**: Retained. This is a memory safety fix with no measurable performance impact. Prevents unbounded memory growth from outlier blocks.
 
+
+---
+
+## TASK-010: Fix position key hash collisions — retained
+
+**Scope**: Correctness fix to eliminate hash collisions in position cache
+
+**Problem**: `hashPositionKey` only used `collection` field, ignoring `collateral`. Different positions with same collection but different collateral would hash to same value, causing O(N) linked-list traversals.
+
+**Solution**: Mix both `collateral` and `collection` bytes in hash using word-at-a-time XOR.
+
+**Correctness**:
+- [x] 0xf replay passed (219,492 blocks, 506,599 events)
+- [x] Realized: 37.876088169187416774, Holdings: 313.683532169187415452376136, Net: 351.559620338374832226376136
+- [x] Runtime: 2.44s
+
+**Micro-benchmark** (200-block corpus):
+
+| Benchmark | Baseline median | With fix median | Delta |
+|---|---:|---:|---:|
+| ProcessProtoWarmState | 58.2 ms | 58.3 ms | ±0.2% (noise) |
+| ParseAndProcessProtoReuse | 187.7 ms | 188.0 ms | ±0.2% (noise) |
+| Bytes/op | 22,095,472 | 22,095,472 | 0 |
+| Allocs/op | 311,320 | 311,320 | 0 |
+
+**Decision**: Retained. This is a correctness fix with no measurable performance impact on normal workload. Prevents O(N) collisions for positions with different collaterals.
+
+---
+
+## TASK-011: Fix collection key hash collisions — retained
+
+**Scope**: Correctness fix to eliminate hash collisions in collection cache
+
+**Problem**: `hashCollectionKey` only used `condition` and `index` fields, ignoring `parent`. Different collections with same condition/index but different parent would hash to same value.
+
+**Solution**: Mix `parent`, `condition`, and `index` bytes in hash using word-at-a-time XOR.
+
+**Correctness**:
+- [x] 0xf replay passed (219,492 blocks, 506,599 events)
+- [x] Realized: 37.876088169187416774, Holdings: 313.683532169187415452376136, Net: 351.559620338374832226376136
+- [x] Runtime: 2.44s
+
+**Micro-benchmark** (200-block corpus):
+
+| Benchmark | Baseline median | With fix median | Delta |
+|---|---:|---:|---:|
+| ProcessProtoWarmState | 58.2 ms | 58.3 ms | ±0.2% (noise) |
+| ParseAndProcessProtoReuse | 187.7 ms | 188.0 ms | ±0.2% (noise) |
+| Bytes/op | 22,095,472 | 22,095,472 | 0 |
+| Allocs/op | 311,320 | 311,320 | 0 |
+
+**Decision**: Retained. This is a correctness fix with no measurable performance impact on normal workload. Prevents O(N) collisions for collections with different parents.
+
