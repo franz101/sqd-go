@@ -6,7 +6,7 @@ include .env
 export
 endif
 
-.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
+.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-tmux dev-tmux-reindex dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
 
 DETECTOR_CONTAINER := $(shell docker ps --filter "publish=9003" --format "{{.Names}}" | head -n 1)
 CLICKHOUSE_CONTAINER ?= $(if $(DETECTOR_CONTAINER),$(DETECTOR_CONTAINER),$(shell docker ps --filter "name=clickhouse" --format "{{.Names}}" | head -n 1))
@@ -35,6 +35,9 @@ UNISWAP_DIR := examples/uniswap
 POLYMARKET_DIR := examples/polymarket
 POLYMARKET_DATABASE ?= polymarket
 POLYMARKET_ARGS ?=
+POLYMARKET_TMUX_SESSION ?= sqd-polymarket-live
+POLYMARKET_TMUX_LOG ?= tmp/dev-v2-live.log
+POLYMARKET_PRUNE_INTERVAL ?= 999999999999
 INMEM_ARGS ?=
 
 initpnl: build
@@ -68,6 +71,26 @@ dev-v2: codegen-polymarket build
 
 dev-v2-live: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 2364531 --end-block 0 $(POLYMARKET_ARGS)
+
+dev-tmux:
+	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
+		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION):0"; \
+	else \
+		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
+		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) $(MAKE) dev-v2-live POLYMARKET_ARGS=--state 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
+	fi
+
+dev-tmux-reindex:
+	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
+		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION):0"; \
+	else \
+		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
+		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --reindex-from 8400000\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
+	fi
 
 dev-v1: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block 3664531 --no-proto $(POLYMARKET_ARGS)
@@ -109,7 +132,10 @@ polymarket-fork: codegen-polymarket build
 	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) $(BUILD_DIR)/sqd-go start examples/polymarket --blockchain polygon --start-block $$START_BLOCK --end-block 0 --restart $(POLYMARKET_ARGS)
 
 fetch-polymarket:
-	go run debugger/fetchUntil.go -start 33605403 -end 40000000 -out debugger/data
+	go run debugger/fetchUntil.go \
+		-endpoint https://portal.sqd.dev/datasets/polygon-mainnet/finalized-stream \
+		-start 33605403 -end 40206663 \
+		-out debugger/data/wallet_0xf05b67_full
 
 inmem:
 	go run debugger/inMemoryProcessor.go $(INMEM_ARGS)
@@ -127,7 +153,7 @@ pnl:
 # Run PnL comparison for all wallets in drafts/pnl_wallets.yaml
 pnl-all:
 	@echo "Running PnL comparison for all wallets..."
-	@for wallet in $$(python3 -c "import yaml; print('\n'.join(w['address'] for w in yaml.safe_load(open('tmp/pnl_wallets.yaml'))['wallets'] if w.get('active', True)))"); do \
+	@for wallet in $$(python3 -c "import yaml; print('\n'.join(w['address'] for w in yaml.safe_load(open('drafts/pnl_wallets.yaml'))['wallets'] if w.get('active', True)))"); do \
 		echo ""; \
 		echo "========================================"; \
 		echo "Wallet: $$wallet"; \
