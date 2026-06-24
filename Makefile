@@ -6,7 +6,7 @@ include .env
 export
 endif
 
-.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-tmux dev-tmux-reindex dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
+.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-tmux dev-tmux-reindex dev-tmux-profiling dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
 
 DETECTOR_CONTAINER := $(shell docker ps --filter "publish=9003" --format "{{.Names}}" | head -n 1)
 CLICKHOUSE_CONTAINER ?= $(if $(DETECTOR_CONTAINER),$(DETECTOR_CONTAINER),$(shell docker ps --filter "name=clickhouse" --format "{{.Names}}" | head -n 1))
@@ -89,6 +89,16 @@ dev-tmux-reindex:
 		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
 		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
 			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --reindex-from 8400000\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
+	fi
+
+dev-tmux-profiling:
+	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
+		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION):0"; \
+	else \
+		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)) tmp/profiles; \
+		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --cpuprofile tmp/profiles/polymarket-live.pprof\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
 		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
 	fi
 
