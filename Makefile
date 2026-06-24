@@ -6,7 +6,7 @@ include .env
 export
 endif
 
-.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-tmux dev-tmux-reindex dev-tmux-profiling dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
+.PHONY: dev dev-build build test vet benchmark codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e codegen-polymarket dev-polymarket dev-v2-live dev-tmux dev-tmux-reindex dev-tmux-profiling dev-fast-tmux dev-fast-tmux-profiling dev-e2e dev-e2e-v2 dev-v2-e2e db-reset stop polymarket-fork fetch-polymarket inmem memch initpnl pnl pnl-all
 
 DETECTOR_CONTAINER := $(shell docker ps --filter "publish=9003" --format "{{.Names}}" | head -n 1)
 CLICKHOUSE_CONTAINER ?= $(if $(DETECTOR_CONTAINER),$(DETECTOR_CONTAINER),$(shell docker ps --filter "name=clickhouse" --format "{{.Names}}" | head -n 1))
@@ -88,7 +88,7 @@ dev-tmux-reindex:
 	else \
 		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
 		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
-			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --reindex-from 8400000\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --reindex-from 84000000\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
 		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
 	fi
 
@@ -100,6 +100,31 @@ dev-tmux-profiling:
 		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
 			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --cpuprofile tmp/profiles/polymarket-live.pprof\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
 		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
+	fi
+
+# Fast live tmux run: proto mode + parallel finalized backfill (--parallel-fetch,
+# SQD_PARALLEL_FETCHERS/PAGE/RPS tunable), pruning disabled, stats tick every 5m.
+# Like dev-tmux it uses --state (no --restart, no delete) so recovery is automatic.
+dev-fast-tmux:
+	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
+		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION):0"; \
+	else \
+		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
+		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) SQD_STATS_INTERVAL=300 $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --parallel-fetch\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+		echo "started tmux session (fast: --parallel-fetch, stats 5m): $(POLYMARKET_TMUX_SESSION):0"; \
+	fi
+
+# Fast live tmux run with CPU profiling. Profile lands in tmp/profiles/polymarket-fast.pprof;
+# SIGINT the session to flush it, then `go tool pprof` to analyze.
+dev-fast-tmux-profiling:
+	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
+		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION):0"; \
+	else \
+		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)) tmp/profiles; \
+		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) SQD_STATS_INTERVAL=300 $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --parallel-fetch --cpuprofile tmp/profiles/polymarket-fast.pprof\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+		echo "started tmux session (fast+profiling -> tmp/profiles/polymarket-fast.pprof): $(POLYMARKET_TMUX_SESSION):0"; \
 	fi
 
 dev-v1: codegen-polymarket build
