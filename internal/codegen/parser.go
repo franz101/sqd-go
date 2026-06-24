@@ -107,6 +107,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		var blockNum uint64
 		var blockTimestamp uint64
 		var blockHash string
+		var blockTime time.Time // Pre-calculated once per block to avoid repeated time.Unix calls
 		var slot *ParsedBlock
 		var protoSlot *ProtoEventBlock
 
@@ -133,6 +134,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					l.WantComma()
 				}
 				l.Delim('}')
+				blockTime = time.Unix(int64(blockTimestamp), 0).UTC() // Calculate once per block
 			case "logs":
 				if ring != nil {
 					slot = ring.NextSlot(blockNum, blockHash)
@@ -187,7 +189,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					// Event routing and decoding
 					meta := EventMeta{
 						BlockNumber:      blockNum,
-						BlockTimestamp:   time.Unix(int64(blockTimestamp), 0).UTC(),
+						BlockTimestamp:   blockTime,
 						BlockHash:        abiunpack.HashFromHex(blockHash),
 						ContractAddress:  abiunpack.AddressFromHex(address),
 						TransactionHash:  abiunpack.HashFromHex(txHash),
