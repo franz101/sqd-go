@@ -52,6 +52,12 @@ type Options struct {
 	// workers (cursor mode only). The immutable finalized region is fetched out
 	// of order and re-serialized for the in-order consumer; see parallel_fetch.go.
 	ParallelFetch bool
+
+	// ReindexFrom is the block number to reindex from. If set, all blocks with
+	// numbers greater than this value are deleted from ClickHouse using lightweight
+	// DELETE, and indexing starts from this block. Data at or below this block is
+	// preserved.
+	ReindexFrom uint64
 }
 
 const (
@@ -172,7 +178,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -180,7 +186,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -195,9 +201,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	}
 	log.Printf("Chain %d: %d event types, %d filter(s)", chain.ID, len(decoders), len(filters))
 	storeBlocks := cfg.ShouldStoreBlocks()
+	if reindexFrom > 0 {
+		log.Printf("[REINDEX] Deleting all blocks > %d using lightweight DELETE...", reindexFrom)
+		if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, reindexFrom); err != nil {
+			return fmt.Errorf("reindex rollback: %w", err)
+		}
+		log.Printf("[REINDEX] Lightweight DELETE completed for blocks > %d", reindexFrom)
+	}
 	currentBlock := chain.StartBlock
 	if flagStartBlock > 0 {
 		currentBlock = flagStartBlock
+	}
+	if reindexFrom > 0 && reindexFrom > currentBlock {
+		currentBlock = reindexFrom
+		log.Printf("[REINDEX] Starting from block %d (from --reindex-from)", currentBlock)
 	}
 	state := NewForkTracker(forkMode)
 	if coldCache {

@@ -20,6 +20,7 @@ type parsedArgs struct {
 	parallelFetch bool
 	state         bool
 	protoMode     bool
+	reindexFrom   string
 	initSource    string
 	initABI       string
 	initName      string
@@ -100,6 +101,12 @@ func parseArgs(args []string) (*parsedArgs, error) {
 				return nil, fmt.Errorf("--pagesize requires a value")
 			}
 			p.pageSize = args[i]
+		case "--reindex-from":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--reindex-from requires a value")
+			}
+			p.reindexFrom = args[i]
 		default:
 			if !strings.HasPrefix(a, "-") {
 				positional = append(positional, a)
@@ -176,14 +183,14 @@ func Run(args []string) int {
 		if p.state && os.Getenv(stateChildEnv) == "" {
 			return runStateRebuild(args, p.project)
 		}
-		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom)
 
 	case "stop":
 		return runStop()
@@ -202,7 +209,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom)
 	}
 }
 
@@ -334,6 +341,9 @@ Flags:
                        (includeAllBlocks=false) unless the project stores raw blocks/logs. Tune via
                        SQD_PARALLEL_FETCHERS (default 6), SQD_PARALLEL_PAGE (default 10000),
                        SQD_PARALLEL_RPS (default 5).
+	  --reindex-from        (start/dev) Delete all blocks above the specified block using lightweight
+	                       DELETE and resume indexing from that block. Data at or below this block is
+	                       preserved. Useful for reindexing after a contract fix.
 
 Examples:
   sqd-go
