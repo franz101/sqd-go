@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/parser"
+	"github.com/holiman/uint256"
 )
 
 func TestNextRequestRangeCursorCapsToLocalEnd(t *testing.T) {
@@ -288,7 +290,19 @@ func TestIngestionDecodeScratchDoesNotCorruptSecondLogData(t *testing.T) {
 			if err != nil {
 				t.Fatalf("decode log %d: %v", lg.LogIndex, err)
 			}
-			values = append(values, ev.Params["value"].(string))
+			// Handle both native uint256.Int and normalized string types
+			var valStr string
+			switch v := ev.Params["value"].(type) {
+			case string:
+				valStr = v
+			case *uint256.Int:
+				valStr = v.Dec()
+			case uint256.Int:
+				valStr = v.Dec()
+			default:
+				valStr = fmt.Sprintf("%v", v)
+			}
+			values = append(values, valStr)
 		}
 		return nil
 	}); err != nil {

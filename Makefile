@@ -82,6 +82,16 @@ dev-tmux:
 		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
 	fi
 
+dev-optimized-tmux:
+	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
+		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION):0"; \
+	else \
+		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
+		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) SQD_COLDCACHE_OPTIM=largemem $(MAKE) dev-v2-live POLYMARKET_ARGS='--state  --prefetch' 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+		echo "started tmux session: $(POLYMARKET_TMUX_SESSION):0"; \
+	fi
+
 dev-tmux-reindex:
 	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
 		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION):0"; \
@@ -111,7 +121,7 @@ dev-fast-tmux:
 	else \
 		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
 		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
-			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) SQD_STATS_INTERVAL=300 $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --parallel-fetch\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) SQD_STATS_INTERVAL=300 $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state   --prefetch  --parallel-fetch\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
 		echo "started tmux session (fast: --parallel-fetch, stats 5m): $(POLYMARKET_TMUX_SESSION):0"; \
 	fi
 
@@ -123,7 +133,7 @@ dev-fast-tmux-profiling:
 	else \
 		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)) tmp/profiles; \
 		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
-			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) SQD_STATS_INTERVAL=300 $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --parallel-fetch --cpuprofile tmp/profiles/polymarket-fast.pprof\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+			"cd $(CURDIR) && CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) SQD_STATS_INTERVAL=300 $(MAKE) dev-v2-live POLYMARKET_ARGS=\"--state --parallel-fetch --prefetch --cpuprofile tmp/profiles/polymarket-fast.pprof\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
 		echo "started tmux session (fast+profiling -> tmp/profiles/polymarket-fast.pprof): $(POLYMARKET_TMUX_SESSION):0"; \
 	fi
 

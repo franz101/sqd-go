@@ -92,8 +92,14 @@ func (e *EventDef) Decode(address string, topics []string, data []byte) (*Decode
 	result := make(map[string]any)
 	if len(data) > 0 {
 		if err := e.fastUnpack(result, data); err != nil {
+			// fastUnpack fell back (e.g. dynamic uint256[] arrays)
 			if err := e.abi.UnpackIntoMap(result, e.eventName, data); err != nil {
 				return nil, fmt.Errorf("unpack non-indexed: %w", err)
+			}
+			// go-ethereum's UnpackIntoMap returns non-native types (*big.Int, common.Address vs Hex)
+			// Normalize only the fallback path to keep the map consistent for the inserter.
+			for k, v := range result {
+				result[k] = normalizeParamValue(v)
 			}
 		}
 	}
@@ -106,9 +112,6 @@ func (e *EventDef) Decode(address string, topics []string, data []byte) (*Decode
 			return nil, fmt.Errorf("decode indexed %q: %w", arg.Name, err)
 		}
 		result[arg.Name] = val
-	}
-	for k, v := range result {
-		result[k] = normalizeParamValue(v)
 	}
 	return &DecodedEvent{Address: address, EventName: e.eventName, Topic0: e.topic0.Hex(), Params: result}, nil
 }
@@ -124,32 +127,63 @@ func (e *EventDef) fastUnpack(result map[string]any, data []byte) error {
 	for _, arg := range nonIndexed {
 		switch arg.Type.T {
 		case abi.UintTy, abi.IntTy:
-			word, ok := abiunpack.Word(data, headWord)
-			if !ok {
-				return fmt.Errorf("out of bounds")
+			// Handle both static uint/int and dynamic uint[]/int[]
+			if arg.Type.Elem != nil {
+				// Dynamic integer array - use efficient abiunpack decoder
+				arr, ok := abiunpack.Uint256Array(data, headWord)
+				if !ok {
+					return fmt.Errorf("invalid uint256[]")
+				}
+				result[arg.Name] = arr
+				headWord++
+			} else {
+				word, ok := abiunpack.Word(data, headWord)
+				if !ok {
+					return fmt.Errorf("out of bounds")
+				}
+				var n uint256.Int
+				n.SetBytes32(word)
+				result[arg.Name] = &n
+				headWord++
 			}
-			var n uint256.Int
-			n.SetBytes32(word)
-			result[arg.Name] = &n
-			headWord++
 		case abi.AddressTy:
-			word, ok := abiunpack.Word(data, headWord)
-			if !ok {
-				return fmt.Errorf("out of bounds")
+			if arg.Type.Elem != nil {
+				// Dynamic address array
+				arr, ok := abiunpack.AddressArray(data, headWord)
+				if !ok {
+					return fmt.Errorf("invalid address[]")
+				}
+				result[arg.Name] = arr
+				headWord++
+			} else {
+				word, ok := abiunpack.Word(data, headWord)
+				if !ok {
+					return fmt.Errorf("out of bounds")
+				}
+				result[arg.Name] = common.BytesToAddress(word[12:]).Hex()
+				headWord++
 			}
-			result[arg.Name] = common.BytesToAddress(word[12:]).Hex()
-			headWord++
 		case abi.BoolTy:
-			word, ok := abiunpack.Word(data, headWord)
-			if !ok {
-				return fmt.Errorf("out of bounds")
+			if arg.Type.Elem != nil {
+				// Dynamic bool array
+				arr, ok := abiunpack.BoolArray(data, headWord)
+				if !ok {
+					return fmt.Errorf("invalid bool[]")
+				}
+				result[arg.Name] = arr
+				headWord++
+			} else {
+				word, ok := abiunpack.Word(data, headWord)
+				if !ok {
+					return fmt.Errorf("out of bounds")
+				}
+				val, ok := abiunpack.Bool(word)
+				if !ok {
+					return fmt.Errorf("invalid bool")
+				}
+				result[arg.Name] = val
+				headWord++
 			}
-			val, ok := abiunpack.Bool(word)
-			if !ok {
-				return fmt.Errorf("invalid bool")
-			}
-			result[arg.Name] = val
-			headWord++
 		case abi.StringTy:
 			b, ok := abiunpack.Bytes(data, headWord)
 			if !ok {
@@ -165,14 +199,41 @@ func (e *EventDef) fastUnpack(result map[string]any, data []byte) error {
 			result[arg.Name] = b
 			headWord++
 		case abi.FixedBytesTy:
-			word, ok := abiunpack.Word(data, headWord)
-			if !ok {
-				return fmt.Errorf("out of bounds")
+			if arg.Type.Elem != nil {
+				// Dynamic bytes32[] / hash[] array
+				arr, ok := abiunpack.HashArray(data, headWord)
+				if !ok {
+					return fmt.Errorf("invalid bytes32[]")
+				}
+				result[arg.Name] = arr
+				headWord++
+			} else {
+				word, ok := abiunpack.Word(data, headWord)
+				if !ok {
+					return fmt.Errorf("out of bounds")
+				}
+				dst := make([]byte, arg.Type.Size)
+				copy(dst, word[:arg.Type.Size])
+				result[arg.Name] = dst
+				headWord++
 			}
-			dst := make([]byte, arg.Type.Size)
-			copy(dst, word[:arg.Type.Size])
-			result[arg.Name] = dst
-			headWord++
+		case abi.HashTy:
+			if arg.Type.Elem != nil {
+				// Dynamic hash[] array (same as bytes32[])
+				arr, ok := abiunpack.HashArray(data, headWord)
+				if !ok {
+					return fmt.Errorf("invalid hash[]")
+				}
+				result[arg.Name] = arr
+				headWord++
+			} else {
+				word, ok := abiunpack.Word(data, headWord)
+				if !ok {
+					return fmt.Errorf("out of bounds")
+				}
+				result[arg.Name] = common.BytesToHash(word)
+				headWord++
+			}
 		default:
 			return fmt.Errorf("unsupported fastUnpack type %v", arg.Type.T)
 		}
