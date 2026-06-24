@@ -1226,3 +1226,39 @@ remaining `common.FromHex(lg.Data)` (variable-length log data) is the next
 candidate (it needs a reusable decode buffer whose lifetime matches
 `AppendFromLog`, so it is left for a separately-validated change).
 
+## HEX-3 — clock-cache `Get` key no longer escapes to the heap: implemented
+
+The C8 follow-up: the generated `*ClockCache.Get` cold branch passed `&key` to
+`unsafe.Slice` for the cold lookup. Go's escape analysis is flow-insensitive, so
+that single `&key` forced the `key` parameter (a 52-byte
+`UserPositionsClockKey`) onto the heap on **every** `Get` — including hot hits
+that never reach the cold branch (`-gcflags=-m`: `moved to heap: key`). The
+template now copies `key` into a local inside the cold branch (`k := key`) and
+takes `&k`, containing the escape to the cold-miss path.
+
+- **Escape analysis**: `moved to heap: key` is gone for `Get`.
+- **Alloc test** (`TestC8ValueGetAvoidsEscape`): the value-get path dropped from
+  **1.00 → 0.00 allocs/op** — the hot order-fill position read is now fully
+  allocation-free (combined with C8).
+- **Realistic e2e profile diff**: `UserPositionsClockCache.Get` **−599,536**,
+  `FixedProductMarketMakersClockCache.Get` **−105,268**.
+  **Total allocations 9,623,824 → 8,864,393 (−759k, −7.9%).**
+- **Correctness**: e2e byte-identical; `go test ./internal/codegen` and
+  `go test -race` (cache) pass.
+
+### Parse-path + cache squeeze — cumulative
+
+| Stage | Total alloc objects (realistic e2e) | Δ vs before |
+|---|---:|---:|
+| Before (post C2/C4/C6/C8) | 18,954,540 | — |
+| + HEX-1 (Process hex helpers) | 15,702,697 | −17.2% |
+| + HEX-2 (AppendFromLog hoist) | 9,623,824 | −38.7% |
+| + HEX-3 (Get key escape) | 8,864,393 | −7.9% |
+| **Cumulative** | **8,864,393** | **−53.2%** |
+
+The largest remaining allocator is `internal/parser.bytesToString` (~37%): the
+JSONL parser materializes each log's address/topics/data as fresh strings that
+the processor then hex-decodes. Eliminating it means a zero-copy parser→processor
+interface (return byte views into the raw buffer) — a core-parser change outside
+this codegen-only sweep, noted as the next target.
+

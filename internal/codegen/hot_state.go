@@ -499,9 +499,13 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 	if c.cold != nil {
 		// GetInto copies the stored bytes straight into v (a fixed-size value
 		// whose layout matches the bytes written on eviction), avoiding the
-		// per-hit []byte allocation that the value-returning cold.Get does.
+		// per-hit []byte allocation that the value-returning cold.Get does. key is
+		// copied to a local first: taking &key directly forces the key parameter
+		// to the heap on EVERY Get (escape analysis is flow-insensitive), including
+		// hot hits that never reach this cold branch. &k keeps the escape contained.
+		k := key
 		var v %[3]s
-		if found, _ := c.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
+		if found, _ := c.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))); found {
 			c.SetByKey(key, v)
 			if c.metrics != nil {
 				c.metrics.ColdHits++
