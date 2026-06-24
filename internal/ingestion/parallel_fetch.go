@@ -408,10 +408,13 @@ func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *clie
 			return false
 		}
 
-		// If response was empty or coveredTo didn't advance past pageEnd, we're done with this range
-		if len(resp.Raw) == 0 || coveredTo >= pageEnd {
+		// If coveredTo reached pageEnd, we're done with this range
+		// Note: empty response doesn't mean we're done - continue to next block
+		if coveredTo >= pageEnd {
 			return true
 		}
+		// Empty response (no blocks in this specific range) - continue to next block
+		// The loop will increment cur and try again
 
 		// Move to next block after what we just covered
 		cur = coveredTo + 1
