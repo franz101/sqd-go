@@ -200,6 +200,78 @@ func clickHouseBytes(v []byte) string {
 	return "0x" + common.Bytes2Hex(v)
 }
 
+func clickHouseUint256Array(v []uint256.Int) string {
+	if len(v) == 0 {
+		return "[]"
+	}
+	var b strings.Builder
+	b.Grow(2 + len(v)*8)
+	b.WriteByte('[')
+	for i := range v {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(v[i].String())
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func clickHouseHashArray(v []common.Hash) string {
+	if len(v) == 0 {
+		return "[]"
+	}
+	var b strings.Builder
+	b.Grow(2 + len(v)*67)
+	b.WriteByte('[')
+	for i := range v {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(v[i].Hex())
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func clickHouseAddressArray(v []common.Address) string {
+	if len(v) == 0 {
+		return "[]"
+	}
+	var b strings.Builder
+	b.Grow(2 + len(v)*43)
+	b.WriteByte('[')
+	for i := range v {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(v[i].Hex())
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func clickHouseBoolArray(v []bool) string {
+	if len(v) == 0 {
+		return "[]"
+	}
+	var b strings.Builder
+	b.Grow(2 + len(v)*6)
+	b.WriteByte('[')
+	for i, val := range v {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		if val {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
 func quoteIdent(name string) string {
 	return "\x60" + strings.ReplaceAll(name, "\x60", "\x60\x60") + "\x60"
 }
@@ -352,6 +424,14 @@ func appendExpr(arg eventArg) string {
 		return "ev." + arg.GoFieldName + "[:]"
 	case arg.SolidityType == "bytes":
 		return "clickHouseBytes(ev." + arg.GoFieldName + ")"
+	case arg.GoType == "[]uint256.Int":
+		return "clickHouseUint256Array(ev." + arg.GoFieldName + ")"
+	case arg.GoType == "[]common.Hash":
+		return "clickHouseHashArray(ev." + arg.GoFieldName + ")"
+	case arg.GoType == "[]common.Address":
+		return "clickHouseAddressArray(ev." + arg.GoFieldName + ")"
+	case arg.GoType == "[]bool":
+		return "clickHouseBoolArray(ev." + arg.GoFieldName + ")"
 	default:
 		return "fmt.Sprint(ev." + arg.GoFieldName + ")"
 	}

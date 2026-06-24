@@ -382,6 +382,7 @@ func renderStateHandleTypes(b *bytes.Buffer, handles []stateHandleSpec) {
 		b.WriteString("type ")
 		b.WriteString(handle.stateType)
 		b.WriteString(" struct { state *State }\n\n")
+		renderStateHandleGetValue(b, handle)
 		renderStateHandleGet(b, handle)
 		if !handle.spec.table.IsEvent {
 			renderStateHandleSave(b, handle)
@@ -389,16 +390,18 @@ func renderStateHandleTypes(b *bytes.Buffer, handles []stateHandleSpec) {
 	}
 }
 
-func renderStateHandleGet(b *bytes.Buffer, handle stateHandleSpec) {
+func renderStateHandleGetValue(b *bytes.Buffer, handle stateHandleSpec) {
 	keyFields := handle.spec.table.keyFields()
 	b.WriteString("func (h ")
 	b.WriteString(handle.stateType)
-	b.WriteString(") Get(")
+	b.WriteString(") GetValue(")
 	renderClockKeyParams(b, keyFields)
-	b.WriteString(") (*")
+	b.WriteString(") (")
 	b.WriteString(handle.valueName)
 	b.WriteString(", bool) {\n")
-	b.WriteString("\tif h.state == nil || h.state.HotState == nil {\n\t\treturn nil, false\n\t}\n")
+	b.WriteString("\tif h.state == nil || h.state.HotState == nil {\n\t\treturn ")
+	b.WriteString(handle.valueName)
+	b.WriteString("{}, false\n\t}\n")
 	b.WriteString("\tval, ok := h.state.HotState.")
 	b.WriteString(handle.spec.baseName)
 	b.WriteString(".GetByFields(")
@@ -415,7 +418,9 @@ func renderStateHandleGet(b *bytes.Buffer, handle stateHandleSpec) {
 		// exist in ClickHouse, so skip the point-SELECT entirely — this is what
 		// removes the per-miss SELECT storm. Non-authoritative (resume / cursor) or
 		// cold-disabled keeps the ClickHouse fallback below.
-		b.WriteString("\t\tif h.state.HotState != nil && h.state.HotState.coldAuthoritative {\n\t\t\treturn nil, false\n\t\t}\n")
+		b.WriteString("\t\tif h.state.HotState != nil && h.state.HotState.coldAuthoritative {\n\t\t\treturn ")
+		b.WriteString(handle.valueName)
+		b.WriteString("{}, false\n\t\t}\n")
 	}
 	b.WriteString("\t\tif h.state.Store != nil && h.state.Store.Conn() != nil {\n")
 	b.WriteString("\t\t\tkey := ")
@@ -440,17 +445,42 @@ func renderStateHandleGet(b *bytes.Buffer, handle stateHandleSpec) {
 	b.WriteString(handle.spec.baseName)
 	b.WriteString(".Get(key); ok {\n")
 	b.WriteString("\t\t\t\t\tif val.Tombstone {\n")
-	b.WriteString("\t\t\t\t\t\treturn nil, false\n")
+	b.WriteString("\t\t\t\t\t\treturn ")
+	b.WriteString(handle.valueName)
+	b.WriteString("{}, false\n")
 	b.WriteString("\t\t\t\t\t}\n")
-	b.WriteString("\t\t\t\t\treturn &val, true\n")
+	b.WriteString("\t\t\t\t\treturn val, true\n")
 	b.WriteString("\t\t\t\t}\n")
 	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t}\n")
-	b.WriteString("\t\treturn nil, false\n\t}\n")
+	b.WriteString("\t\treturn ")
+	b.WriteString(handle.valueName)
+	b.WriteString("{}, false\n\t}\n")
 	b.WriteString("\tif val.Tombstone {\n")
-	b.WriteString("\t\treturn nil, false\n")
+	b.WriteString("\t\treturn ")
+	b.WriteString(handle.valueName)
+	b.WriteString("{}, false\n")
 	b.WriteString("\t}\n")
-	b.WriteString("\treturn &val, true\n}\n\n")
+	b.WriteString("\treturn val, true\n}\n\n")
+}
+
+func renderStateHandleGet(b *bytes.Buffer, handle stateHandleSpec) {
+	keyFields := handle.spec.table.keyFields()
+	b.WriteString("func (h ")
+	b.WriteString(handle.stateType)
+	b.WriteString(") Get(")
+	renderClockKeyParams(b, keyFields)
+	b.WriteString(") (*")
+	b.WriteString(handle.valueName)
+	b.WriteString(", bool) {\n")
+	b.WriteString("\tval, ok := h.GetValue(")
+	for i, field := range keyFields {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(lowerFirst(field.Name))
+	}
+	b.WriteString(")\n\tif !ok {\n\t\treturn nil, false\n\t}\n\treturn &val, true\n}\n\n")
 }
 
 func renderStateHandleSave(b *bytes.Buffer, handle stateHandleSpec) {
