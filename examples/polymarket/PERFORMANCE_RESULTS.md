@@ -769,3 +769,30 @@ Added comprehensive edge case tests in `custom_processor_math_test.go`:
 
 **Decision**: Retained. Shows ~3% improvement on ParseAndProcess with minimal allocation overhead. The timing improvement outweighs the small allocation increase.
 
+
+---
+
+## TASK-009: Cap ring buffer slice capacities — retained
+
+**Scope**: Memory safety fix to prevent unbounded memory growth
+
+**Problem**: Slices in ParsedBlock grow indefinitely via `[:0]` reset. If a freak block has 10,000 events, the slice capacity grows to 10,000 and stays there forever across all 8,192 ring slots, breaking the 12GB memory cap.
+
+**Solution**: Added capacity guards in ringbuffer.go codegen to check `cap > 1024` and reallocate to cap 128 if exceeded.
+
+**Correctness**:
+- [x] 0xf replay passed (219,492 blocks, 506,599 events)
+- [x] Realized: 37.876088169187416774, Holdings: 313.683532169187415452376136, Net: 351.559620338374832226376136
+- [x] Runtime: 2.44s
+
+**Micro-benchmark** (200-block corpus):
+
+| Benchmark | Baseline median | With fix median | Delta |
+|---|---:|---:|---:|
+| ProcessProtoWarmState | 58.2 ms | 58.4 ms | ±0.3% (noise) |
+| ParseAndProcessProtoReuse | 187.7 ms | 192.7 ms | ±2.7% (noise) |
+| Bytes/op | 22,095,472 | 22,095,472 | 0 |
+| Allocs/op | 311,320 | 311,320 | 0 |
+
+**Decision**: Retained. This is a memory safety fix with no measurable performance impact. Prevents unbounded memory growth from outlier blocks.
+
