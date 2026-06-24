@@ -166,53 +166,6 @@ func hashConditionIDKey(k conditionIDKey) uint64 {
 var condResolveNanos int64
 var condResolveRoundTrips int64
 
-var (
-	fallbackOrderFilled        int64
-	fallbackFPMMBuy            int64
-	fallbackFPMMSell           int64
-	fallbackFPMMAdded          int64
-	fallbackFPMMRemoved        int64
-	fallbackPositionSplit      int64
-	fallbackPositionsMerge     int64
-	fallbackNegRiskSplit       int64
-	fallbackNegRiskMerge       int64
-	fallbackPositionsConverted int64
-	fallbackPayoutCTF          int64
-	fallbackPayoutNegRisk      int64
-)
-
-func getFallbackCounters() map[string]int64 {
-	return map[string]int64{
-		"OrderFilled":        fallbackOrderFilled,
-		"FPMMBuy":            fallbackFPMMBuy,
-		"FPMMSell":           fallbackFPMMSell,
-		"FPMMAdded":          fallbackFPMMAdded,
-		"FPMMRemoved":        fallbackFPMMRemoved,
-		"PositionSplit":      fallbackPositionSplit,
-		"PositionsMerge":     fallbackPositionsMerge,
-		"NegRiskSplit":       fallbackNegRiskSplit,
-		"NegRiskMerge":       fallbackNegRiskMerge,
-		"PositionsConverted": fallbackPositionsConverted,
-		"PayoutCTF":          fallbackPayoutCTF,
-		"PayoutNegRisk":      fallbackPayoutNegRisk,
-	}
-}
-
-func resetFallbackCounters() {
-	fallbackOrderFilled = 0
-	fallbackFPMMBuy = 0
-	fallbackFPMMSell = 0
-	fallbackFPMMAdded = 0
-	fallbackFPMMRemoved = 0
-	fallbackPositionSplit = 0
-	fallbackPositionsMerge = 0
-	fallbackNegRiskSplit = 0
-	fallbackNegRiskMerge = 0
-	fallbackPositionsConverted = 0
-	fallbackPayoutCTF = 0
-	fallbackPayoutNegRisk = 0
-}
-
 func ensureConditionsLoaded(state *generated.State, conditionIDs []common.Hash) {
 	canResolve := state.Store != nil && state.Store.Conn() != nil
 	// From-genesis run (authoritative cold tier) with no Condition ever evicted
@@ -1434,9 +1387,14 @@ func updateUserPositionWithBuyD256(state *generated.State, user common.Address, 
 	if amount.IsZero() {
 		return
 	}
-	up := getUserPosition(state, user, tokenID)
-	if up == nil {
-		up = &generated.Position{
+	// C8: value semantics. getUserPositionValue returns the position by value, so
+	// up lives on this frame's stack and Save(&up) does not heap-escape it (Save
+	// only writes through the pointer and copies the value into the cache). This
+	// removes the per-update heap allocation that state.Position.Get's `&val`
+	// forced on the dominant order-fill path.
+	up, ok := getUserPositionValue(state, user, tokenID)
+	if !ok {
+		up = generated.Position{
 			User:    user,
 			TokenID: tokenIDHash(tokenID),
 		}
@@ -1467,14 +1425,16 @@ func updateUserPositionWithBuyD256(state *generated.State, user common.Address, 
 	if v, ok := up.TotalBought.Add(amount); ok {
 		up.TotalBought = v
 	}
-	state.Position.Save(up, meta)
+	state.Position.Save(&up, meta)
 }
 
 // updateUserPositionWithSellD256 is the native-Decimal256 equivalent of
 // updateUserPositionWithSell.
 func updateUserPositionWithSellD256(state *generated.State, user common.Address, tokenID uint256.Int, price, amount protomath.Decimal256, meta generated.EventMeta) {
-	up := getUserPosition(state, user, tokenID)
-	if up == nil {
+	// C8: value semantics (see updateUserPositionWithBuyD256) — up stays on the
+	// stack; Save(&up) does not heap-escape it.
+	up, ok := getUserPositionValue(state, user, tokenID)
+	if !ok {
 		return
 	}
 
@@ -1498,7 +1458,7 @@ func updateUserPositionWithSellD256(state *generated.State, user common.Address,
 		up.Amount = v
 	}
 
-	state.Position.Save(up, meta)
+	state.Position.Save(&up, meta)
 }
 
 func updateUserPositionWithBuy(state *generated.State, user common.Address, tokenID uint256.Int, price, amount, pnlAdj decimal.Decimal, meta generated.EventMeta) {
@@ -1653,6 +1613,13 @@ func tokenIDHash(tokenID uint256.Int) common.Hash {
 	var h common.Hash
 	tokenID.WriteToSlice(h[:])
 	return h
+}
+
+// getUserPositionValue returns the position by value (no heap allocation). The
+// caller keeps it on its own stack and writes it back with Save(&up); the get →
+// mutate → Save round-trip never escapes the position to the heap (finding C8).
+func getUserPositionValue(state *generated.State, user common.Address, tokenID uint256.Int) (generated.Position, bool) {
+	return state.Position.GetValue(user, tokenIDHash(tokenID))
 }
 
 func getUserPosition(state *generated.State, user common.Address, tokenID uint256.Int) *generated.Position {
