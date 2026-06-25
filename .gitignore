@@ -24,3 +24,6 @@ TODO.md
 REVIEW.md
 REVIEW2.md
 examples/polymarket/
+
+# Fetched debug/test fixtures (regenerate via scripts/fetch_v2_fixture.sh)
+debugger/data/
