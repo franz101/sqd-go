@@ -1,9 +1,9 @@
 package ingestion
 
 import (
-	"os"
-	"strconv"
 	"time"
+
+	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
 // Portal page sizing.
@@ -105,16 +105,7 @@ func clampPageForLatency(page, span uint64, fetchDur, targetDur time.Duration, m
 // adaptive path. SQD_TARGET_FETCH_SECONDS overrides the default; a value <= 0
 // disables the latency clamp entirely (pure byte/row-cap sizing).
 func resolveTargetFetchDuration() time.Duration {
-	secs := defaultTargetFetchSeconds
-	if v := os.Getenv("SQD_TARGET_FETCH_SECONDS"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			secs = f
-		}
-	}
-	if secs <= 0 {
-		return 0
-	}
-	return time.Duration(secs * float64(time.Second))
+	return envconfig.TargetFetchDuration()
 }
 
 // resolveStatsInterval returns the periodic-stats cadence used by the consumer's
@@ -122,10 +113,5 @@ func resolveTargetFetchDuration() time.Duration {
 // default — handy for verbose operation and for tests whose runs are far shorter
 // than the 10s default. Unparseable values or anything below 50ms are ignored.
 func resolveStatsInterval() time.Duration {
-	if v := os.Getenv("SQD_STATS_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 50*time.Millisecond {
-			return d
-		}
-	}
-	return statsInterval
+	return envconfig.StatsIntervalDuration()
 }

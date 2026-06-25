@@ -27,6 +27,9 @@ type blockEntry struct {
 	rangeLabel        string
 	requestStartBlock uint64
 	raw               []byte
+	proto             any
+	batchFlush        func(context.Context) error
+	batchEvents       uint64
 }
 
 // ReplayBuffer is a circular buffer of recent blocks that enables fork recovery
@@ -116,6 +119,47 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 		rb.count++
 	}
 
+	select {
+	case rb.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+// WriteParsed stores one producer-parsed generated block. The replay mutex is
+// also the publication edge for the shared preallocated proto-ring slot.
+func (rb *ReplayBuffer) WriteParsed(chainID uint64, block BatchParsedBlock, finalized *client.BlockRef, isLastInBatch bool, rangeLabel string, requestStartBlock uint64, batchFlush func(context.Context) error, batchEvents uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	idx := rb.writePos % rb.capacity
+	if rb.count == rb.capacity {
+		delete(rb.index, rb.slots[idx].number)
+	}
+	rb.slots[idx] = blockEntry{
+		number:            block.Number,
+		hash:              block.Hash,
+		timestamp:         block.Timestamp,
+		finalized:         finalized,
+		isLastInBatch:     isLastInBatch,
+		rangeLabel:        rangeLabel,
+		requestStartBlock: requestStartBlock,
+		blockRow: database.BlockRow{
+			ChainID:        chainID,
+			BlockNumber:    block.Number,
+			BlockTimestamp: block.Timestamp,
+			BlockHash:      block.Hash,
+		},
+		raw:         block.RawLine,
+		proto:       block.Block,
+		batchFlush:  batchFlush,
+		batchEvents: batchEvents,
+	}
+	rb.index[block.Number] = idx
+	rb.latestBlock.Store(block.Number)
+	rb.writePos++
+	if rb.count < rb.capacity {
+		rb.count++
+	}
 	select {
 	case rb.notifyCh <- struct{}{}:
 	default:

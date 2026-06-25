@@ -223,7 +223,7 @@ func TestParallelPrefetcherSparseCoverageVsNonEmpty(t *testing.T) {
 	// for grid pages those land at page boundaries (e.g. 9999, 19999, ...). Add them
 	// so sparseFakePortal returns them as present-with-marker lines.
 	for from := start; from <= end; from += pageSize {
-		to := from + pageSize - 1
+		to := from + uint64(pageSize) - 1
 		if to > end {
 			to = end
 		}
@@ -251,10 +251,10 @@ func TestParallelPrefetcherSparseCoverageVsNonEmpty(t *testing.T) {
 			break
 		}
 		if pg.err != nil {
-			t.Fatalf("unexpected page err [%d-%d]: %v", pg.from, pg.to, pg.err)
+			t.Fatalf("unexpected page err [%d-%d]: %v", pg.from, pg.coveredTo, pg.err)
 		}
-		if pg.to > pageHi {
-			pageHi = pg.to
+		if pg.coveredTo > pageHi {
+			pageHi = pg.coveredTo
 		}
 		for _, n := range covParseBlockNumbers(pg.raw) {
 			nonEmpty++
@@ -335,8 +335,8 @@ func TestIntegrationParallelFetchCoverageStat(t *testing.T) {
 		present = append(present, n)
 	}
 	_, pageSize, _ := ParallelFetchSettings()
-	for from := startBlock; from <= endBlock; from += pageSize {
-		to := from + pageSize - 1
+	for from := startBlock; from <= endBlock; from += uint64(pageSize) {
+		to := from + uint64(pageSize) - 1
 		if to > endBlock {
 			to = endBlock
 		}
@@ -496,5 +496,5 @@ func covNextAdvanced(t *testing.T, logged string, endBlock uint64) bool {
 		}
 	}
 	_, pageSize, _ := ParallelFetchSettings()
-	return maxNext+pageSize >= endBlock
+	return maxNext+uint64(pageSize) >= endBlock
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/parser"
+	"github.com/holiman/uint256"
 )
 
 func TestNextRequestRangeCursorCapsToLocalEnd(t *testing.T) {
@@ -258,6 +260,30 @@ func TestFastJSONLParserRetainedStringsSurviveParserReuse(t *testing.T) {
 	}
 }
 
+func TestRetainReplayJSONLPageOwnsResponseBytes(t *testing.T) {
+	response := []byte("{\"header\":{\"number\":1}}\n{\"header\":{\"number\":2}}\n")
+	retained := retainReplayJSONLPage(response)
+
+	var lines [][]byte
+	p := parser.NewFastJSONLParser(2)
+	if err := p.ParseWithLine(retained, func(_ *parser.Block, rawLine []byte) error {
+		lines = append(lines, rawLine)
+		return nil
+	}); err != nil {
+		t.Fatalf("parse retained page: %v", err)
+	}
+
+	for i := range response {
+		response[i] = 'x'
+	}
+	if got, want := string(lines[0]), `{"header":{"number":1}}`; got != want {
+		t.Fatalf("first retained line changed after source reuse: got %q, want %q", got, want)
+	}
+	if got, want := string(lines[1]), `{"header":{"number":2}}`; got != want {
+		t.Fatalf("second retained line changed after source reuse: got %q, want %q", got, want)
+	}
+}
+
 func TestIngestionDecodeScratchDoesNotCorruptSecondLogData(t *testing.T) {
 	contracts := []config.ChainContractConfig{{
 		Name:    "Scratch",
@@ -288,7 +314,19 @@ func TestIngestionDecodeScratchDoesNotCorruptSecondLogData(t *testing.T) {
 			if err != nil {
 				t.Fatalf("decode log %d: %v", lg.LogIndex, err)
 			}
-			values = append(values, ev.Params["value"].(string))
+			// Handle both native uint256.Int and normalized string types
+			var valStr string
+			switch v := ev.Params["value"].(type) {
+			case string:
+				valStr = v
+			case *uint256.Int:
+				valStr = v.Dec()
+			case uint256.Int:
+				valStr = v.Dec()
+			default:
+				valStr = fmt.Sprintf("%v", v)
+			}
+			values = append(values, valStr)
 		}
 		return nil
 	}); err != nil {

@@ -46,6 +46,7 @@ package generated
 	b.WriteString("\t// lastCommitWallNanos is the unix-nanos of the last hot-state commit, used\n")
 	b.WriteString("\t// by the hybrid block/time commit cadence. 0 means \"not yet committed\".\n")
 	b.WriteString("\tlastCommitWallNanos int64\n")
+	b.WriteString("\tcommitDone chan stateCommitResult\n")
 	b.WriteString("\t// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only\n")
 	b.WriteString("\t// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized\n")
 	b.WriteString("\t// head); during finalized backfill they are pure GC/memory churn, so the\n")
@@ -54,6 +55,7 @@ package generated
 	b.WriteString("\tsnapshots []memorySnapshot\n")
 	b.WriteString("\tsnapshotIdx int\n")
 	b.WriteString("}\n\n")
+	b.WriteString("type stateCommitResult struct {\n\tblock uint64\n\terr error\n}\n\n")
 
 	b.WriteString("type memorySnapshot struct {\n\tblockNumber uint64\n")
 	for _, spec := range specs {
@@ -84,7 +86,59 @@ package generated
 	if s == nil || s.HotState == nil || store == nil {
 		return nil
 	}
-	return s.HotState.Commit(ctx, store.Conn(), store.DB())
+	conn := store.Conn()
+	if commitStore, ok := store.(interface{ CommitConn() *ch.Client }); ok && commitStore.CommitConn() != nil {
+		conn = commitStore.CommitConn()
+	}
+	return s.HotState.Commit(ctx, conn, store.DB())
+}
+
+func (s *State) StartCommit(ctx context.Context, store Store, blockNumber uint64) bool {
+	if s == nil || s.commitDone != nil {
+		return false
+	}
+	done := make(chan stateCommitResult, 1)
+	s.commitDone = done
+	go func() {
+		done <- stateCommitResult{block: blockNumber, err: s.Commit(ctx, store)}
+	}()
+	return true
+}
+
+func (s *State) PollCommit() error {
+	if s == nil || s.commitDone == nil {
+		return nil
+	}
+	select {
+	case result := <-s.commitDone:
+		s.commitDone = nil
+		if result.err == nil && result.block > s.LastSyncBlock {
+			s.LastSyncBlock = result.block
+		}
+		return result.err
+	default:
+		return nil
+	}
+}
+
+func (s *State) WaitCommit(ctx context.Context) error {
+	if s == nil || s.commitDone == nil {
+		return nil
+	}
+	select {
+	case result := <-s.commitDone:
+		s.commitDone = nil
+		if result.err == nil && result.block > s.LastSyncBlock {
+			s.LastSyncBlock = result.block
+		}
+		return result.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *State) CommitInFlight() bool {
+	return s != nil && s.commitDone != nil
 }
 
 // LoadFromClickHouse rebuilds the in-memory hot state from the durable memory_*
@@ -414,11 +468,23 @@ func renderStateHandleGetValue(b *bytes.Buffer, handle stateHandleSpec) {
 	b.WriteString(")\n\tif !ok {\n")
 	if entityUsesCold(handle.spec.table) {
 		// Cold tier already consulted inside GetByFields. A hot+cold miss under an
-		// authoritative (from-genesis) cold tier means the key provably does not
-		// exist in ClickHouse, so skip the point-SELECT entirely — this is what
-		// removes the per-miss SELECT storm. Non-authoritative (resume / cursor) or
-		// cold-disabled keeps the ClickHouse fallback below.
-		b.WriteString("\t\tif h.state.HotState != nil && h.state.HotState.coldAuthoritative {\n\t\t\treturn ")
+		// authoritative (from-genesis) cold tier normally means the key provably does
+		// not exist in ClickHouse, so skip the point-SELECT entirely — this is what
+		// removes the per-miss SELECT storm. BUT the bounded flat cold backend EVICTS,
+		// so a miss is only provably-new when the negative filter confirms the key was
+		// never written (ColdMightContain==false). An evicted key (==true) must still
+		// fall back to ClickHouse below, otherwise its cumulative state would be
+		// silently reset to zero. Non-authoritative (resume / cursor) always falls back.
+		b.WriteString("\t\tif h.state.HotState != nil && h.state.HotState.coldAuthoritative && !h.state.HotState.")
+		b.WriteString(handle.spec.baseName)
+		b.WriteString(".ColdMightContain(")
+		for i, field := range keyFields {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(lowerFirst(field.Name))
+		}
+		b.WriteString(") {\n\t\t\treturn ")
 		b.WriteString(handle.valueName)
 		b.WriteString("{}, false\n\t\t}\n")
 	}
@@ -435,6 +501,19 @@ func renderStateHandleGetValue(b *bytes.Buffer, handle stateHandleSpec) {
 		b.WriteString(lowerFirst(field.Name))
 	}
 	b.WriteString("}\n")
+	// Prefetch dry-run: while recordMode is set, just queue the missing key for the
+	// batched ResolveAllPending and return a miss. The per-key synchronous Resolve
+	// below is skipped — that is the whole point of prefetch (one round-trip per
+	// entity per block instead of one per missing key). The second (apply) pass runs
+	// with recordMode off and keeps the lazy fallback for any key the dry run missed.
+	b.WriteString("\t\t\tif h.state.HotState.recordMode {\n")
+	b.WriteString("\t\t\t\th.state.HotState.")
+	b.WriteString(handle.spec.baseName)
+	b.WriteString("Resolver.Queue(key)\n")
+	b.WriteString("\t\t\t\treturn ")
+	b.WriteString(handle.valueName)
+	b.WriteString("{}, false\n")
+	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t\th.state.HotState.")
 	b.WriteString(handle.spec.baseName)
 	b.WriteString("Resolver.Queue(key)\n")
@@ -490,6 +569,10 @@ func renderStateHandleSave(b *bytes.Buffer, handle stateHandleSpec) {
 	b.WriteString(handle.valueName)
 	b.WriteString(", meta EventMeta) {\n")
 	b.WriteString("\tif h.state == nil || h.state.HotState == nil || value == nil {\n\t\treturn\n\t}\n")
+	// Suppress writes during the prefetch dry-run pass: the value here was computed
+	// from miss-everything reads and would corrupt state. The apply pass (recordMode
+	// off) does the real Save, so the dry run has no committed side effects.
+	b.WriteString("\tif h.state.HotState.recordMode {\n\t\treturn\n\t}\n")
 	for _, field := range handle.spec.table.Fields {
 		switch field.Name {
 		case "BlockNumber", "UpdatedAtBlock":

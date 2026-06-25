@@ -36,6 +36,36 @@ type FastJSONLProcessor interface {
 	ProcessJSONL(ctx context.Context, store *database.Store, data []byte) (uint64, error)
 }
 
+// FastJSONLInsertProcessor extends the raw JSONL path so one generated parse
+// both runs custom state processing and fills native ClickHouse event batches.
+// The returned flush must be called before the processor is used for another
+// batch. A nil flush means there is nothing to insert.
+type FastJSONLInsertProcessor interface {
+	FastJSONLProcessor
+	ProcessJSONLWithInserts(ctx context.Context, store *database.Store, data []byte) (uint64, func(context.Context) error, error)
+}
+
+// BatchParsedBlock carries one generated columnar block from the producer parse
+// stage to the consumer. Block is type-erased so generated packages can expose
+// their concrete proto block through the public sqd package.
+type BatchParsedBlock struct {
+	Number    uint64
+	Hash      string
+	Timestamp time.Time
+	RawLine   []byte
+	Block     any
+}
+
+// FastBatchParseProcessor parses each portal page once on the producer, fills
+// typed insert columns, and hands parsed blocks to the consumer for state math.
+type FastBatchParseProcessor interface {
+	FastJSONLInsertProcessor
+	SupportsBatchParse() bool
+	ParseBatchForInserts(store *database.Store, data []byte, endBlock uint64, onParsed func(BatchParsedBlock) error) (uint64, func(context.Context) error, error)
+	ProcessParsedBlock(ctx context.Context, store *database.Store, block any) error
+	ReclaimParseBatches()
+}
+
 // CommitHorizonReporter is optionally implemented by processors that durably
 // commit derived state at intervals. When implemented, the ingestion checkpoint
 // is gated so it never leads this horizon: a crash resumes from durable state
@@ -82,6 +112,17 @@ func (p ProcessorProfile) Delta(previous ProcessorProfile) ProcessorProfile {
 		FPMMResolveDuration:      nonNegativeDurationDelta(p.FPMMResolveDuration, previous.FPMMResolveDuration),
 		FPMMRoundTrips:           maxInt64(p.FPMMRoundTrips-previous.FPMMRoundTrips, 0),
 	}
+}
+
+// PrefetchProcessor is optionally implemented by processors that support the
+// two-pass batch prefetch (--prefetch): each block is dispatched once to collect
+// its hot-state read-set, the misses are resolved in one ClickHouse round-trip per
+// entity, then the block is dispatched again for real against the warm cache. This
+// collapses the lazy path's one-SELECT-per-missing-key into one SELECT per entity
+// per block — a large win in resume/cursor mode against a populated ClickHouse,
+// where per-key cold misses otherwise dominate. Opt-in: off by default.
+type PrefetchProcessor interface {
+	EnablePrefetch(enabled bool)
 }
 
 // ColdCacheProcessor is optionally implemented by processors that keep a

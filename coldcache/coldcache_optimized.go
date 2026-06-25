@@ -3,10 +3,10 @@ package coldcache
 import (
 	"log"
 	"os"
-	"strconv"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
 // Optimized configurations to benchmark
@@ -23,9 +23,8 @@ const (
 // OpenOptimized opens a Pebble store with the specified optimization profile
 func OpenOptimized(dir string, cacheBytes int64, memTableBytes uint64, config OptimConfig) (*Store, error) {
 	if cacheBytes <= 0 {
-		if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
-			cacheBytes = mb << 20
-		} else {
+		cacheBytes = envconfig.ColdCacheSize()
+		if cacheBytes <= 0 {
 			cacheBytes = defaultCacheBytes()
 		}
 	}

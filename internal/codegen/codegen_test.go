@@ -85,6 +85,9 @@ chains:
 	assertContains(t, schemaGo, "type Log struct")
 	assertContains(t, schemaGo, "type SyncState struct")
 
+	parserGo := readText(t, filepath.Join(root, "generated", "parser.go"))
+	assertContains(t, parserGo, "func ParseJSONLProtoStream(data []byte, batches *InsertBatches, ring *ProtoRingBuffer")
+
 	processor := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
 	assertNotContains(t, processor, "type Entities struct")
 	assertContains(t, processor, "type AddressPosition struct")
@@ -362,11 +365,23 @@ type MemoryHoldingSchema struct {
 	assertContains(t, stateGo, "Position       PositionState")
 	assertContains(t, stateGo, "func (h PositionState) Get(account common.Address, assetID common.Hash) (*Position, bool)")
 	assertContains(t, stateGo, "func (h PositionState) Save(value *Position, meta EventMeta)")
+	assertContains(t, stateGo, "func (s *State) StartCommit(ctx context.Context, store Store, blockNumber uint64) bool")
+	assertContains(t, stateGo, "func (s *State) PollCommit() error")
 	assertContains(t, stateGo, "val, ok := h.state.HotState.Holdings.GetByFields(account, assetID)")
 	assertNotContains(t, stateGo, "MetricsEnabled()")
 	assertContains(t, stateGo, "h.state.HotState.UpdateMemoryHolding(*value)")
 	assertNotContains(t, stateGo, "Internal"+"PositionState")
 	assertNotContains(t, stateGo, "User"+"PositionKey")
+
+	// Both async-insert modes are generated; SQD_ASYNC_INSERT_FLUSH picks at runtime.
+	// Fire-and-forget (wait=0) plus an explicit queue flush, and the default per-insert
+	// wait (wait=1) that keeps read-backs race-free.
+	hotStateGo := readText(t, filepath.Join(root, "generated", "hotstate.go"))
+	assertContains(t, hotStateGo, `{Key: "wait_for_async_insert", Value: "0", Important: true}`)
+	assertContains(t, hotStateGo, `{Key: "wait_for_async_insert", Value: "1", Important: true}`)
+	assertContains(t, hotStateGo, `Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"`)
+	assertContains(t, hotStateGo, "func asyncInsertFireAndForget() bool")
+	assertContains(t, hotStateGo, "SQD_ASYNC_INSERT_FLUSH")
 
 	processorGo := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
 	assertContains(t, processorGo, "hot.HoldingsResolver.Queue(HoldingsClockKey{Account: ev.Account, AssetID: ev.AssetID})")
@@ -520,6 +535,10 @@ type DummyStateSchema struct {
 	assertContains(t, emptyProc, "var CustomProcessFn func(state *State, block *ParsedBlock) error")
 	assertContains(t, emptyProc, "func CustomProcessing(ctx context.Context, store Store, state *State, block *ParsedBlock) error")
 	assertContains(t, emptyProc, "func NewProcessor(protoMode bool) (*Processor, error)")
+	assertContains(t, emptyProc, "func (p *Processor) ProcessJSONL(ctx context.Context, store *sqd.Store, data []byte) (uint64, error)")
+	assertContains(t, emptyProc, "func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *sqd.Store, data []byte) (uint64, func(context.Context) error, error)")
+	assertContains(t, emptyProc, "func (p *Processor) ParseBatchForInserts(store *sqd.Store, data []byte, endBlock uint64, onParsed func(sqd.BatchParsedBlock) error)")
+	assertContains(t, emptyProc, "func (p *Processor) ProcessParsedBlock(ctx context.Context, store *sqd.Store, block any) error")
 	assertContains(t, emptyProc, "const defaultRingBufferSize uint32 = 8192")
 	assertContains(t, emptyProc, "var stateStore Store")
 	assertContains(t, emptyProc, "p.State.Store = stateStore")
