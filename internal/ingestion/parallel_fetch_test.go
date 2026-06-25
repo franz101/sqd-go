@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -348,5 +350,570 @@ func TestRateLimiterPacesAndCancels(t *testing.T) {
 	cancel()
 	if err := slow.wait(cctx); err == nil {
 		t.Fatal("expected ctx error after cancel, got nil")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Empty-response / deadlock regression tests (c40b5fd follow-up)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestParallelPrefetcherRegression_EmptyResponseNoDeadlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{})
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 1000, 2000, 500, 6, noRateLimit())
+	p.launch(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, ok := p.Next(context.Background()); !ok {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DEADLOCK: parallel fetch did not terminate on all-empty responses")
+	}
+}
+
+func TestParallelPrefetcherRegression_MultipleWorkersAllEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{})
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 5000, 500, 6, noRateLimit())
+	p.launch(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, ok := p.Next(context.Background()); !ok {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("6-worker parallel fetch deadlocked on all-empty responses")
+	}
+}
+
+func TestParallelPrefetcherRegression_EmptyThenData(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		if q.FromBlock == 1500 {
+			fmt.Fprintf(w, "{\"header\":{\"number\":1500,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", 1500, 1700001500)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{})
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 1000, 2000, 500, 1, noRateLimit())
+	p.launch(context.Background())
+	done := make(chan []uint64, 1)
+	go func() {
+		var blocks []uint64
+		for {
+			pg, ok := p.Next(context.Background())
+			if !ok {
+				break
+			}
+			if pg.err != nil {
+				t.Errorf("unexpected fatal err: %v", pg.err)
+				break
+			}
+			blocks = append(blocks, blockNumbersOf(t, pg.raw)...)
+		}
+		done <- blocks
+	}()
+	select {
+	case blocks := <-done:
+		if len(blocks) != 1 || blocks[0] != 1500 {
+			t.Fatalf("got blocks=%v, want [1500]", blocks)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parallel fetch did not terminate after empty-then-data sequence")
+	}
+}
+
+func TestParallelPrefetcherRegression_SingleWorkerEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{})
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 10000, 1000, 1, noRateLimit())
+	p.launch(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, ok := p.Next(context.Background()); !ok {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("single-worker deadlocked on empty responses")
+	}
+}
+
+func TestParallelPrefetcherRegression_SparseEmptyResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		if q.FromBlock%1000 != 0 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte{})
+			return
+		}
+		last := q.FromBlock + 99
+		if q.ToBlock != nil && last > *q.ToBlock {
+			last = *q.ToBlock
+		}
+		var b strings.Builder
+		for n := q.FromBlock; n <= last; n += 1000 {
+			fmt.Fprintf(&b, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", n, n, 1700000000+n)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, false, 1000, 3000, 500, 3, noRateLimit())
+	p.launch(context.Background())
+	var got []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("unexpected err: %v", pg.err)
+		}
+		got = append(got, blockNumbersOf(t, pg.raw)...)
+	}
+	if len(got) != 3 || got[0] != 1000 || got[1] != 2000 || got[2] != 3000 {
+		t.Fatalf("got %v, want [1000,2000,3000]", got)
+	}
+}
+
+func TestParallelPrefetcherRegression_HighConcurrencyStress(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		last := q.FromBlock + 99
+		if q.ToBlock != nil && last > *q.ToBlock {
+			last = *q.ToBlock
+		}
+		var b strings.Builder
+		for n := q.FromBlock; n <= last; n++ {
+			fmt.Fprintf(&b, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", n, n, 1700000000+n)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 100000, 1000, 32, noRateLimit())
+	p.launch(context.Background())
+	var got []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("err: %v", pg.err)
+		}
+		got = append(got, blockNumbersOf(t, pg.raw)...)
+	}
+	if uint64(len(got)) != 100001 {
+		t.Fatalf("got %d blocks, want 100001", len(got))
+	}
+	for i, n := range got {
+		if n != uint64(i) {
+			t.Fatalf("block[%d]=%d, want %d", i, n, i)
+		}
+	}
+}
+
+func TestParallelPrefetcherRegression_MultipleTransientErrors(t *testing.T) {
+	var mu sync.Mutex
+	attempts := make(map[uint64]int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		mu.Lock()
+		attempts[q.FromBlock]++
+		n := attempts[q.FromBlock]
+		mu.Unlock()
+		if n <= 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("transient"))
+			return
+		}
+		fmt.Fprintf(w, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", q.FromBlock, q.FromBlock, 1700000000+q.FromBlock)
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 0, 1, 1, noRateLimit())
+	p.launch(context.Background())
+	done := make(chan []uint64, 1)
+	go func() {
+		var blocks []uint64
+		for {
+			pg, ok := p.Next(context.Background())
+			if !ok {
+				break
+			}
+			if pg.err != nil {
+				t.Errorf("unexpected fatal err: %v", pg.err)
+				break
+			}
+			blocks = append(blocks, blockNumbersOf(t, pg.raw)...)
+		}
+		done <- blocks
+	}()
+	select {
+	case blocks := <-done:
+		if len(blocks) != 1 || blocks[0] != 0 {
+			t.Fatalf("got blocks=%v, want [0]", blocks)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("parallel fetch did not recover from multiple transient errors")
+	}
+}
+
+func TestParallelPrefetcherRegression_MixedEmptyAndData(t *testing.T) {
+	var requestCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		n := requestCount.Add(1)
+		if n%2 == 0 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte{})
+			return
+		}
+		fmt.Fprintf(w, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", q.FromBlock, q.FromBlock, 1700000000+q.FromBlock)
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 100, 10, 2, noRateLimit())
+	p.launch(context.Background())
+	done := make(chan []uint64, 1)
+	go func() {
+		var blocks []uint64
+		for {
+			pg, ok := p.Next(context.Background())
+			if !ok {
+				break
+			}
+			if pg.err != nil {
+				t.Errorf("err: %v", pg.err)
+				break
+			}
+			blocks = append(blocks, blockNumbersOf(t, pg.raw)...)
+		}
+		done <- blocks
+	}()
+	select {
+	case blocks := <-done:
+		if len(blocks) == 0 {
+			t.Fatal("got no blocks")
+		}
+		for i := 1; i < len(blocks); i++ {
+			if blocks[i] <= blocks[i-1] {
+				t.Fatalf("blocks not ascending: ...%d, %d...", blocks[i-1], blocks[i])
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled on mixed empty/data chunks")
+	}
+}
+
+func TestParallelPrefetcherRegression_SingleBlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		fmt.Fprintf(w, "{\"header\":{\"number\":42,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", 42, 1700000042)
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 42, 42, 100, 1, noRateLimit())
+	p.launch(context.Background())
+	var got []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("err: %v", pg.err)
+		}
+		got = append(got, blockNumbersOf(t, pg.raw)...)
+	}
+	if len(got) != 1 || got[0] != 42 {
+		t.Fatalf("got %v, want [42]", got)
+	}
+}
+
+func TestParallelPrefetcherRegression_PageSizeOne(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		fmt.Fprintf(w, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", q.FromBlock, q.FromBlock, 1700000000+q.FromBlock)
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 9, 1, 3, noRateLimit())
+	p.launch(context.Background())
+	var got []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("err: %v", pg.err)
+		}
+		got = append(got, blockNumbersOf(t, pg.raw)...)
+	}
+	if uint64(len(got)) != 10 {
+		t.Fatalf("got %d blocks, want 10", len(got))
+	}
+	for i, n := range got {
+		if n != uint64(i) {
+			t.Fatalf("block[%d]=%d, want %d", i, n, i)
+		}
+	}
+}
+
+func TestParallelPrefetcherRegression_Boundary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		last := q.FromBlock + 99
+		if q.ToBlock != nil && last > *q.ToBlock {
+			last = *q.ToBlock
+		}
+		var b strings.Builder
+		for n := q.FromBlock; n <= last; n++ {
+			fmt.Fprintf(&b, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", n, n, 1700000000+n)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 99, 100, 1, noRateLimit())
+	p.launch(context.Background())
+	var got []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("err: %v", pg.err)
+		}
+		got = append(got, blockNumbersOf(t, pg.raw)...)
+	}
+	if uint64(len(got)) != 100 {
+		t.Fatalf("got %d blocks, want 100", len(got))
+	}
+	for i, n := range got {
+		if n != uint64(i) {
+			t.Fatalf("block[%d]=%d, want %d", i, n, i)
+		}
+	}
+}
+
+func TestParallelPrefetcherRegression_OutOfOrderReassembly(t *testing.T) {
+	var requestCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		n := requestCount.Add(1)
+		if n%2 == 1 {
+			time.Sleep(20 * time.Millisecond)
+		}
+		last := q.FromBlock + 49
+		if q.ToBlock != nil && last > *q.ToBlock {
+			last = *q.ToBlock
+		}
+		var b strings.Builder
+		for nn := q.FromBlock; nn <= last; nn++ {
+			fmt.Fprintf(&b, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", nn, nn, 1700000000+nn)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 199, 50, 4, noRateLimit())
+	p.launch(context.Background())
+	var got []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("err: %v", pg.err)
+		}
+		got = append(got, blockNumbersOf(t, pg.raw)...)
+	}
+	if uint64(len(got)) != 200 {
+		t.Fatalf("got %d blocks, want 200", len(got))
+	}
+	for i, n := range got {
+		if n != uint64(i) {
+			t.Fatalf("block[%d]=%d, want %d", i, n, i)
+		}
+	}
+}
+
+func TestParallelPrefetcherRegression_WorkerCountExceedsPages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		fmt.Fprintf(w, "{\"header\":{\"number\":0,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", 0, 1700000000)
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 0, 1, 16, noRateLimit())
+	p.launch(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, ok := p.Next(context.Background()); !ok {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("excess workers did not exit")
+	}
+}
+
+func TestParallelPrefetcherRegression_CancelDuringBackoff(t *testing.T) {
+	var requestCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := requestCount.Add(1)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		if n <= 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("transient"))
+			return
+		}
+		fmt.Fprintf(w, "{\"header\":{\"number\":0,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", 0, 1700000000)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	p := newParallelPrefetcher(srv.URL, nil, true, 0, 10000, 1000, 2, noRateLimit())
+	p.launch(ctx)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, ok := p.Next(ctx); !ok {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("workers did not exit after cancel")
+	}
+}
+
+func TestParallelPrefetcherRegression_SparseConsumerGapSkip(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+		if q.FromBlock%2000 != 0 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte{})
+			return
+		}
+		last := q.FromBlock + 49
+		if q.ToBlock != nil && last > *q.ToBlock {
+			last = *q.ToBlock
+		}
+		var b strings.Builder
+		for n := q.FromBlock; n <= last; n += 2000 {
+			fmt.Fprintf(&b, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", n, n, 1700000000+n)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+	p := newParallelPrefetcher(srv.URL, nil, false, 0, 10000, 1000, 3, noRateLimit())
+	p.launch(context.Background())
+	var consumed []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("err: %v", pg.err)
+		}
+		consumed = append(consumed, blockNumbersOf(t, pg.raw)...)
+	}
+	if len(consumed) == 0 {
+		t.Fatal("consumed no blocks")
+	}
+	for i := 1; i < len(consumed); i++ {
+		if consumed[i] <= consumed[i-1] {
+			t.Fatalf("blocks not ascending: ...%d, %d...", consumed[i-1], consumed[i])
+		}
 	}
 }

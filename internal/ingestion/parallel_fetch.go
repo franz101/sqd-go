@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/franz101/sqd-go/internal/client"
+	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
 // headerNumberRe pulls the "number" out of a block-header JSONL line. With the
@@ -57,9 +58,9 @@ type rateLimiter struct {
 // Workers: concurrent HTTP fetchers. Page size: blocks per work unit.
 // RPS: target request rate to the portal (shared across all workers).
 func ParallelFetchSettings() (workers, pageSize int, rps float64) {
-	workers = defaultParallelFetchers
-	pageSize = defaultParallelPageSize
-	rps = defaultParallelRPS
+	workers = envconfig.ParallelFetchers()
+	pageSize = envconfig.ParallelPageSize()
+	rps = envconfig.ParallelRPS()
 	return
 }
 
@@ -111,13 +112,13 @@ func (r *rateLimiter) wait(ctx context.Context) error {
 // a successful portal response completes, eliminating the stall where
 // the consumer waits for a full 10,000-block page to accumulate.
 type fetchChunk struct {
-	seq        uint64         // sequence number for ordering
-	from       uint64         // first requested block
-	coveredTo  uint64         // last block covered by this response
-	requestedTo uint64        // pinned upper bound of the request
-	raw        []byte         // response JSONL
-	head       client.Head    // chain head
-	err        error          // fetch error if any
+	seq         uint64      // sequence number for ordering
+	from        uint64      // first requested block
+	coveredTo   uint64      // last block covered by this response
+	requestedTo uint64      // pinned upper bound of the request
+	raw         []byte      // response JSONL
+	head        client.Head // chain head
+	err         error       // fetch error if any
 }
 
 // parallelPrefetcher fetches a bounded, fully-finalized block range using N
@@ -147,10 +148,9 @@ type parallelPrefetcher struct {
 	endBlock         uint64 // inclusive
 	pageSize         uint64 // grid-page width for work partitioning
 	workers          int
-	maxAhead         uint64 // bounded look-ahead window, in chunks
+	maxAhead         uint64 // bounded look-ahead window, in block numbers
 	limiter          *rateLimiter
 
-	nextSeq   atomic.Uint64 // global sequence counter for chunk ordering
 	nextClaim atomic.Uint64 // next work range index to claim
 
 	mu        sync.Mutex
@@ -179,7 +179,7 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 		endBlock:         end,
 		pageSize:         pageSize,
 		workers:          workers,
-		maxAhead:         uint64(workers*4) + 8, // Allow more chunks ahead since they're smaller
+		maxAhead:         pageSize * uint64(workers),
 		limiter:          limiter,
 		ready:            make(map[uint64]*fetchChunk),
 	}
@@ -225,7 +225,7 @@ func (p *parallelPrefetcher) Next(ctx context.Context) (*fetchChunk, bool) {
 		if chunk, ok := p.ready[p.nextEmit]; ok {
 			delete(p.ready, p.nextEmit)
 			p.nextEmit = chunk.coveredTo + 1 // advance to next expected block
-			p.cond.Broadcast() // slide the look-ahead window
+			p.cond.Broadcast()               // slide the look-ahead window
 			return chunk, true
 		}
 
@@ -284,7 +284,7 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 			return
 		}
 
-		if !p.waitForWindow(ctx) {
+		if !p.waitForWindow(ctx, from) {
 			return
 		}
 
@@ -296,16 +296,14 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 }
 
 // waitForWindow blocks until the worker is within the look-ahead window.
-func (p *parallelPrefetcher) waitForWindow(ctx context.Context) bool {
+func (p *parallelPrefetcher) waitForWindow(ctx context.Context, from uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
 		if ctx.Err() != nil || p.stopClaim {
 			return false
 		}
-		// Since chunks are smaller than pages, we allow more ahead
-		seq := p.nextSeq.Load()
-		if seq < p.nextEmit + p.maxAhead {
+		if from <= p.nextEmit+p.maxAhead {
 			return true
 		}
 		p.cond.Wait()
@@ -322,6 +320,9 @@ func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *clie
 
 	for cur <= pageEnd {
 		if ctx.Err() != nil {
+			return false
+		}
+		if !p.waitForWindow(ctx, cur) {
 			return false
 		}
 
@@ -392,12 +393,12 @@ func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *clie
 
 		// Deliver this chunk immediately (even if empty)
 		p.deliverChunk(&fetchChunk{
-			seq:        seq,
-			from:       cur,
-			coveredTo:  coveredTo,
+			seq:         seq,
+			from:        cur,
+			coveredTo:   coveredTo,
 			requestedTo: toPin,
-			raw:        rawCopy,
-			head:       resp.Head,
+			raw:         rawCopy,
+			head:        resp.Head,
 		})
 
 		// Check if we should stop (error chunk was delivered)

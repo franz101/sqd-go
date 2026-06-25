@@ -4,9 +4,14 @@ import (
 	"testing"
 )
 
-// TestGetIntoMatchesGet proves GetInto returns the same bytes as Get for a
-// pointer-free value, decoding straight into the destination struct. This is the
-// path the generated clock-cache cold fallback uses (finding C6).
+// TestGetIntoMatchesGet proves GetInto writes the same bytes into a caller-owned
+// buffer that Get returns in a freshly allocated slice, for a pointer-free value.
+//
+// GetInto is the zero-allocation cold-read path the generated clock-cache
+// fallback uses (finding C6): rather than allocate a result slice per cold hit
+// like Get, it decodes straight into the destination struct's backing array. The
+// two must stay byte-for-byte identical — a divergence (short copy, wrong length,
+// stale buffer) would make the cold tier silently return corrupt state.
 func TestGetIntoMatchesGet(t *testing.T) {
 	s, err := Open(t.TempDir()+"/cc", 8<<20, 4<<20)
 	if err != nil {

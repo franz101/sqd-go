@@ -13,15 +13,17 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/franz101/sqd-go/internal/parser"
 	"github.com/franz101/sqd-go/abiunpack"
+	"github.com/franz101/sqd-go/internal/parser"
 	"github.com/holiman/uint256"
 )
 
 // Store wraps a ClickHouse native-protocol connection and the target database name.
 type Store struct {
-	conn *ch.Client
-	db   string
+	conn       *ch.Client
+	insertConn *ch.Client
+	commitConn *ch.Client
+	db         string
 }
 
 // BlockRow is a single row in the blocks table, used during fork tracking.
@@ -69,12 +71,13 @@ type EnsureTablesOptions struct {
 // NewClickHouse connects to ClickHouse via the native protocol, creates the
 // target database if it doesn't exist, and returns a Store.
 func NewClickHouse(ctx context.Context, host string, port int, user, password, db string) (*Store, error) {
-	conn, err := ch.Dial(ctx, ch.Options{
+	opts := ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
 		Database: "default",
 		User:     user,
 		Password: password,
-	})
+	}
+	conn, err := ch.Dial(ctx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("connect clickhouse: %w", err)
 	}
@@ -82,7 +85,18 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 		conn.Close()
 		return nil, fmt.Errorf("create database %s: %w", db, err)
 	}
-	return &Store{conn: conn, db: db}, nil
+	insertConn, err := ch.Dial(ctx, opts)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("connect clickhouse insert connection: %w", err)
+	}
+	commitConn, err := ch.Dial(ctx, opts)
+	if err != nil {
+		_ = insertConn.Close()
+		conn.Close()
+		return nil, fmt.Errorf("connect clickhouse commit connection: %w", err)
+	}
+	return &Store{conn: conn, insertConn: insertConn, commitConn: commitConn, db: db}, nil
 }
 
 // DropClickHouseDatabase drops the named database (used by --restart).
@@ -101,7 +115,30 @@ func DropClickHouseDatabase(ctx context.Context, host string, port int, user, pa
 }
 
 func (s *Store) Close() error {
+	if s.insertConn != nil {
+		_ = s.insertConn.Close()
+	}
+	if s.commitConn != nil {
+		_ = s.commitConn.Close()
+	}
 	return s.conn.Close()
+}
+
+// InsertConn is dedicated to generated event-batch writes so they can overlap
+// state processing on Conn without concurrent use of one ch.Client.
+func (s *Store) InsertConn() *ch.Client {
+	if s == nil {
+		return nil
+	}
+	return s.insertConn
+}
+
+// CommitConn is dedicated to durable generated state commits.
+func (s *Store) CommitConn() *ch.Client {
+	if s == nil {
+		return nil
+	}
+	return s.commitConn
 }
 
 func (s *Store) Conn() *ch.Client {

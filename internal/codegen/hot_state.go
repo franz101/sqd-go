@@ -53,7 +53,27 @@ package generated
 }
 
 func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
-	host, user, password, _, port := envconfig.ClickHouse("default")
+	// Connection settings are read straight from the environment: generated code
+	// is a standalone module and must not import sqd-go internal packages. These
+	// defaults mirror internal/envconfig.ClickHouse.
+	host := "127.0.0.1"
+	if v := os.Getenv("CLICKHOUSE_HOST"); v != "" {
+		host = v
+	}
+	port := 9000
+	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			port = n
+		}
+	}
+	user := "default"
+	if v := os.Getenv("CLICKHOUSE_USER"); v != "" {
+		user = v
+	}
+	password := "sqd-clickhouse"
+	if v := os.Getenv("CLICKHOUSE_PASSWORD"); v != "" {
+		password = v
+	}
 	return ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
 		Database: "default",
@@ -63,7 +83,13 @@ func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
 }
 
 func recoveryRecencyClause() string {
-	mb := envconfig.RecoveryMinBlockNumber()
+	// SQD_RECOVERY_MIN_BLOCK floor, read inline (see recoveryDialConn).
+	var mb uint64
+	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			mb = uint64(n)
+		}
+	}
 	if mb == 0 {
 		return ""
 	}
@@ -156,6 +182,33 @@ feed:
 	return firstErr
 }
 
+// asyncInsertFireAndForget reports whether commits use wait_for_async_insert=0.
+// Fire-and-forget is faster but only guarantees rows are queryable after an
+// explicit SYSTEM FLUSH ASYNC INSERT QUEUE, which Commit issues at each commit
+// boundary. The default (unset) keeps wait_for_async_insert=1, which waits per
+// insert so a read-back right after Commit always sees the rows. Toggle with
+// SQD_ASYNC_INSERT_FLUSH=1.
+func asyncInsertFireAndForget() bool {
+	v := os.Getenv("SQD_ASYNC_INSERT_FLUSH")
+	return v == "1" || v == "true"
+}
+
+func asyncInsertSettings() []ch.Setting {
+	if asyncInsertFireAndForget() {
+		return []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}
+	}
+	return []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}
+}
+
+// flushAsyncInserts drains the server-side async-insert queue so subsequent
+// read-backs see all committed rows. No-op unless fire-and-forget is enabled.
+func flushAsyncInserts(ctx context.Context, conn *ch.Client) error {
+	if conn == nil || !asyncInsertFireAndForget() {
+		return nil
+	}
+	return conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
+}
+
 `)
 	} else {
 		b.WriteString("\n")
@@ -184,16 +237,15 @@ feed:
 
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
-		`"context"`:                                         "",
-		`"encoding/binary"`:                                 "",
-		`"fmt"`:                                             "",
-		`"strings"`:                                         "",
-		`"sync"`:                                            "",
-		`"sync/atomic"`:                                     "",
-		`"github.com/ClickHouse/ch-go"`:                     "",
-		`"github.com/ClickHouse/ch-go/proto"`:               "",
-		`"github.com/franz101/sqd-go/coldcache"`:            "",
-		`"github.com/franz101/sqd-go/internal/envconfig"`: "",
+		`"context"`:                              "",
+		`"encoding/binary"`:                      "",
+		`"fmt"`:                                  "",
+		`"strings"`:                              "",
+		`"sync"`:                                 "",
+		`"sync/atomic"`:                          "",
+		`"github.com/ClickHouse/ch-go"`:          "",
+		`"github.com/ClickHouse/ch-go/proto"`:    "",
+		`"github.com/franz101/sqd-go/coldcache"`: "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""
@@ -202,6 +254,13 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 	if len(tables) > 0 {
 		imports[`"strconv"`] = ""
 		imports[`"time"`] = ""
+	}
+	if len(hotStateSpecs(tables)) > 0 {
+		// The cold-recovery runtime reads ClickHouse settings and the recovery
+		// floor from the environment (generated code must not import internal
+		// packages), so it needs os + strconv.
+		imports[`"os"`] = ""
+		imports[`"strconv"`] = ""
 	}
 	if customTablesUseColdCache(tables) {
 		// Cold tier (Pebble): pointer-free values are stored as raw bytes via
@@ -581,6 +640,30 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 			b.WriteString(lowerFirst(field.Name))
 		}
 		b.WriteString("})\n}\n\n")
+
+		if coldOn {
+			// ColdMightContain reports whether the key may have ever been written to
+			// the cold tier (negative-filter probe; no false negatives). A hot+cold
+			// miss with ColdMightContain==false is provably new, so the authoritative
+			// read path may skip ClickHouse. A miss with ==true may be an evicted
+			// entry (the bounded flat backend evicts), so ClickHouse must be checked.
+			b.WriteString("func (c *")
+			b.WriteString(spec.cacheType)
+			b.WriteString(") ColdMightContain(")
+			renderClockKeyParams(b, keyFields)
+			b.WriteString(") bool {\n\tif c == nil || c.cold == nil {\n\t\treturn false\n\t}\n\tk := ")
+			b.WriteString(spec.keyType)
+			b.WriteString("{")
+			for i, field := range keyFields {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(field.Name)
+				b.WriteString(": ")
+				b.WriteString(lowerFirst(field.Name))
+			}
+			b.WriteString("}\n\treturn c.cold.MightContain(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)))\n}\n\n")
+		}
 	}
 
 	// coldDel mirrors a hard delete into the cold tier so a rolled-back key cannot
@@ -741,10 +824,12 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(spec.batchType)
 	b.WriteString(") Insert(ctx context.Context, conn *ch.Client, db string) error {\n\tif b.Rows() == 0 {\n\t\treturn nil\n\t}\n\treturn conn.Do(ctx, ch.Query{Body: fmt.Sprintf(")
 	b.WriteString(strconv.Quote("INSERT INTO %s.%s " + customInsertColumnList(spec.table) + " VALUES"))
-	// wait_for_async_insert MUST be 1: hot-state commits are read back on
-	// prefetch/recovery/rollback. With wait=0 (fire-and-forget) a SELECT after
-	// Commit can miss un-flushed rows, returning stale/partial state under load.
-	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: \"async_insert\", Value: \"1\", Important: true}, {Key: \"wait_for_async_insert\", Value: \"1\", Important: true}}})\n}\n\n")
+	// Insert settings are flag-selected by asyncInsertSettings(): the default
+	// waits per insert (wait_for_async_insert=1) so the hot-state read-backs on
+	// prefetch/recovery/rollback always see committed rows; SQD_ASYNC_INSERT_FLUSH
+	// switches to fire-and-forget (wait=0) with an explicit queue flush at each
+	// commit boundary (see asyncInsertSettings / flushAsyncInserts).
+	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: asyncInsertSettings()})\n}\n\n")
 }
 
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
@@ -1038,6 +1123,9 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(")\n")
 		b.WriteString("\t}\n")
 	}
+	// Drain the async-insert queue so the next read-back sees these rows (no-op
+	// unless SQD_ASYNC_INSERT_FLUSH is set; see flushAsyncInserts).
+	b.WriteString("\tif err := flushAsyncInserts(ctx, conn); err != nil {\n\t\treturn err\n\t}\n")
 	b.WriteString("\treturn nil\n}\n")
 
 	// Generate Restore methods for journal rollback
