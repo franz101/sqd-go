@@ -635,7 +635,7 @@ func protoAppendExpr(arg eventArg) string {
 	case "[]bool":
 		return "protoBoolArray(ev." + arg.GoFieldName + ")"
 	default:
-		return appendExpr(arg)
+		return arg.AppendExpr()
 	}
 }
 
