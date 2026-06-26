@@ -1,9 +1,10 @@
 package ingestion
+
 import (
 	"context"
 	"fmt"
-	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/examples/uniswap/generated"
+	"github.com/franz101/sqd-go/internal/client"
 	"testing"
 )
 
@@ -22,7 +23,7 @@ func TestLBTC(t *testing.T) {
 	}
 	fmt.Printf("Raw bytes fetched: %d\n", len(resp.Raw))
 	fmt.Printf("RAW:\n%s\n", string(resp.Raw))
-	
+
 	batches := generated.NewInsertBatches()
 	events, err := generated.ParseJSONL(resp.Raw, batches, nil)
 	fmt.Printf("Parsed Events: %d, err: %v\n", events, err)

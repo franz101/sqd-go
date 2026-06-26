@@ -19,6 +19,7 @@ type parsedArgs struct {
 	noColdCache   bool
 	parallelFetch bool
 	prefetch      bool
+	noReplay      bool
 	state         bool
 	protoMode     bool
 	// reindexFrom holds the --reindex-from value: a block number above which all
@@ -95,6 +96,8 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.protoMode = false
 		case "--no-cold-cache":
 			p.noColdCache = true
+		case "--no-replay":
+			p.noReplay = true
 		case "--parallel-fetch":
 			p.parallelFetch = true
 		case "--prefetch":
@@ -189,14 +192,14 @@ func Run(args []string) int {
 		if p.state && os.Getenv(stateChildEnv) == "" {
 			return runStateRebuild(args, p.project)
 		}
-		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 
 	case "stop":
 		return runStop()
@@ -215,7 +218,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 	}
 }
 
@@ -338,6 +341,9 @@ Flags:
   --no-proto            (start/dev) Use V1 legacy parsed mode instead of proto (struct-based event
                        processing with JSON decode; useful for debugging or unvalidated contracts)
   --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default)
+  --no-replay           (start/dev) Disable fork recovery. The replay buffer is reduced to a small
+                       smoothing pipe; fork errors are fatal. Use for backfill-only or benchmarking
+                       runs where reorgs cannot occur or do not matter.
   --state               (start) Regenerate the project and re-exec a binary with the project's
                        processor compiled in, so custom state + the PK-keyed cold tier actually run
                        in one command (no manual rebuild). Needs the Go toolchain; the project must

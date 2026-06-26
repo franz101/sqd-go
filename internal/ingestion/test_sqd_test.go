@@ -1,9 +1,10 @@
 package ingestion
+
 import (
 	"context"
 	"fmt"
 	"github.com/franz101/sqd-go/internal/client"
-    "testing"
+	"testing"
 )
 
 func TestCheckFormat(t *testing.T) {

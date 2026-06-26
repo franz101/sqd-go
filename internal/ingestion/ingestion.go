@@ -58,6 +58,12 @@ type Options struct {
 	// off; most useful in resume/cursor mode against a populated ClickHouse.
 	Prefetch bool
 
+	// NoReplay disables fork recovery. The replay buffer is reduced to a small
+	// smoothing pipe; fork errors are treated as fatal instead of triggering
+	// rollback-and-replay. Use for backfill-only or benchmarking runs where forks
+	// cannot occur or do not matter.
+	NoReplay bool
+
 	// ParallelFetch fetches the finalized backfill range with concurrent range
 	// workers (cursor mode only). The immutable finalized region is fetched out
 	// of order and re-serialized for the in-order consumer; see parallel_fetch.go.
@@ -188,7 +194,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom, opts.Prefetch); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom, opts.Prefetch, opts.NoReplay); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -196,7 +202,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64, prefetch bool) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64, prefetch bool, noReplay bool) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -342,7 +348,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		defer sqdFinalized.Close()
 	}
 	jsonl := parser.NewFastJSONLParser(1024)
-	replayBuf := NewReplayBuffer(65536) // ~8K blocks of replay capacity
+	replayBufCap := 65536 // ~64K blocks of replay capacity
+	if noReplay {
+		replayBufCap = 1024 // small smoothing pipe; no fork recovery needed
+	}
+	replayBuf := NewReplayBuffer(replayBufCap)
 	// No-data-loss (Invariant 0): if the processor reports a durable commit
 	// horizon, the persisted checkpoint is gated so it never leads that horizon.
 	// On crash the run resumes from durable state and re-fetches the cheap gap.
@@ -358,9 +368,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// and dynamically enable once the consumer approaches the finalized head.
 	var snapshotController SnapshotController
 	var snapshotsActive bool
-	if sc, ok := proc.(SnapshotController); ok {
-		snapshotController = sc
-		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
+	if !noReplay {
+		if sc, ok := proc.(SnapshotController); ok {
+			snapshotController = sc
+			sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
+		}
 	}
 	backfillGC := cursorMode && !snapshotsActive
 	var previousGOGC int
@@ -1415,6 +1427,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		case sig := <-errChan:
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			if sig.forkErr != nil {
+				if noReplay {
+					return fmt.Errorf("fork detected at block %d (replay disabled — restart to recover)", currentConsumerBlockVal)
+				}
 				if err := drainPendingInsert(); err != nil {
 					return fmt.Errorf("drain producer-parse event insert before fork rollback: %w", err)
 				}
