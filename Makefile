@@ -7,7 +7,7 @@ BUILD_DIR := tmp
 
 .PHONY: build dev-build test vet benchmark benchmark-fast \
 	test-config-matrix benchmark-live-matrix \
-	codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e \
+	codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e uniswap-fast \
 	db-reset stop
 
 # Load .env file if it exists (for local ClickHouse credentials)
@@ -70,6 +70,9 @@ start-uniswap:
 
 dev-uniswap:
 	go run . dev $(UNISWAP_DIR)
+
+uniswap-fast:
+	SQD_PARSE_DECODE_V2=1 go run . dev $(UNISWAP_DIR) --parallel-fetch
 
 restart-uniswap:
 	go run . start $(UNISWAP_DIR) --restart
