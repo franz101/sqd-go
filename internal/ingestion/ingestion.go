@@ -568,7 +568,13 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				var err error
 				var lastFetchDur time.Duration
 				if prefetch != nil {
+					// Attribute the consumer's wait for the prefetcher to deliver the next
+					// page to fetch time: ~0 when prefetch keeps up (fetch not limiting), >0
+					// when it stalls. Previously invisible (fetch=0s) since background prefetch
+					// work never touched profFetchNanos.
+					fetchT0 := time.Now()
 					page, ok := prefetch.Next(pCtx)
+					profFetchNanos.Add(int64(time.Since(fetchT0)))
 					if !ok {
 						// Region fully emitted (or cancelled/stalled): resume sequential
 						// from the current cursor, which the last consumed page advanced.
