@@ -72,7 +72,11 @@ dev-uniswap:
 	go run . dev $(UNISWAP_DIR)
 
 uniswap-fast:
-	SQD_PARSE_DECODE_V2=1 go run . dev $(UNISWAP_DIR) --parallel-fetch
+	SQD_PARSE_DECODE_V2=1 SQD_METRICS_CH=1 SQD_METRICS_CH_INTERVAL=2s go run . dev $(UNISWAP_DIR) --parallel-fetch --restart
+
+uniswap-fast-tmux:
+	tmux new-session -d -s sqd-fast "SQD_PARSE_DECODE_V2=1 SQD_METRICS_CH=1 SQD_METRICS_CH_INTERVAL=2s go run . dev $(UNISWAP_DIR) --parallel-fetch" || tmux attach -t sqd-fast
+	tmux attach -t sqd-fast
 
 restart-uniswap:
 	go run . start $(UNISWAP_DIR) --restart
