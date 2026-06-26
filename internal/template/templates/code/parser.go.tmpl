@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
-
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
@@ -77,11 +77,39 @@ func ParseJSONLProtoStream(data []byte, batches *InsertBatches, ring *ProtoRingB
 	return parseJSONL(data, batches, nil, ring, nil, nil, endBlock, callback)
 }
 
+// _parseStats accumulates profiling across all parseJSONL calls and prints a
+// summary every 10 seconds so the log isn't spammed per-batch.
+var _parseStats struct {
+	mu      sync.Mutex
+	last    time.Time
+	batches int64
+	events  int64
+	blocks  int64
+	scan    int64
+	lex     int64
+	hdr     int64
+	logs    int64
+	decode  int64
+	append  int64
+	maxEvts int64
+}
+
+func _parseStatsFmtN(n int64) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	if n < 1_000_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1e3)
+	}
+	return fmt.Sprintf("%.2fM", float64(n)/1e6)
+}
+
 func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, protoRing *ProtoRingBuffer, onBlock func(*ParsedBlock) error, onProtoBlock func(*ProtoEventBlock) error, endBlock uint64, onLine func(*ParsedBlock, *ProtoEventBlock, parsedLineMeta) error) (uint64, error) {
 	var topics [4]string
 	var dataHex string
 	var dataBytes []byte
 	var eventCount uint64
+	var blockCount int64
 
 	// Granular profiling: accumulate nanoseconds spent in each phase
 	var profLineScan, profJSONLex, profHeaderParse, profLogsParse, profEventDecode, profBatchAppend int64
@@ -129,6 +157,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					switch hkey {
 					case "number":
 						blockNum = l.Uint64()
+						blockCount++
 					case "timestamp":
 						blockTimestamp = l.Uint64()
 					case "hash":
@@ -354,16 +383,65 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 			}
 		}
 	}
-	// Print detailed profiling for parsing performance
-	if eventCount > 0 {
-		log.Printf("[PARSE PROFILING] events=%d | line_scan=%s json_lex=%s header_parse=%s logs_parse=%s event_decode=%s batch_append=%s",
-			eventCount,
-			time.Duration(profLineScan).Round(time.Microsecond),
-			time.Duration(profJSONLex).Round(time.Microsecond),
-			time.Duration(profHeaderParse).Round(time.Microsecond),
-			time.Duration(profLogsParse).Round(time.Microsecond),
-			time.Duration(profEventDecode).Round(time.Microsecond),
-				time.Duration(profBatchAppend).Round(time.Microsecond))
+	// Accumulate profiling stats; print a summary every 10 seconds.
+	{
+		s := &_parseStats
+		s.mu.Lock()
+		now := time.Now()
+		if s.last.IsZero() {
+			s.last = now
+		}
+		s.batches++
+		s.events += int64(eventCount)
+		s.blocks += blockCount
+		s.scan += profLineScan
+		s.lex += profJSONLex
+		s.hdr += profHeaderParse
+		s.logs += profLogsParse
+		s.decode += profEventDecode
+		s.append += profBatchAppend
+		if int64(eventCount) > s.maxEvts {
+			s.maxEvts = int64(eventCount)
+		}
+		elapsed := now.Sub(s.last)
+		if elapsed >= 10*time.Second && s.batches > 0 {
+			b, ev, bl := s.batches, s.events, s.blocks
+			scan, lex, hdr, logs, dec, app := s.scan, s.lex, s.hdr, s.logs, s.decode, s.append
+			maxEvts := s.maxEvts
+			s.batches, s.events, s.blocks = 0, 0, 0
+			s.scan, s.lex, s.hdr, s.logs, s.decode, s.append = 0, 0, 0, 0, 0, 0
+			s.maxEvts = 0
+			s.last = now
+			s.mu.Unlock()
+
+			secs := elapsed.Seconds()
+			total := scan + lex + hdr + logs + dec + app
+			pct := func(n int64) string {
+				if total == 0 {
+					return "  0%"
+				}
+				return fmt.Sprintf("%3d%%", 100*n/total)
+			}
+			nsPerEv := func(n int64) string {
+				if ev == 0 {
+					return "  -"
+				}
+				return fmt.Sprintf("%4dns", n/ev)
+			}
+			log.Printf("[PARSE 10s] %s ev | %s blk | %.0f ev/s | %.0f blk/s | %d batches | peak %s ev/batch",
+				_parseStatsFmtN(ev), _parseStatsFmtN(bl),
+				float64(ev)/secs, float64(bl)/secs,
+				b, _parseStatsFmtN(maxEvts))
+			log.Printf("[PARSE 10s] decode %s(%s/ev)  scan %s  hdr %s  logs %s  lex %s  append %s",
+				pct(dec), nsPerEv(dec),
+				pct(scan),
+				pct(hdr),
+				pct(logs),
+				pct(lex),
+				pct(app))
+		} else {
+			s.mu.Unlock()
+		}
 	}
 	return eventCount, nil
 }
