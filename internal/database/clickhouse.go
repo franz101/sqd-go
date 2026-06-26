@@ -870,6 +870,18 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 		if table.HasChainID {
 			where = fmt.Sprintf("chain_id = %d AND %s", chainID, where)
 		}
+		// Skip the DELETE when nothing is above the checkpoint: a lightweight
+		// delete still creates a mutation that scans/rewrites the last part even
+		// for 0 matches, stalling a clean resume for tens of minutes on huge
+		// event tables. max(block_number) is cheap relative to that.
+		if mx, ok, err := s.maxBlockNumber(ctx, table.Name, chainID, table.HasChainID); err != nil {
+			return fmt.Errorf("rollback probe %s: %w", table.Name, err)
+		} else if !ok || mx <= lastBlock {
+			if rollbackSQL {
+				log.Printf("[ROLLBACK] skip %q: max block %d <= checkpoint %d (nothing above)", table.Name, mx, lastBlock)
+			}
+			continue
+		}
 		q := fmt.Sprintf("DELETE FROM %s.%s WHERE %s SETTINGS lightweight_deletes_sync = 1", quoteIdent(s.db), quoteIdent(table.Name), where)
 		if rollbackSQL {
 			log.Printf("[ROLLBACK] delete table %q for blocks > %d: %s", table.Name, lastBlock, q)
@@ -895,6 +907,25 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 	// made rollback take 9+ minutes. Background merges compact parts async.
 	log.Printf("[ROLLBACK] issued lightweight delete for %d table(s) and sync_state with blocks > %d in %s", len(tables), lastBlock, time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+func (s *Store) maxBlockNumber(ctx context.Context, table string, chainID uint64, hasChainID bool) (uint64, bool, error) {
+	var mx proto.ColUInt64
+	var cnt proto.ColUInt64
+	where := ""
+	if hasChainID {
+		where = fmt.Sprintf(" WHERE chain_id = %d", chainID)
+	}
+	if err := s.conn.Do(ctx, ch.Query{
+		Body:   fmt.Sprintf("SELECT coalesce(max(block_number), 0) AS m, count() AS c FROM %s.%s%s", quoteIdent(s.db), quoteIdent(table), where),
+		Result: proto.Results{{Name: "m", Data: &mx}, {Name: "c", Data: &cnt}},
+	}); err != nil {
+		return 0, false, err
+	}
+	if mx.Rows() == 0 || cnt.Rows() == 0 || cnt.Row(0) == 0 {
+		return 0, false, nil
+	}
+	return mx.Row(0), true, nil
 }
 
 func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint64) error {
