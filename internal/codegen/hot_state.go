@@ -209,6 +209,97 @@ func flushAsyncInserts(ctx context.Context, conn *ch.Client) error {
 	return conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
 }
 
+func recoveryPreFloorClause() (clause string, active bool) {
+	var mb uint64
+	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			mb = uint64(n)
+		}
+	}
+	if mb == 0 {
+		return "", false
+	}
+	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " < " + strconv.FormatUint(mb, 10), true
+}
+
+func recoverFilterKeysParallel[K any](
+	ctx context.Context,
+	primary *ch.Client,
+	nbuckets int,
+	cold *coldcache.Store,
+	run func(ctx context.Context, conn *ch.Client, bucket int, emit func(K)) error,
+) error {
+	conc := recoveryConcurrency
+	if conc > nbuckets {
+		conc = nbuckets
+	}
+	if conc < 1 {
+		conc = 1
+	}
+	conns := make([]*ch.Client, 1, conc)
+	conns[0] = primary
+	for len(conns) < conc {
+		wc, err := recoveryDialConn(ctx)
+		if err != nil {
+			break
+		}
+		conns = append(conns, wc)
+	}
+	defer func() {
+		for _, wc := range conns[1:] {
+			_ = wc.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	buckets := make(chan int)
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+	for _, conn := range conns {
+		wg.Add(1)
+		go func(conn *ch.Client) {
+			defer wg.Done()
+			emit := func(k K) {
+				cold.AddKeyToFilter(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)))
+			}
+			for bucket := range buckets {
+				if err := run(ctx, conn, bucket, emit); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}(conn)
+	}
+feed:
+	for bucket := 0; bucket < nbuckets; bucket++ {
+		select {
+		case buckets <- bucket:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(buckets)
+	wg.Wait()
+	return firstErr
+}
+
+
 `)
 	} else {
 		b.WriteString("\n")
@@ -880,13 +971,17 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	}
 	b.WriteString("\t\t\t})\n\t\t}\n\t\treturn nil\n\t}})\n\t}\n")
 	if isPointerFreeEntity(spec.table) {
-		b.WriteString("\tif c.cold != nil {\n\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
+		b.WriteString("\tif c.cold != nil {\n")
+		renderClockFilterKeysPass(b, spec)
+		b.WriteString("\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
 		b.WriteString(spec.table.GoTypeName)
 		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
 		b.WriteString(spec.keyType)
 		b.WriteString("(v)\n\t\t\treturn put(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)), unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)))\n\t\t})\n\t}\n")
 	} else if isColdSerializableEntity(spec.table) {
-		b.WriteString("\tif c.cold != nil {\n\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
+		b.WriteString("\tif c.cold != nil {\n")
+		renderClockFilterKeysPass(b, spec)
+		b.WriteString("\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
 		b.WriteString(spec.table.GoTypeName)
 		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
 		b.WriteString(spec.keyType)
@@ -934,6 +1029,16 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	b.WriteString("\t// the lazy state Get queues misses instead of resolving them synchronously,\n")
 	b.WriteString("\t// and Save is suppressed (the dry run has no committed side effects).\n")
 	b.WriteString("\trecordMode bool\n")
+	b.WriteString("\t// Async resolve state: non-blocking resolution of entity resolver misses.\n")
+	b.WriteString("\t// When enabled, resolver queries run in background goroutines via\n")
+	b.WriteString("\t// StartResolveAllPending, allowing other work to overlap.\n")
+	b.WriteString("\tresolveAsyncEnabled bool\n")
+	b.WriteString("\tresolveInProgress   bool\n")
+	b.WriteString("\tresolveDone         chan resolveResult\n")
+	b.WriteString("\tresolveConn         *ch.Client\n")
+	b.WriteString("\tresolveDB           string\n")
+	b.WriteString("\tresolveCtx          context.Context\n")
+	b.WriteString("\tresolveCancel       context.CancelFunc\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -963,6 +1068,13 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(spec.baseName)
 		b.WriteString(")\n")
 	}
+	for _, spec := range specs {
+		b.WriteString("\tstate.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.hot = state\n")
+	}
+	// Initialize async resolve fields
+	b.WriteString("\tstate.resolveAsyncEnabled = asyncResolveEnabled()\n")
 	b.WriteString("\treturn state\n}\n\n")
 
 	// EnableColdCache / CloseColdCache: attach the Pebble cold tier to every
@@ -1057,6 +1169,133 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString("Resolver.Resolve(ctx, conn, db); err != nil {\n\t\treturn err\n\t}\n")
 	}
 	b.WriteString("\treturn nil\n}\n\n")
+
+	// Async resolve infrastructure: non-blocking resolver queries for higher throughput.
+	// Environment variable helpers.
+	b.WriteString("func asyncResolveEnabled() bool {\n\tif v := os.Getenv(\"SQD_ASYNC_RESOLVE\"); v != \"\" {\n\t\treturn v == \"1\" || v == \"true\" || v == \"yes\"\n\t}\n\treturn false\n}\n\n")
+	b.WriteString("func asyncResolveConcurrency() int {\n\tif v := os.Getenv(\"SQD_ASYNC_RESOLVE_CONCURRENCY\"); v != \"\" {\n\t\tif n, err := strconv.Atoi(v); err == nil && n > 0 {\n\t\t\treturn n\n\t\t}\n\t}\n\treturn 4\n}\n\n")
+
+	// resolveResult carries the outcome of one async resolve pass back to the
+	// poller (PollResolveAllPending / WaitResolveAllPending).
+	b.WriteString("type resolveResult struct {\n\terr error\n}\n\n")
+
+	// StartResolveAllPending begins async resolution of all queued misses.
+	// Returns true if async resolution was started (false if already in progress
+	// or no pending work). Non-blocking: launches goroutine and returns immediately.
+	b.WriteString("func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, db string) bool {\n")
+	b.WriteString("\tif s == nil || conn == nil || !s.resolveAsyncEnabled {\n\t\treturn false\n\t}\n")
+	b.WriteString("\tif s == nil || s.resolveInProgress {\n\t\treturn false\n\t}\n")
+	// Check if any resolver has pending work
+	b.WriteString("\thasPending := false\n")
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\tif s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Pending() > 0 {\n\t\thasPending = true\n\t}\n")
+	}
+	b.WriteString("\tif !hasPending {\n\t\treturn false\n\t}\n")
+	// Set up async state
+	b.WriteString("\ts.mu.Lock()\n")
+	b.WriteString("\ts.resolveInProgress = true\n")
+	b.WriteString("\ts.resolveConn = conn\n")
+	b.WriteString("\ts.resolveDB = db\n")
+	b.WriteString("\ts.resolveCtx, s.resolveCancel = context.WithCancel(ctx)\n")
+	b.WriteString("\ts.mu.Unlock()\n")
+	// Create result channel if needed
+	b.WriteString("\tif s.resolveDone == nil {\n\t\ts.resolveDone = make(chan resolveResult, 1)\n\t}\n")
+	// Launch async resolution goroutine
+	b.WriteString("\tgo func() {\n")
+	b.WriteString("\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\ts.resolveDone <- resolveResult{err: fmt.Errorf(\"resolve panic: %v\", r)}\n\t\t\t}\n\t\t}()\n")
+	b.WriteString("\t\terr := s.resolveAllParallel(s.resolveCtx, conn, db)\n")
+	b.WriteString("\t\ts.resolveDone <- resolveResult{err: err}\n")
+	b.WriteString("\t}()\n")
+	b.WriteString("\treturn true\n}\n\n")
+
+	// PollResolveAllPending checks async resolution completion without blocking.
+	b.WriteString("func (s *HotState) PollResolveAllPending() error {\n")
+	b.WriteString("\tif s == nil || s.resolveDone == nil {\n\t\treturn nil\n\t}\n")
+	b.WriteString("\tselect {\n")
+	b.WriteString("\tcase result := <-s.resolveDone:\n")
+	b.WriteString("\t\ts.resolveInProgress = false\n")
+	b.WriteString("\t\ts.resolveDone = nil\n")
+	b.WriteString("\t\tif s.resolveCancel != nil {\n")
+	b.WriteString("\t\t\ts.resolveCancel()\n")
+	b.WriteString("\t\t\ts.resolveCancel = nil\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\treturn result.err\n")
+	b.WriteString("\tdefault:\n")
+	b.WriteString("\t\treturn nil\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+
+	// WaitResolveAllPending blocks until async resolution completes or context cancels.
+	b.WriteString("func (s *HotState) WaitResolveAllPending(ctx context.Context) error {\n")
+	b.WriteString("\tif s == nil || s.resolveDone == nil {\n\t\treturn nil\n\t}\n")
+	b.WriteString("\tselect {\n")
+	b.WriteString("\tcase result := <-s.resolveDone:\n")
+	b.WriteString("\t\ts.resolveInProgress = false\n")
+	b.WriteString("\t\ts.resolveDone = nil\n")
+	b.WriteString("\t\tif s.resolveCancel != nil {\n")
+	b.WriteString("\t\t\ts.resolveCancel()\n")
+	b.WriteString("\t\t\ts.resolveCancel = nil\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\treturn result.err\n")
+	b.WriteString("\tcase <-ctx.Done():\n")
+	b.WriteString("\t\treturn ctx.Err()\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+
+	// resolveAllParallel executes entity resolvers concurrently.
+	b.WriteString("func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db string) error {\n")
+	b.WriteString("\ttype resolveJob struct {\n\t\tname string\n\t\tresolve func(context.Context, *ch.Client, string) error\n\t}\n")
+	b.WriteString("\tvar jobs []resolveJob\n")
+	// Collect jobs only for resolvers with Pending() > 0
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\tif s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Pending() > 0 {\n")
+		b.WriteString("\t\tjobs = append(jobs, resolveJob{\n")
+		b.WriteString("\t\t\tname: \"")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString("\",\n")
+		b.WriteString("\t\t\tresolve: func(ctx context.Context, conn *ch.Client, db string) error {\n")
+		b.WriteString("\t\t\t\treturn s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Resolve(ctx, conn, db)\n")
+		b.WriteString("\t\t\t},\n")
+		b.WriteString("\t\t})\n")
+		b.WriteString("\t}\n")
+	}
+	b.WriteString("\tif len(jobs) == 0 {\n\t\treturn nil\n\t}\n")
+	// Semaphore to bound concurrency
+	b.WriteString("\tconcurrency := asyncResolveConcurrency()\n")
+	b.WriteString("\tif concurrency > len(jobs) {\n\t\tconcurrency = len(jobs)\n\t}\n")
+	b.WriteString("\tsem := make(chan struct{}, concurrency)\n")
+	b.WriteString("\tvar wg sync.WaitGroup\n")
+	b.WriteString("\terrMu := sync.Mutex{}\n")
+	b.WriteString("\tvar firstErr error\n")
+	b.WriteString("\tfor _, job := range jobs {\n\t\twg.Add(1)\n\t\tgo func(j resolveJob) {\n\t\t\tdefer wg.Done()\n")
+	b.WriteString("\t\t\tsem <- struct{}{}\n")
+	b.WriteString("\t\t\tdefer func() { <-sem }()\n")
+	b.WriteString("\t\t\tif ctx.Err() != nil {\n\t\t\t\treturn\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tif err := j.resolve(ctx, conn, db); err != nil {\n")
+	b.WriteString("\t\t\t\terrMu.Lock()\n")
+	b.WriteString("\t\t\t\tif firstErr == nil {\n")
+	b.WriteString("\t\t\t\t\tfirstErr = fmt.Errorf(\"%s resolve: %w\", j.name, err)\n")
+	b.WriteString("\t\t\t\t}\n")
+	b.WriteString("\t\t\t\terrMu.Unlock()\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t}(job)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\twg.Wait()\n")
+	b.WriteString("\treturn firstErr\n")
+	b.WriteString("}\n\n")
 
 	// Generate Update methods
 	for _, spec := range specs {
@@ -1177,6 +1416,7 @@ type BatchResolverMetrics struct {
 	UniqueMisses uint64
 	RoundTrips   uint64
 	ResolveNanos uint64
+	Skipped      uint64
 }
 
 func clockHashWord(seed, word uint64) uint64 {
@@ -1993,7 +2233,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\n\tfoundKeys map[")
 	b.WriteString(keyType)
 	b.WriteString("]struct{}")
-	b.WriteString("\n\tmetricsEnabled bool\n\tmetrics BatchResolverMetrics\n}\n\n")
+	b.WriteString("\n\tmetricsEnabled bool\n\tmetrics BatchResolverMetrics\n\thot *HotState\n}\n\n")
 
 	b.WriteString("func New")
 	b.WriteString(resolverType)
@@ -2014,11 +2254,17 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(", bool) {\n")
 	b.WriteString("\treturn r.cache.Get(key)\n}\n\n")
 
+	b.WriteString("func (c *")
+	b.WriteString(cacheType)
+	b.WriteString(") coldMightContainKey(key ")
+	b.WriteString(keyType)
+	b.WriteString(") bool {\n\tif c == nil || c.cold == nil {\n\t\treturn true\n\t}\n\tk := key\n\treturn c.cold.MightContain(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)))\n}\n\n")
+
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
 	b.WriteString(") Queue(key ")
 	b.WriteString(keyType)
-	b.WriteString(") {\n\tif _, ok := r.Lookup(key); !ok {\n")
+	b.WriteString(") {\n\t\t// Provably-new fast path: under an authoritative cold tier a key the\n\t\t// negative filter has never seen cannot exist in ClickHouse, so the lazy Get\n\t\t// returns zero and queuing it for a resolve would be a wasted CH round-trip.\n\tif r.hot != nil && r.hot.coldAuthoritative && !r.cache.coldMightContainKey(key) {\n\t\tif r.metricsEnabled {\n\t\t\tr.metrics.Skipped++\n\t\t}\n\t\treturn\n\t}\n\tif _, ok := r.Lookup(key); !ok {\n")
 	b.WriteString("\t\tif r.metricsEnabled {\n\t\t\tr.metrics.QueuedMisses++\n\t\t}\n")
 	b.WriteString("\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
 
