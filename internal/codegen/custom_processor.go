@@ -23,6 +23,7 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/franz101/sqd-go/sqd"
 	"github.com/holiman/uint256"
 )
 
@@ -209,6 +210,88 @@ func _customProcessorEventCount() int {
 	return `)
 	b.WriteString(strconv.Itoa(len(events)))
 	b.WriteString(`
+}
+`)
+
+	// Processor struct and FastJSONLProcessor implementation.
+	// Bridge: ParsedBlock -> Entities -> CustomProcessing.
+	b.WriteString("func parsedBlockToEntities(block *ParsedBlock) *Entities {\n")
+	b.WriteString("\tif block == nil {\n\t\treturn nil\n\t}\n")
+	b.WriteString("\treturn &Entities{\n")
+	for _, ev := range events {
+		b.WriteString("\t\t")
+		b.WriteString(ev.GoTypeName)
+		b.WriteString(": block.")
+		b.WriteString(ev.GoTypeName)
+		b.WriteString("s,\n")
+	}
+	b.WriteString("\t\tBlockNumber: block.BlockNumber,\n")
+	b.WriteString("\t}\n}\n\n")
+
+	b.WriteString(`type Processor struct {
+	ring *OrderedHistoricRingBuffer
+}
+
+func NewProcessor(_ bool) (*Processor, error) {
+	ring, err := NewOrderedHistoricRingBuffer(4096)
+	if err != nil {
+		return nil, err
+	}
+	return &Processor{ring: ring}, nil
+}
+
+func (p *Processor) ProcessJSONL(ctx context.Context, store *sqd.Store, data []byte) (uint64, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil
+	}
+	var s Store
+	if store != nil {
+		s = store
+	}
+	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
+		return CustomProcessing(ctx, s, parsedBlockToEntities(block))
+	})
+}
+
+func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *sqd.Store, data []byte) (uint64, func(context.Context) error, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil, nil
+	}
+	var s Store
+	if store != nil {
+		s = store
+	}
+	batches := NewInsertBatches()
+	n, err := ParseJSONLV2(data, batches, p.ring, func(block *ParsedBlock) error {
+		return CustomProcessing(ctx, s, parsedBlockToEntities(block))
+	})
+	if err != nil || store == nil || store.InsertConn() == nil {
+		batches.Reset()
+		return n, nil, err
+	}
+	flush := func(flushCtx context.Context) error {
+		defer batches.Reset()
+		return batches.Insert(flushCtx, store.InsertConn(), store.DB())
+	}
+	return n, flush, nil
+}
+
+func (p *Processor) Process(_ context.Context, _ *sqd.Store, _ []sqd.CustomLog) error {
+	return nil
+}
+
+func (p *Processor) RestoreToBlock(blockNumber uint64) (uint64, error) {
+	return blockNumber, nil
+}
+
+func (p *Processor) LoadFromDatabase(_ context.Context, _ uint64) error {
+	return nil
+}
+
+func init() {
+	sqd.RegisterProcessorV2(ProjectName, func(protoMode bool) (sqd.Processor, error) {
+		return NewProcessor(protoMode)
+	})
 }
 `)
 	return format.Source(b.Bytes())
