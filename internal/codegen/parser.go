@@ -74,14 +74,31 @@ func ParseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 }
 
 func ParseJSONLV2(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, onBlock func(*ParsedBlock) error) (uint64, error) {
-	return parseJSONL(data, batches, ring, nil, onBlock, nil)
+	return parseJSONL(data, batches, ring, nil, onBlock, nil, 0, nil)
 }
 
 func ParseJSONLProto(data []byte, batches *InsertBatches, ring *ProtoRingBuffer, onBlock func(*ProtoEventBlock) error) (uint64, error) {
-	return parseJSONL(data, batches, nil, ring, nil, onBlock)
+	return parseJSONL(data, batches, nil, ring, nil, onBlock, 0, nil)
 }
 
-func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, protoRing *ProtoRingBuffer, onBlock func(*ParsedBlock) error, onProtoBlock func(*ProtoEventBlock) error) (uint64, error) {
+type parsedLineMeta struct {
+	number    uint64
+	timestamp uint64
+	hash      string
+	line      []byte
+}
+
+func ParseJSONLProtoStream(data []byte, batches *InsertBatches, ring *ProtoRingBuffer, endBlock uint64, onLine func(proto *ProtoEventBlock, number, timestamp uint64, hash string, line []byte) error) (uint64, error) {
+	var callback func(*ParsedBlock, *ProtoEventBlock, parsedLineMeta) error
+	if onLine != nil {
+		callback = func(_ *ParsedBlock, proto *ProtoEventBlock, meta parsedLineMeta) error {
+			return onLine(proto, meta.number, meta.timestamp, meta.hash, meta.line)
+		}
+	}
+	return parseJSONL(data, batches, nil, ring, nil, nil, endBlock, callback)
+}
+
+func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, protoRing *ProtoRingBuffer, onBlock func(*ParsedBlock) error, onProtoBlock func(*ProtoEventBlock) error, endBlock uint64, onLine func(*ParsedBlock, *ProtoEventBlock, parsedLineMeta) error) (uint64, error) {
 	var topics [4]string
 	var dataHex string
 	var dataBytes []byte
@@ -110,6 +127,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		var blockTime time.Time // Pre-calculated once per block to avoid repeated time.Unix calls
 		var slot *ParsedBlock
 		var protoSlot *ProtoEventBlock
+		var lineSkipped bool
 
 		l.Delim('{')
 		for !l.IsDelim('}') {
@@ -136,6 +154,12 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				l.Delim('}')
 				blockTime = time.Unix(int64(blockTimestamp), 0).UTC() // Calculate once per block
 			case "logs":
+				if endBlock > 0 && blockNum > endBlock {
+					lineSkipped = true
+					l.SkipRecursive()
+					l.WantComma()
+					continue
+				}
 				if ring != nil {
 					slot = ring.NextSlot(blockNum, blockHash)
 				}
@@ -326,6 +350,16 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		l.Delim('}')
 		if !l.Ok() {
 			return eventCount, l.Error()
+		}
+		if onLine != nil {
+			if !lineSkipped {
+				if err := onLine(slot, protoSlot, parsedLineMeta{
+					number: blockNum, timestamp: blockTimestamp, hash: blockHash, line: line,
+				}); err != nil {
+					return eventCount, err
+				}
+			}
+			continue
 		}
 		if onBlock != nil && slot != nil {
 			if err := onBlock(slot); err != nil {

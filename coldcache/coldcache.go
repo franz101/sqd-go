@@ -100,7 +100,7 @@ type Store struct {
 	cache *pebble.Cache
 	dir   string
 
-	// flat, when non-nil, replaces the Pebble backend with the in-RAM flat store.
+	// flat, when non-nil, replaces the Pebble backend with the in-RAM flatcold store.
 	// Every method dispatches to it BEFORE the s.db==nil guards.
 	flat *flatcold
 
@@ -123,8 +123,7 @@ func (s *Store) EnableNegativeFilter(bitBudget uint64) {
 }
 
 func defaultNegativeFilterBits() uint64 {
-	// Use envconfig for centralized environment variable management
-	return uint64(envconfig.ColdFilterSize()) * 10
+	return envconfig.ColdFilterSize()
 }
 
 // FilterSkips returns how many Pebble Gets the negative filter has avoided.
@@ -135,6 +134,17 @@ func (s *Store) FilterSkips() uint64 {
 	return s.filterHits.Load()
 }
 
+// AddKeyToFilter adds a key to the negative filter (if enabled). This is called
+// during cold recovery to populate the filter with keys that are known to exist in
+// ClickHouse above the recovery floor. Subsequent Gets for these keys will skip the
+// Pebble lookup when the filter reports "may contain=false" (authoritative miss).
+func (s *Store) AddKeyToFilter(key []byte) {
+	if s == nil || s.neg == nil {
+		return
+	}
+	s.neg.add(key)
+}
+
 // Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
 // cacheBytes/memTableBytes <= 0 fall back to the defaults.
 func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
@@ -142,14 +152,28 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 		budget := cacheBytes
 		if budget <= 0 {
 			budget = envconfig.ColdCacheSize()
+			if budget <= 0 {
+				budget = defaultCacheBytes()
+			}
 		}
 		log.Printf("cold tier: in-RAM flat backend, budget %d MiB (SQD_COLDCACHE_BACKEND=flat)", budget>>20)
-		return &Store{flat: newFlatcoldBudget(budget), dir: dir}, nil
+		s := &Store{flat: newFlatcoldBudget(budget), dir: dir}
+		// The flat backend is capacity-bounded and EVICTS (CLOCK), unlike Pebble.
+		// The authoritative "hot+cold miss => provably new" fast path is only sound
+		// when a miss can be distinguished from an eviction: the negative filter
+		// provides that (a key ever written stays "maybe present" forever, so an
+		// evicted key still forces a ClickHouse check). Without it, evicted entries
+		// would be silently treated as new and reset to zero.
+		if bits := defaultNegativeFilterBits(); bits > 0 {
+			s.EnableNegativeFilter(bits)
+		}
+		return s, nil
 	}
 	if cacheBytes <= 0 {
 		cacheBytes = envconfig.ColdCacheSize()
-	} else {
-		cacheBytes = defaultCacheBytes()
+		if cacheBytes <= 0 {
+			cacheBytes = defaultCacheBytes()
+		}
 	}
 	log.Printf("cold tier: block cache %d MiB (override with SQD_COLDCACHE_MB)", cacheBytes>>20)
 	if memTableBytes == 0 {
@@ -227,6 +251,9 @@ func (s *Store) Put(key, value []byte) error {
 		return nil
 	}
 	if s.flat != nil {
+		if s.neg != nil {
+			s.neg.add(key)
+		}
 		s.flat.put(key, value)
 		return nil
 	}
@@ -254,7 +281,7 @@ func (s *Store) NewWriteBatch() *WriteBatch {
 		return &WriteBatch{}
 	}
 	if s.flat != nil {
-		return &WriteBatch{flat: s.flat}
+		return &WriteBatch{flat: s.flat, neg: s.neg}
 	}
 	if s.db == nil {
 		return &WriteBatch{}
@@ -267,6 +294,9 @@ func (w *WriteBatch) Put(key, value []byte) error {
 		return nil
 	}
 	if w.flat != nil {
+		if w.neg != nil {
+			w.neg.add(key)
+		}
 		w.flat.put(key, value)
 		return nil
 	}

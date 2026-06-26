@@ -30,6 +30,17 @@ func GetenvInt(key string, defaultVal int) int {
 	return defaultVal
 }
 
+// GetenvFloat returns the environment variable value as float64 or default if
+// not set/invalid.
+func GetenvFloat(key string, defaultVal float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return defaultVal
+}
+
 // GetenvBool returns the environment variable value as bool or default if not set.
 func GetenvBool(key string, defaultVal bool) bool {
 	if v := strings.TrimSpace(strings.ToLower(os.Getenv(key))); v != "" {
@@ -119,8 +130,8 @@ const (
 	TargetFetchSeconds = "SQD_TARGET_FETCH_SECONDS"
 
 	// SQD_STATS_INTERVAL is the interval between printing statistics in seconds.
-	// Set to 0 to disable stats printing.
-	// Default: 60 seconds
+	// A Go duration (for example "250ms" or "5m") is also accepted.
+	// Default: 10 seconds
 	StatsInterval = "SQD_STATS_INTERVAL"
 
 	// SQD_COMMIT_INTERVAL is the target commit interval in blocks.
@@ -130,8 +141,21 @@ const (
 
 	// SQD_COMMIT_MAX_INTERVAL is the maximum time between commits in seconds.
 	// Forces a commit even if COMMIT_INTERVAL blocks haven't been processed.
-	// Default: 60 seconds
+	// A Go duration is also accepted by generated processors.
+	// Default: 3 seconds
 	CommitMaxInterval = "SQD_COMMIT_MAX_INTERVAL"
+
+	// SQD_PARALLEL_FETCHERS is the number of parallel fetch workers.
+	// Default: 6
+	EnvParallelFetchers = "SQD_PARALLEL_FETCHERS"
+
+	// SQD_PARALLEL_PAGE_SIZE is the block range each worker claims per page.
+	// Default: 10000
+	EnvParallelPageSize = "SQD_PARALLEL_PAGE_SIZE"
+
+	// SQD_PARALLEL_RPS is the target request rate to the portal (shared).
+	// Default: 5.0 (requests/sec)
+	EnvParallelRPS = "SQD_PARALLEL_RPS"
 )
 
 // ParseDecodeV2Enabled returns true if the fast JSONL parser is enabled.
@@ -141,18 +165,33 @@ func ParseDecodeV2Enabled() bool {
 
 // TargetFetchDuration returns the target fetch latency as duration.
 func TargetFetchDuration() time.Duration {
-	seconds := GetenvInt(TargetFetchSeconds, 6)
-	return time.Duration(seconds) * time.Second
-}
-
-// StatsIntervalDuration returns the stats interval as duration.
-// Returns 0 if stats printing is disabled.
-func StatsIntervalDuration() time.Duration {
-	seconds := GetenvInt(StatsInterval, 60)
+	seconds := GetenvFloat(TargetFetchSeconds, 6)
 	if seconds <= 0 {
 		return 0
 	}
-	return time.Duration(seconds) * time.Second
+	return time.Duration(seconds * float64(time.Second))
+}
+
+// StatsIntervalDuration returns the stats interval as duration.
+func StatsIntervalDuration() time.Duration {
+	const defaultInterval = 10 * time.Second
+	v := strings.TrimSpace(os.Getenv(StatsInterval))
+	if v == "" {
+		return defaultInterval
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		if d >= 50*time.Millisecond {
+			return d
+		}
+		return defaultInterval
+	}
+	if seconds, err := strconv.ParseFloat(v, 64); err == nil {
+		d := time.Duration(seconds * float64(time.Second))
+		if d >= 50*time.Millisecond {
+			return d
+		}
+	}
+	return defaultInterval
 }
 
 // CommitIntervalBlocks returns the commit interval in blocks.
@@ -162,7 +201,47 @@ func CommitIntervalBlocks() int {
 
 // CommitMaxIntervalSeconds returns the max commit interval in seconds.
 func CommitMaxIntervalSeconds() int {
-	return GetenvInt(CommitMaxInterval, 60)
+	v := strings.TrimSpace(os.Getenv(CommitMaxInterval))
+	if v == "" {
+		return 3
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return max(1, int(d/time.Second))
+	}
+	if seconds, err := strconv.Atoi(v); err == nil && seconds > 0 {
+		return seconds
+	}
+	return 3
+}
+
+// ParallelFetchers returns the number of parallel fetch workers.
+func ParallelFetchers() int {
+	n := GetenvInt(EnvParallelFetchers, 6)
+	if n < 1 {
+		return 1
+	}
+	if n > 32 {
+		return 32
+	}
+	return n
+}
+
+// ParallelPageSize returns the block range per worker page.
+func ParallelPageSize() int {
+	n := GetenvInt(EnvParallelPageSize, 10000)
+	if n < 1000 {
+		return 1000
+	}
+	return n
+}
+
+// ParallelRPS returns the target request rate to the portal.
+func ParallelRPS() float64 {
+	n := GetenvFloat(EnvParallelRPS, 5.0)
+	if n <= 0 {
+		return 5.0
+	}
+	return n
 }
 
 // ============================================================================
@@ -172,12 +251,12 @@ func CommitMaxIntervalSeconds() int {
 const (
 	// SQD_COLDCACHE_MB is the cold cache memory budget in megabytes.
 	// Actual memory usage may be up to 2x this value for bookkeeping.
-	// Default: 1024 MB
+	// Default: 0 (let the cold-cache package auto-size from system RAM)
 	ColdCacheMB = "SQD_COLDCACHE_MB"
 
 	// SQD_COLDFILTER_BITS is the size of the cold filter in bits.
 	// Must be a power of 2 for optimal performance.
-	// Default: 1 << 28 (268 million bits, ~32 MB)
+	// Default: 1 << 31 (2.1 billion bits, 256 MB)
 	ColdFilterBits = "SQD_COLDFILTER_BITS"
 
 	// SQD_BLOOM_KEYS is the number of hash functions for the Bloom filter.
@@ -198,13 +277,26 @@ const (
 
 // ColdCacheSize returns the cold cache memory budget in bytes.
 func ColdCacheSize() int64 {
-	mb := GetenvInt(ColdCacheMB, 1024)
+	mb := GetenvInt(ColdCacheMB, 0)
+	if mb <= 0 {
+		return 0
+	}
 	return int64(mb) * 1024 * 1024
 }
 
 // ColdFilterSize returns the cold filter size in bits.
-func ColdFilterSize() int {
-	return GetenvInt(ColdFilterBits, 1<<28)
+func ColdFilterSize() uint64 {
+	if v := os.Getenv(ColdFilterBits); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	if v := os.Getenv(BloomKeys); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n * 10
+		}
+	}
+	return 1 << 31
 }
 
 // BloomHashCount returns the number of Bloom filter hash functions.
@@ -249,7 +341,7 @@ func MetricsCHEnabled() bool {
 
 // MetricsCHFlushInterval returns the metrics flush interval.
 func MetricsCHFlushInterval() time.Duration {
-	return GetenvDuration(MetricsCHInterval, 1*time.Minute)
+	return GetenvDuration(MetricsCHInterval, 5*time.Second)
 }
 
 // MetricsCHTTL returns the metrics data retention period.

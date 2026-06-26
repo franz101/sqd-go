@@ -53,7 +53,27 @@ package generated
 }
 
 func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
-	host, user, password, _, port := envconfig.ClickHouse("default")
+	// Connection settings are read straight from the environment: generated code
+	// is a standalone module and must not import sqd-go internal packages. These
+	// defaults mirror internal/envconfig.ClickHouse.
+	host := "127.0.0.1"
+	if v := os.Getenv("CLICKHOUSE_HOST"); v != "" {
+		host = v
+	}
+	port := 9000
+	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			port = n
+		}
+	}
+	user := "default"
+	if v := os.Getenv("CLICKHOUSE_USER"); v != "" {
+		user = v
+	}
+	password := "sqd-clickhouse"
+	if v := os.Getenv("CLICKHOUSE_PASSWORD"); v != "" {
+		password = v
+	}
 	return ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
 		Database: "default",
@@ -63,7 +83,13 @@ func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
 }
 
 func recoveryRecencyClause() string {
-	mb := envconfig.RecoveryMinBlockNumber()
+	// SQD_RECOVERY_MIN_BLOCK floor, read inline (see recoveryDialConn).
+	var mb uint64
+	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			mb = uint64(n)
+		}
+	}
 	if mb == 0 {
 		return ""
 	}
@@ -156,6 +182,124 @@ feed:
 	return firstErr
 }
 
+// asyncInsertFireAndForget reports whether commits use wait_for_async_insert=0.
+// Fire-and-forget is faster but only guarantees rows are queryable after an
+// explicit SYSTEM FLUSH ASYNC INSERT QUEUE, which Commit issues at each commit
+// boundary. The default (unset) keeps wait_for_async_insert=1, which waits per
+// insert so a read-back right after Commit always sees the rows. Toggle with
+// SQD_ASYNC_INSERT_FLUSH=1.
+func asyncInsertFireAndForget() bool {
+	v := os.Getenv("SQD_ASYNC_INSERT_FLUSH")
+	return v == "1" || v == "true"
+}
+
+func asyncInsertSettings() []ch.Setting {
+	if asyncInsertFireAndForget() {
+		return []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}
+	}
+	return []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}
+}
+
+// flushAsyncInserts drains the server-side async-insert queue so subsequent
+// read-backs see all committed rows. No-op unless fire-and-forget is enabled.
+func flushAsyncInserts(ctx context.Context, conn *ch.Client) error {
+	if conn == nil || !asyncInsertFireAndForget() {
+		return nil
+	}
+	return conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
+}
+
+func recoveryPreFloorClause() (clause string, active bool) {
+	var mb uint64
+	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			mb = uint64(n)
+		}
+	}
+	if mb == 0 {
+		return "", false
+	}
+	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " < " + strconv.FormatUint(mb, 10), true
+}
+
+func recoverFilterKeysParallel[K any](
+	ctx context.Context,
+	primary *ch.Client,
+	nbuckets int,
+	cold *coldcache.Store,
+	run func(ctx context.Context, conn *ch.Client, bucket int, emit func(K)) error,
+) error {
+	conc := recoveryConcurrency
+	if conc > nbuckets {
+		conc = nbuckets
+	}
+	if conc < 1 {
+		conc = 1
+	}
+	conns := make([]*ch.Client, 1, conc)
+	conns[0] = primary
+	for len(conns) < conc {
+		wc, err := recoveryDialConn(ctx)
+		if err != nil {
+			break
+		}
+		conns = append(conns, wc)
+	}
+	defer func() {
+		for _, wc := range conns[1:] {
+			_ = wc.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	buckets := make(chan int)
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+	for _, conn := range conns {
+		wg.Add(1)
+		go func(conn *ch.Client) {
+			defer wg.Done()
+			emit := func(k K) {
+				cold.AddKeyToFilter(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)))
+			}
+			for bucket := range buckets {
+				if err := run(ctx, conn, bucket, emit); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}(conn)
+	}
+feed:
+	for bucket := 0; bucket < nbuckets; bucket++ {
+		select {
+		case buckets <- bucket:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(buckets)
+	wg.Wait()
+	return firstErr
+}
+
+
 `)
 	} else {
 		b.WriteString("\n")
@@ -184,16 +328,15 @@ feed:
 
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
-		`"context"`:                                         "",
-		`"encoding/binary"`:                                 "",
-		`"fmt"`:                                             "",
-		`"strings"`:                                         "",
-		`"sync"`:                                            "",
-		`"sync/atomic"`:                                     "",
-		`"github.com/ClickHouse/ch-go"`:                     "",
-		`"github.com/ClickHouse/ch-go/proto"`:               "",
-		`"github.com/franz101/sqd-go/coldcache"`:            "",
-		`"github.com/franz101/sqd-go/internal/envconfig"`: "",
+		`"context"`:                              "",
+		`"encoding/binary"`:                      "",
+		`"fmt"`:                                  "",
+		`"strings"`:                              "",
+		`"sync"`:                                 "",
+		`"sync/atomic"`:                          "",
+		`"github.com/ClickHouse/ch-go"`:          "",
+		`"github.com/ClickHouse/ch-go/proto"`:    "",
+		`"github.com/franz101/sqd-go/coldcache"`: "",
 	}
 	if customTablesUseDecimal(tables) {
 		imports[`"encoding/binary"`] = ""
@@ -202,6 +345,13 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 	if len(tables) > 0 {
 		imports[`"strconv"`] = ""
 		imports[`"time"`] = ""
+	}
+	if len(hotStateSpecs(tables)) > 0 {
+		// The cold-recovery runtime reads ClickHouse settings and the recovery
+		// floor from the environment (generated code must not import internal
+		// packages), so it needs os + strconv.
+		imports[`"os"`] = ""
+		imports[`"strconv"`] = ""
 	}
 	if customTablesUseColdCache(tables) {
 		// Cold tier (Pebble): pointer-free values are stored as raw bytes via
@@ -581,6 +731,30 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 			b.WriteString(lowerFirst(field.Name))
 		}
 		b.WriteString("})\n}\n\n")
+
+		if coldOn {
+			// ColdMightContain reports whether the key may have ever been written to
+			// the cold tier (negative-filter probe; no false negatives). A hot+cold
+			// miss with ColdMightContain==false is provably new, so the authoritative
+			// read path may skip ClickHouse. A miss with ==true may be an evicted
+			// entry (the bounded flat backend evicts), so ClickHouse must be checked.
+			b.WriteString("func (c *")
+			b.WriteString(spec.cacheType)
+			b.WriteString(") ColdMightContain(")
+			renderClockKeyParams(b, keyFields)
+			b.WriteString(") bool {\n\tif c == nil || c.cold == nil {\n\t\treturn false\n\t}\n\tk := ")
+			b.WriteString(spec.keyType)
+			b.WriteString("{")
+			for i, field := range keyFields {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(field.Name)
+				b.WriteString(": ")
+				b.WriteString(lowerFirst(field.Name))
+			}
+			b.WriteString("}\n\treturn c.cold.MightContain(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)))\n}\n\n")
+		}
 	}
 
 	// coldDel mirrors a hard delete into the cold tier so a rolled-back key cannot
@@ -741,10 +915,12 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(spec.batchType)
 	b.WriteString(") Insert(ctx context.Context, conn *ch.Client, db string) error {\n\tif b.Rows() == 0 {\n\t\treturn nil\n\t}\n\treturn conn.Do(ctx, ch.Query{Body: fmt.Sprintf(")
 	b.WriteString(strconv.Quote("INSERT INTO %s.%s " + customInsertColumnList(spec.table) + " VALUES"))
-	// wait_for_async_insert MUST be 1: hot-state commits are read back on
-	// prefetch/recovery/rollback. With wait=0 (fire-and-forget) a SELECT after
-	// Commit can miss un-flushed rows, returning stale/partial state under load.
-	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: \"async_insert\", Value: \"1\", Important: true}, {Key: \"wait_for_async_insert\", Value: \"1\", Important: true}}})\n}\n\n")
+	// Insert settings are flag-selected by asyncInsertSettings(): the default
+	// waits per insert (wait_for_async_insert=1) so the hot-state read-backs on
+	// prefetch/recovery/rollback always see committed rows; SQD_ASYNC_INSERT_FLUSH
+	// switches to fire-and-forget (wait=0) with an explicit queue flush at each
+	// commit boundary (see asyncInsertSettings / flushAsyncInserts).
+	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: asyncInsertSettings()})\n}\n\n")
 }
 
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
@@ -795,13 +971,17 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 	}
 	b.WriteString("\t\t\t})\n\t\t}\n\t\treturn nil\n\t}})\n\t}\n")
 	if isPointerFreeEntity(spec.table) {
-		b.WriteString("\tif c.cold != nil {\n\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
+		b.WriteString("\tif c.cold != nil {\n")
+		renderClockFilterKeysPass(b, spec)
+		b.WriteString("\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
 		b.WriteString(spec.table.GoTypeName)
 		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
 		b.WriteString(spec.keyType)
 		b.WriteString("(v)\n\t\t\treturn put(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)), unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)))\n\t\t})\n\t}\n")
 	} else if isColdSerializableEntity(spec.table) {
-		b.WriteString("\tif c.cold != nil {\n\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
+		b.WriteString("\tif c.cold != nil {\n")
+		renderClockFilterKeysPass(b, spec)
+		b.WriteString("\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
 		b.WriteString(spec.table.GoTypeName)
 		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
 		b.WriteString(spec.keyType)
@@ -849,6 +1029,16 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	b.WriteString("\t// the lazy state Get queues misses instead of resolving them synchronously,\n")
 	b.WriteString("\t// and Save is suppressed (the dry run has no committed side effects).\n")
 	b.WriteString("\trecordMode bool\n")
+	b.WriteString("\t// Async resolve state: non-blocking resolution of entity resolver misses.\n")
+	b.WriteString("\t// When enabled, resolver queries run in background goroutines via\n")
+	b.WriteString("\t// StartResolveAllPending, allowing other work to overlap.\n")
+	b.WriteString("\tresolveAsyncEnabled bool\n")
+	b.WriteString("\tresolveInProgress   bool\n")
+	b.WriteString("\tresolveDone         chan resolveResult\n")
+	b.WriteString("\tresolveConn         *ch.Client\n")
+	b.WriteString("\tresolveDB           string\n")
+	b.WriteString("\tresolveCtx          context.Context\n")
+	b.WriteString("\tresolveCancel       context.CancelFunc\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -878,6 +1068,13 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(spec.baseName)
 		b.WriteString(")\n")
 	}
+	for _, spec := range specs {
+		b.WriteString("\tstate.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.hot = state\n")
+	}
+	// Initialize async resolve fields
+	b.WriteString("\tstate.resolveAsyncEnabled = asyncResolveEnabled()\n")
 	b.WriteString("\treturn state\n}\n\n")
 
 	// EnableColdCache / CloseColdCache: attach the Pebble cold tier to every
@@ -973,6 +1170,133 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	}
 	b.WriteString("\treturn nil\n}\n\n")
 
+	// Async resolve infrastructure: non-blocking resolver queries for higher throughput.
+	// Environment variable helpers.
+	b.WriteString("func asyncResolveEnabled() bool {\n\tif v := os.Getenv(\"SQD_ASYNC_RESOLVE\"); v != \"\" {\n\t\treturn v == \"1\" || v == \"true\" || v == \"yes\"\n\t}\n\treturn false\n}\n\n")
+	b.WriteString("func asyncResolveConcurrency() int {\n\tif v := os.Getenv(\"SQD_ASYNC_RESOLVE_CONCURRENCY\"); v != \"\" {\n\t\tif n, err := strconv.Atoi(v); err == nil && n > 0 {\n\t\t\treturn n\n\t\t}\n\t}\n\treturn 4\n}\n\n")
+
+	// resolveResult carries the outcome of one async resolve pass back to the
+	// poller (PollResolveAllPending / WaitResolveAllPending).
+	b.WriteString("type resolveResult struct {\n\terr error\n}\n\n")
+
+	// StartResolveAllPending begins async resolution of all queued misses.
+	// Returns true if async resolution was started (false if already in progress
+	// or no pending work). Non-blocking: launches goroutine and returns immediately.
+	b.WriteString("func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, db string) bool {\n")
+	b.WriteString("\tif s == nil || conn == nil || !s.resolveAsyncEnabled {\n\t\treturn false\n\t}\n")
+	b.WriteString("\tif s == nil || s.resolveInProgress {\n\t\treturn false\n\t}\n")
+	// Check if any resolver has pending work
+	b.WriteString("\thasPending := false\n")
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\tif s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Pending() > 0 {\n\t\thasPending = true\n\t}\n")
+	}
+	b.WriteString("\tif !hasPending {\n\t\treturn false\n\t}\n")
+	// Set up async state
+	b.WriteString("\ts.mu.Lock()\n")
+	b.WriteString("\ts.resolveInProgress = true\n")
+	b.WriteString("\ts.resolveConn = conn\n")
+	b.WriteString("\ts.resolveDB = db\n")
+	b.WriteString("\ts.resolveCtx, s.resolveCancel = context.WithCancel(ctx)\n")
+	b.WriteString("\ts.mu.Unlock()\n")
+	// Create result channel if needed
+	b.WriteString("\tif s.resolveDone == nil {\n\t\ts.resolveDone = make(chan resolveResult, 1)\n\t}\n")
+	// Launch async resolution goroutine
+	b.WriteString("\tgo func() {\n")
+	b.WriteString("\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\ts.resolveDone <- resolveResult{err: fmt.Errorf(\"resolve panic: %v\", r)}\n\t\t\t}\n\t\t}()\n")
+	b.WriteString("\t\terr := s.resolveAllParallel(s.resolveCtx, conn, db)\n")
+	b.WriteString("\t\ts.resolveDone <- resolveResult{err: err}\n")
+	b.WriteString("\t}()\n")
+	b.WriteString("\treturn true\n}\n\n")
+
+	// PollResolveAllPending checks async resolution completion without blocking.
+	b.WriteString("func (s *HotState) PollResolveAllPending() error {\n")
+	b.WriteString("\tif s == nil || s.resolveDone == nil {\n\t\treturn nil\n\t}\n")
+	b.WriteString("\tselect {\n")
+	b.WriteString("\tcase result := <-s.resolveDone:\n")
+	b.WriteString("\t\ts.resolveInProgress = false\n")
+	b.WriteString("\t\ts.resolveDone = nil\n")
+	b.WriteString("\t\tif s.resolveCancel != nil {\n")
+	b.WriteString("\t\t\ts.resolveCancel()\n")
+	b.WriteString("\t\t\ts.resolveCancel = nil\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\treturn result.err\n")
+	b.WriteString("\tdefault:\n")
+	b.WriteString("\t\treturn nil\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+
+	// WaitResolveAllPending blocks until async resolution completes or context cancels.
+	b.WriteString("func (s *HotState) WaitResolveAllPending(ctx context.Context) error {\n")
+	b.WriteString("\tif s == nil || s.resolveDone == nil {\n\t\treturn nil\n\t}\n")
+	b.WriteString("\tselect {\n")
+	b.WriteString("\tcase result := <-s.resolveDone:\n")
+	b.WriteString("\t\ts.resolveInProgress = false\n")
+	b.WriteString("\t\ts.resolveDone = nil\n")
+	b.WriteString("\t\tif s.resolveCancel != nil {\n")
+	b.WriteString("\t\t\ts.resolveCancel()\n")
+	b.WriteString("\t\t\ts.resolveCancel = nil\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\treturn result.err\n")
+	b.WriteString("\tcase <-ctx.Done():\n")
+	b.WriteString("\t\treturn ctx.Err()\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+
+	// resolveAllParallel executes entity resolvers concurrently.
+	b.WriteString("func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db string) error {\n")
+	b.WriteString("\ttype resolveJob struct {\n\t\tname string\n\t\tresolve func(context.Context, *ch.Client, string) error\n\t}\n")
+	b.WriteString("\tvar jobs []resolveJob\n")
+	// Collect jobs only for resolvers with Pending() > 0
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\tif s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Pending() > 0 {\n")
+		b.WriteString("\t\tjobs = append(jobs, resolveJob{\n")
+		b.WriteString("\t\t\tname: \"")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString("\",\n")
+		b.WriteString("\t\t\tresolve: func(ctx context.Context, conn *ch.Client, db string) error {\n")
+		b.WriteString("\t\t\t\treturn s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Resolve(ctx, conn, db)\n")
+		b.WriteString("\t\t\t},\n")
+		b.WriteString("\t\t})\n")
+		b.WriteString("\t}\n")
+	}
+	b.WriteString("\tif len(jobs) == 0 {\n\t\treturn nil\n\t}\n")
+	// Semaphore to bound concurrency
+	b.WriteString("\tconcurrency := asyncResolveConcurrency()\n")
+	b.WriteString("\tif concurrency > len(jobs) {\n\t\tconcurrency = len(jobs)\n\t}\n")
+	b.WriteString("\tsem := make(chan struct{}, concurrency)\n")
+	b.WriteString("\tvar wg sync.WaitGroup\n")
+	b.WriteString("\terrMu := sync.Mutex{}\n")
+	b.WriteString("\tvar firstErr error\n")
+	b.WriteString("\tfor _, job := range jobs {\n\t\twg.Add(1)\n\t\tgo func(j resolveJob) {\n\t\t\tdefer wg.Done()\n")
+	b.WriteString("\t\t\tsem <- struct{}{}\n")
+	b.WriteString("\t\t\tdefer func() { <-sem }()\n")
+	b.WriteString("\t\t\tif ctx.Err() != nil {\n\t\t\t\treturn\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tif err := j.resolve(ctx, conn, db); err != nil {\n")
+	b.WriteString("\t\t\t\terrMu.Lock()\n")
+	b.WriteString("\t\t\t\tif firstErr == nil {\n")
+	b.WriteString("\t\t\t\t\tfirstErr = fmt.Errorf(\"%s resolve: %w\", j.name, err)\n")
+	b.WriteString("\t\t\t\t}\n")
+	b.WriteString("\t\t\t\terrMu.Unlock()\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t}(job)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\twg.Wait()\n")
+	b.WriteString("\treturn firstErr\n")
+	b.WriteString("}\n\n")
+
 	// Generate Update methods
 	for _, spec := range specs {
 		if spec.table.IsEvent {
@@ -1038,6 +1362,9 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(")\n")
 		b.WriteString("\t}\n")
 	}
+	// Drain the async-insert queue so the next read-back sees these rows (no-op
+	// unless SQD_ASYNC_INSERT_FLUSH is set; see flushAsyncInserts).
+	b.WriteString("\tif err := flushAsyncInserts(ctx, conn); err != nil {\n\t\treturn err\n\t}\n")
 	b.WriteString("\treturn nil\n}\n")
 
 	// Generate Restore methods for journal rollback
@@ -1905,7 +2232,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\n\tfoundKeys map[")
 	b.WriteString(keyType)
 	b.WriteString("]struct{}")
-	b.WriteString("\n\tmetricsEnabled bool\n\tmetrics BatchResolverMetrics\n}\n\n")
+	b.WriteString("\n\tmetricsEnabled bool\n\tmetrics BatchResolverMetrics\n\thot *HotState\n}\n\n")
 
 	b.WriteString("func New")
 	b.WriteString(resolverType)
@@ -1926,11 +2253,17 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(", bool) {\n")
 	b.WriteString("\treturn r.cache.Get(key)\n}\n\n")
 
+	b.WriteString("func (c *")
+	b.WriteString(cacheType)
+	b.WriteString(") coldMightContainKey(key ")
+	b.WriteString(keyType)
+	b.WriteString(") bool {\n\tif c == nil || c.cold == nil {\n\t\treturn true\n\t}\n\tk := key\n\treturn c.cold.MightContain(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)))\n}\n\n")
+
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
 	b.WriteString(") Queue(key ")
 	b.WriteString(keyType)
-	b.WriteString(") {\n\tif _, ok := r.Lookup(key); !ok {\n")
+	b.WriteString(") {\n\t\t// Provably-new fast path: under an authoritative cold tier a key the\n\t\t// negative filter has never seen cannot exist in ClickHouse, so the lazy Get\n\t\t// returns zero and queuing it for a resolve would be a wasted CH round-trip.\n\tif r.hot != nil && r.hot.coldAuthoritative && !r.cache.coldMightContainKey(key) {\n\t\treturn\n\t}\n\tif _, ok := r.Lookup(key); !ok {\n")
 	b.WriteString("\t\tif r.metricsEnabled {\n\t\t\tr.metrics.QueuedMisses++\n\t\t}\n")
 	b.WriteString("\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
 

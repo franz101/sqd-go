@@ -265,11 +265,13 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 	"context"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/franz101/sqd-go/internal/envconfig"
 	"github.com/franz101/sqd-go/sqd"
 )
 
@@ -433,6 +435,9 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 }
 
 func commitCustomProcessing(ctx context.Context, store Store, state *State, blockNumber uint64) error {
+	if err := state.PollCommit(); err != nil {
+		return fmt.Errorf("async state commit: %w", err)
+	}
 	// Hybrid commit cadence. Commit when EITHER bound is hit, whichever first:
 	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 5000): the crash re-fetch budget.
 	//     Bounds how many blocks a crash must re-fetch+re-process from the durable
@@ -443,31 +448,46 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 	//     clock). Dominates at the head.
 	// This replaces the single magic block interval: the checkpoint never leads the
 	// durable horizon, and the gap is bounded in both blocks and wall-clock time.
-	maxBlocks := uint64(envconfig.CommitIntervalBlocks())
-	maxInterval := time.Duration(envconfig.CommitMaxIntervalSeconds()) * time.Second
+	maxBlocks := uint64(5000)
+	if envVal := os.Getenv("SQD_COMMIT_INTERVAL"); envVal != "" {
+		if parsed, err := strconv.ParseUint(envVal, 10, 64); err == nil && parsed > 0 {
+			maxBlocks = parsed
+		}
+	}
+	maxInterval := 3 * time.Second
+	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
+		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
+			maxInterval = parsed
+		} else if seconds, err := strconv.ParseUint(envVal, 10, 64); err == nil && seconds > 0 {
+			maxInterval = time.Duration(seconds) * time.Second
+		}
+	}
 
 	nowNanos := time.Now().UnixNano()
 	if state.lastCommitWallNanos == 0 {
 		state.lastCommitWallNanos = nowNanos
 	}
+	pruneInterval := uint64(100000)
+	if envVal := os.Getenv("CLICKHOUSE_PRUNE_INTERVAL"); envVal != "" {
+		parsed, err := strconv.ParseUint(envVal, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid CLICKHOUSE_PRUNE_INTERVAL %q: %w", envVal, err)
+		}
+		pruneInterval = parsed
+	}
+	if state.LastSyncBlock >= state.LastPruneBlock+pruneInterval {
+		if err := CompactionPruneState(ctx, store, state.LastSyncBlock); err != nil {
+			return fmt.Errorf("prune ClickHouse state at block %d: %w", state.LastSyncBlock, err)
+		}
+		state.LastPruneBlock = state.LastSyncBlock
+	}
+
 	blocksElapsed := blockNumber >= state.LastSyncBlock+maxBlocks
 	timeElapsed := time.Duration(nowNanos-state.lastCommitWallNanos) >= maxInterval
-	if blocksElapsed || timeElapsed {
+	if (blocksElapsed || timeElapsed) && !state.CommitInFlight() {
 		state.lastCommitWallNanos = nowNanos
 		state.SaveSnapshot(blockNumber)
-		if err := state.Commit(ctx, store); err != nil {
-			return err
-		}
-
-		pruneInterval := envconfig.PruneIntervalBlocks()
-		if blockNumber >= state.LastPruneBlock+pruneInterval {
-			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
-				return fmt.Errorf("prune ClickHouse state at block %d: %w", blockNumber, err)
-			}
-			state.LastPruneBlock = blockNumber
-		}
-
-		state.LastSyncBlock = blockNumber
+		state.StartCommit(ctx, store, blockNumber)
 	}
 	return nil
 }
@@ -492,7 +512,12 @@ type Processor struct {
 	protoRing *ProtoRingBuffer
 	State     *State
 	ProtoMode bool
+
+	insertBatches *InsertBatches
+	batchFree     chan *InsertBatches
 }
+
+const insertBatchPoolSize = 4
 
 func NewProcessor(protoMode bool) (*Processor, error) {
 	var ring *OrderedHistoricRingBuffer
@@ -515,6 +540,189 @@ func NewProcessor(protoMode bool) (*Processor, error) {
 		State:     NewState(),
 		ProtoMode: protoMode,
 	}, nil
+}
+
+// ProcessJSONL implements ingestion.FastJSONLProcessor without importing an
+// internal package: sqd.Store is a public alias of the runtime store type.
+// Parsing directly into the generated ring avoids cloning CustomLog strings
+// and decoding those logs again through Process.
+func (p *Processor) ProcessJSONL(ctx context.Context, store *sqd.Store, data []byte) (uint64, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+			if err != nil {
+				return 0, err
+			}
+			p.protoRing = ring
+		}
+		return ParseJSONLProto(data, nil, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	}
+	if p.ring == nil {
+		ring, err := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, err
+		}
+		p.ring = ring
+	}
+	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
+		return CustomProcessing(ctx, stateStore, p.State, block)
+	})
+}
+
+// ProcessJSONLWithInserts performs the generated decode once for both custom
+// state processing and typed event insertion. The caller must run the returned
+// flush before processing another batch.
+func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *sqd.Store, data []byte) (uint64, func(context.Context) error, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	if p.insertBatches == nil {
+		p.insertBatches = NewInsertBatches()
+	} else {
+		p.insertBatches.Reset()
+	}
+	batches := p.insertBatches
+
+	var n uint64
+	var err error
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, ringErr := NewProtoRingBuffer(defaultRingBufferSize)
+			if ringErr != nil {
+				return 0, nil, ringErr
+			}
+			p.protoRing = ring
+		}
+		n, err = ParseJSONLProto(data, batches, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	} else {
+		if p.ring == nil {
+			ring, ringErr := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+			if ringErr != nil {
+				return 0, nil, ringErr
+			}
+			p.ring = ring
+		}
+		n, err = ParseJSONLV2(data, batches, p.ring, func(block *ParsedBlock) error {
+			return CustomProcessing(ctx, stateStore, p.State, block)
+		})
+	}
+	if err != nil || store == nil || store.Conn() == nil {
+		batches.Reset()
+		return n, nil, err
+	}
+	flush := func(flushCtx context.Context) error {
+		defer batches.Reset()
+		return batches.Insert(flushCtx, store.InsertConn(), store.DB())
+	}
+	return n, flush, nil
+}
+
+func (p *Processor) SupportsBatchParse() bool {
+	return p != nil && p.ProtoMode
+}
+
+// ParseBatchForInserts runs the generated parse on the producer and streams
+// ready proto-ring slots to the consumer. A bounded batch pool prevents the
+// producer from outrunning the consumer while allowing the two stages to
+// overlap.
+func (p *Processor) ParseBatchForInserts(store *sqd.Store, data []byte, endBlock uint64, onParsed func(sqd.BatchParsedBlock) error) (uint64, func(context.Context) error, error) {
+	if p == nil || !p.ProtoMode || len(data) == 0 {
+		return 0, nil, nil
+	}
+	if p.protoRing == nil {
+		ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, nil, err
+		}
+		p.protoRing = ring
+	}
+	if p.batchFree == nil {
+		p.batchFree = make(chan *InsertBatches, 2*insertBatchPoolSize)
+		for i := 0; i < insertBatchPoolSize; i++ {
+			p.batchFree <- NewInsertBatches()
+		}
+	}
+	batches := <-p.batchFree
+	n, err := ParseJSONLProtoStream(data, batches, p.protoRing, endBlock, func(proto *ProtoEventBlock, number, timestamp uint64, hash string, line []byte) error {
+		if onParsed == nil {
+			return nil
+		}
+		return onParsed(sqd.BatchParsedBlock{
+			Number:    number,
+			Hash:      strings.Clone(hash),
+			Timestamp: time.Unix(int64(timestamp), 0).UTC(),
+			RawLine:   line,
+			Block:     proto,
+		})
+	})
+	if err != nil {
+		batches.Reset()
+		p.batchFree <- batches
+		return n, nil, err
+	}
+	flush := func(flushCtx context.Context) error {
+		defer func() {
+			batches.Reset()
+			p.batchFree <- batches
+		}()
+		if store == nil || store.InsertConn() == nil {
+			return nil
+		}
+		return batches.Insert(flushCtx, store.InsertConn(), store.DB())
+	}
+	return n, flush, nil
+}
+
+func (p *Processor) ProcessParsedBlock(ctx context.Context, store *sqd.Store, block any) error {
+	if p == nil || block == nil {
+		return nil
+	}
+	protoBlock, ok := block.(*ProtoEventBlock)
+	if !ok || protoBlock == nil {
+		return nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	return CustomProcessingProto(ctx, stateStore, p.State, protoBlock)
+}
+
+func (p *Processor) ReclaimParseBatches() {
+	if p == nil || p.batchFree == nil {
+		return
+	}
+	for len(p.batchFree) < insertBatchPoolSize {
+		p.batchFree <- NewInsertBatches()
+	}
 }
 
 func (p *Processor) Process(ctx context.Context, store *sqd.Store, logs []sqd.CustomLog) error {
@@ -664,6 +872,11 @@ func (p *Processor) RestoreToBlock(blockNumber uint64) (uint64, error) {
 	if p == nil {
 		return 0, nil
 	}
+	if p.State != nil {
+		if err := p.State.WaitCommit(context.Background()); err != nil {
+			return p.State.LastSyncBlock, fmt.Errorf("wait for state commit before restore: %w", err)
+		}
+	}
 	if p.ring != nil {
 		p.ring.Reset()
 	}
@@ -700,8 +913,8 @@ func (p *Processor) LoadFromDatabase(ctx context.Context, blockNumber uint64) er
 	return nil
 }
 
-// CommittedBlock returns the highest block whose hot state has been durably
-// committed to ClickHouse (wait_for_async_insert=1). The ingestion checkpoint
+// CommittedBlock returns the highest block whose hot state has passed the
+// generated async-insert durability barrier. The ingestion checkpoint
 // must never lead this horizon, so a crash resumes from durable state and
 // re-fetches the (cheap) gap rather than losing un-committed updates.
 func (p *Processor) CommittedBlock() uint64 {
@@ -720,6 +933,9 @@ func (p *Processor) Flush(ctx context.Context, store *sqd.Store, blockNumber uin
 		return 0, nil
 	}
 	if store != nil {
+		if err := p.State.WaitCommit(ctx); err != nil {
+			return p.State.LastSyncBlock, err
+		}
 		if err := p.State.Commit(ctx, store); err != nil {
 			return p.State.LastSyncBlock, err
 		}

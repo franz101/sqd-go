@@ -27,6 +27,10 @@ type Processor = ingestion.Processor
 // CustomLog is one decoded event log passed to a v1 processor's Process method.
 type CustomLog = ingestion.CustomLog
 
+// BatchParsedBlock is the producer-to-consumer handoff used by generated
+// single-parse processors.
+type BatchParsedBlock = ingestion.BatchParsedBlock
+
 // Store is the ClickHouse-backed store handed to generated Process/Flush.
 type Store = database.Store
 

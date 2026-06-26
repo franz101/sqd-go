@@ -24,6 +24,9 @@ const (
 func OpenOptimized(dir string, cacheBytes int64, memTableBytes uint64, config OptimConfig) (*Store, error) {
 	if cacheBytes <= 0 {
 		cacheBytes = envconfig.ColdCacheSize()
+		if cacheBytes <= 0 {
+			cacheBytes = defaultCacheBytes()
+		}
 	}
 	if memTableBytes == 0 {
 		memTableBytes = DefaultMemTableSize

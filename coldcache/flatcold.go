@@ -15,7 +15,7 @@ import (
 // pointer-free key->value, point lookups only, no ordered scans, and no durability
 // (ClickHouse is the source of truth; an evicted entry simply re-resolves). Pebble
 // is a general-purpose ordered LSM and pays ~2us/op for machinery we never use; a
-// purpose-built flat store is ~26x faster (see flatstore_bench_test.go).
+// purpose-built flatcold store is ~26x faster (see flatstore_bench_test.go).
 //
 // Bounding / TTL: the store is hard-capped at `capacity` slots. CLOCK eviction
 // keeps the working set and drops cold entries when full — and because the

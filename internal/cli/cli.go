@@ -21,16 +21,19 @@ type parsedArgs struct {
 	prefetch      bool
 	state         bool
 	protoMode     bool
-	reindexFrom   string
-	initSource    string
-	initABI       string
-	initName      string
-	initAddress   string
-	initChainID   string
-	initStartBlk  string
-	initEndBlk    string
-	cpuprofile    string
-	pageSize      string
+	// reindexFrom holds the --reindex-from value: a block number above which all
+	// blocks are deleted (lightweight DELETE) before ingestion resumes, so a block
+	// range can be re-derived without a full restart. Empty string = disabled.
+	reindexFrom  string
+	initSource   string
+	initABI      string
+	initName     string
+	initAddress  string
+	initChainID  string
+	initStartBlk string
+	initEndBlk   string
+	cpuprofile   string
+	pageSize     string
 }
 
 func parseArgs(args []string) (*parsedArgs, error) {

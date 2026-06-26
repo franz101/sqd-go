@@ -28,3 +28,34 @@ func TestFastJSONLParserParsesRepeatedPages(t *testing.T) {
 		}
 	}
 }
+
+func TestFastJSONLParserScansHeadersWithoutParsingLogs(t *testing.T) {
+	data := []byte(`{"extra":{"nested":[1,2,3]},"header":{"hash":"0x1","timestamp":11,"number":1},"logs":[{"malformedForFullParser":true}]}
+{"header":{"number":2,"hash":"0x2","timestamp":12},"logs":[]}
+`)
+	parser := NewFastJSONLParser(0)
+	var numbers, timestamps []uint64
+	var hashes, lines []string
+	err := parser.ScanHeadersWithLine(data, func(number, timestamp uint64, hash string, line []byte) error {
+		numbers = append(numbers, number)
+		timestamps = append(timestamps, timestamp)
+		hashes = append(hashes, hash)
+		lines = append(lines, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(numbers) != 2 || numbers[0] != 1 || numbers[1] != 2 {
+		t.Fatalf("numbers = %#v, want [1 2]", numbers)
+	}
+	if len(timestamps) != 2 || timestamps[0] != 11 || timestamps[1] != 12 {
+		t.Fatalf("timestamps = %#v, want [11 12]", timestamps)
+	}
+	if len(hashes) != 2 || hashes[0] != "0x1" || hashes[1] != "0x2" {
+		t.Fatalf("hashes = %#v, want [0x1 0x2]", hashes)
+	}
+	if len(lines) != 2 || lines[0] == "" || lines[1] == "" {
+		t.Fatalf("lines = %#v, want two retained lines", lines)
+	}
+}
