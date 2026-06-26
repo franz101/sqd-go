@@ -511,10 +511,11 @@ func parallelFinalizedBound(cursorMode bool, from, lastFinalized uint64, end *ui
 // parallelMinSpan returns the minimum span (in blocks) that justifies engaging
 // parallel fetch, accounting for page size and worker coordination overhead.
 func parallelMinSpan(pageSize, workers int) uint64 {
-	// At least two full pages per worker so coordination overhead is amortized
-	minPages := 2
-	if workers*2 > minPages {
-		minPages = workers * 2
+	// Reduced from 2 pages per worker to 1 page per worker for earlier engagement
+	// With 6 workers and 10K page size: 60K blocks (down from 120K)
+	minPages := workers
+	if minPages < 2 {
+		minPages = 2
 	}
 	return uint64(minPages) * uint64(pageSize)
 }

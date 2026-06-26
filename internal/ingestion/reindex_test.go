@@ -59,15 +59,19 @@ func TestIntegrationReindexFrom(t *testing.T) {
 	}
 
 	createTable := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.usdc_transfer_events (
+		chain_id UInt64,
 		block_number UInt64,
 		block_timestamp DateTime64(3, 'UTC'),
+		block_hash FixedString(32),
+		contract_address FixedString(20),
+		transaction_hash FixedString(32),
 		transaction_index UInt64,
 		log_index UInt64,
 		from FixedString(20),
 		to FixedString(20),
 		value UInt256
 	) ENGINE = MergeTree()
-	ORDER BY (block_number, transaction_index, log_index)`, quoteIdentForTest(dbName))
+	ORDER BY (chain_id, from, to, block_number, transaction_index, log_index)`, quoteIdentForTest(dbName))
 
 	if err := store.Conn().Do(setupCtx, ch.Query{Body: createTable}); err != nil {
 		t.Fatalf("create typed table: %v", err)
@@ -159,7 +163,7 @@ func TestIntegrationReindexFrom(t *testing.T) {
 		Chains: []config.Chain{{
 			ID:         1,
 			StartBlock: reindexFromBlock,
-			EndBlock:   &endBlock,
+			EndBlock:   &reindexFromBlock,
 			Contracts: []config.ChainContractConfig{{
 				Name:    "USDC",
 				Address: config.Address{"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"},

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -48,6 +49,9 @@ type Head struct {
 type Response struct {
 	Raw  []byte
 	Head Head
+	// Profiling fields for granular timing
+	NetworkDuration time.Duration
+	ZstdDuration    time.Duration
 }
 
 type ForkError struct {
@@ -126,13 +130,15 @@ func (c *Client) FetchWithParent(ctx context.Context, fromBlock uint64, toBlock 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", zstdEncoding)
 
+	networkStart := time.Now()
 	resp, err := c.httpClient.Do(req)
+	networkDuration := time.Since(networkStart)
 	if err != nil {
 		return Response{}, fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	response := Response{Head: parseHeadFromHeaders(resp.Header)}
+	response := Response{Head: parseHeadFromHeaders(resp.Header), NetworkDuration: networkDuration}
 	if resp.StatusCode == http.StatusNoContent {
 		return response, nil
 	}
@@ -155,6 +161,7 @@ func (c *Client) FetchWithParent(ctx context.Context, fromBlock uint64, toBlock 
 		response.Raw = raw
 		return response, nil
 	}
+	zstdStart := time.Now()
 	if c.zstdDecoder == nil {
 		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
 		if err != nil {
@@ -167,6 +174,7 @@ func (c *Client) FetchWithParent(ctx context.Context, fromBlock uint64, toBlock 
 	if err != nil {
 		return Response{}, fmt.Errorf("zstd decode: %w", err)
 	}
+	response.ZstdDuration = time.Since(zstdStart)
 	c.decodeBuf = decompressed
 	response.Raw = decompressed
 	return response, nil

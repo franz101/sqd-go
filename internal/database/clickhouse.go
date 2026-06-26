@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/abiunpack"
 	"github.com/franz101/sqd-go/internal/parser"
+	"github.com/franz101/sqd-go/internal/template"
 	"github.com/holiman/uint256"
 )
 
@@ -170,45 +171,33 @@ func (s *Store) EnsureTablesWithCollapsingAndOmit(ctx context.Context, collapsin
 func (s *Store) EnsureTablesWithOptions(ctx context.Context, collapsing bool, opts EnsureTablesOptions) error {
 	db := quoteIdent(s.db)
 	engine := "MergeTree()"
-	signColumn := ""
 	if collapsing {
 		engine = "CollapsingMergeTree(sign)"
-		signColumn = "sign Int8 DEFAULT 1,"
 	}
+
+	tmplData := struct {
+		DatabaseIdent string
+		Engine        string
+		Collapsing    bool
+	}{
+		DatabaseIdent: db,
+		Engine:        engine,
+		Collapsing:    collapsing,
+	}
+
 	if opts.StoreBlocks {
-		blocksDDL := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s.blocks (
-			chain_id UInt64, block_number UInt64,
-			block_timestamp DateTime64(3, 'UTC'), block_hash String,
-			%s
-			inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = %s ORDER BY (chain_id, block_number)`, db, signColumn, engine)
+		blocksDDL := template.MustExecute("sql/createBlocksTable", tmplData)
 		if err := s.conn.Do(ctx, ch.Query{Body: blocksDDL}); err != nil {
 			return fmt.Errorf("create blocks: %w", err)
 		}
 	}
 	if opts.StoreLogs {
-		logsDDL := fmt.Sprintf(`
-			CREATE TABLE IF NOT EXISTS %s.logs (
-				chain_id UInt64, block_number UInt64,
-				block_timestamp DateTime64(3, 'UTC'), block_hash String,
-				transaction_hash FixedString(32), transaction_index UInt64, log_index UInt64,
-				address FixedString(20), event_name LowCardinality(String),
-				topic0 FixedString(32), params String,
-				%s
-				inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
-			) ENGINE = %s ORDER BY (chain_id, block_number, transaction_index, log_index)`, db, signColumn, engine)
+		logsDDL := template.MustExecute("sql/createLogsTable", tmplData)
 		if err := s.conn.Do(ctx, ch.Query{Body: logsDDL}); err != nil {
 			return fmt.Errorf("create logs: %w", err)
 		}
 	}
-	stateDDL := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s.sync_state (
-			chain_id UInt64, last_block UInt64, last_hash String,
-			finalized_block UInt64, finalized_hash String,
-			rollback_chain String,
-			updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = MergeTree() ORDER BY (chain_id, updated_at)`, db)
+	stateDDL := template.MustExecute("sql/createSyncStateTable", tmplData)
 	if err := s.conn.Do(ctx, ch.Query{Body: stateDDL}); err != nil {
 		return fmt.Errorf("create sync_state: %w", err)
 	}
@@ -303,7 +292,7 @@ func (in *Inserter) InsertBlocks(ctx context.Context, blocks []BlockRow) error {
 		in.blockHash.Append(block.BlockHash)
 	}
 	return in.store.conn.Do(ctx, ch.Query{
-		Body: fmt.Sprintf("INSERT INTO %s.blocks (chain_id, block_number, block_timestamp, block_hash) VALUES", quoteIdent(in.store.db)),
+		Body: template.MustExecute("sql/insertBlocks", struct{ DatabaseIdent string }{DatabaseIdent: quoteIdent(in.store.db)}),
 		Input: []proto.InputColumn{
 			{Name: "chain_id", Data: &in.blockChain}, {Name: "block_number", Data: &in.blockNum},
 			{Name: "block_timestamp", Data: &in.blockTime}, {Name: "block_hash", Data: &in.blockHash},
@@ -334,7 +323,7 @@ func (in *Inserter) InsertLogs(ctx context.Context, events []parser.DecodedEvent
 	chunkSize := 10000
 
 	return in.store.conn.Do(ctx, ch.Query{
-		Body:  fmt.Sprintf("INSERT INTO %s.logs (chain_id, block_number, block_timestamp, block_hash, transaction_hash, transaction_index, log_index, address, event_name, topic0, params) VALUES", quoteIdent(in.store.db)),
+		Body:  template.MustExecute("sql/insertLogs", struct{ DatabaseIdent string }{DatabaseIdent: quoteIdent(in.store.db)}),
 		Input: cols,
 		Settings: []ch.Setting{
 			{Key: "async_insert", Value: "1", Important: true},
@@ -834,7 +823,7 @@ func (s *Store) SaveSyncState(ctx context.Context, chainID uint64, state SyncSta
 	}
 	colRollback.Append(string(rollback))
 	return s.conn.Do(ctx, ch.Query{
-		Body: fmt.Sprintf("INSERT INTO %s.sync_state (chain_id, last_block, last_hash, finalized_block, finalized_hash, rollback_chain) VALUES", quoteIdent(s.db)),
+		Body: template.MustExecute("sql/insertSyncState", struct{ DatabaseIdent string }{DatabaseIdent: quoteIdent(s.db)}),
 		Input: []proto.InputColumn{
 			{Name: "chain_id", Data: &colChain}, {Name: "last_block", Data: &colLast},
 			{Name: "last_hash", Data: &colLastHash}, {Name: "finalized_block", Data: &colFinalized},
@@ -853,8 +842,15 @@ func (s *Store) FlushAsyncInserts(ctx context.Context) error {
 }
 
 func (s *Store) TruncateSyncState(ctx context.Context, chainID, lastBlock uint64) error {
-	db := quoteIdent(s.db)
-	q := fmt.Sprintf("DELETE FROM %s.sync_state WHERE chain_id = %d AND last_block < %d SETTINGS lightweight_deletes_sync = 1", db, chainID, lastBlock)
+	q := template.MustExecute("sql/deleteTruncateSyncState", struct {
+		DatabaseIdent string
+		ChainID       uint64
+		LastBlock     uint64
+	}{
+		DatabaseIdent: quoteIdent(s.db),
+		ChainID:       chainID,
+		LastBlock:     lastBlock,
+	})
 	return s.conn.Do(ctx, ch.Query{Body: q})
 }
 
@@ -1221,6 +1217,7 @@ func quoteString(value string) string {
 }
 
 func splitSQLStatements(sql string) []string {
+	// First pass: filter out comment lines
 	var clean strings.Builder
 	for _, line := range strings.Split(sql, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "--") {
@@ -1230,11 +1227,15 @@ func splitSQLStatements(sql string) []string {
 		clean.WriteByte('\n')
 	}
 
+	// Second pass: split into statements, respecting quotes
 	var statements []string
 	var b strings.Builder
 	var quote rune
 	escaped := false
-	for _, r := range clean.String() {
+
+	// Iterate directly over the builder's string to avoid intermediate allocation
+	cleanStr := clean.String()
+	for _, r := range cleanStr {
 		if quote != 0 {
 			b.WriteRune(r)
 			if r == quote && !escaped {
@@ -1260,6 +1261,8 @@ func splitSQLStatements(sql string) []string {
 			b.WriteRune(r)
 		}
 	}
+
+	// Handle the last statement (if any)
 	stmt := strings.TrimSpace(b.String())
 	if stmt != "" {
 		statements = append(statements, stmt)
