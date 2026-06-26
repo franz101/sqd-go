@@ -105,6 +105,26 @@ func _parseStatsFmtN(n int64) string {
 	return fmt.Sprintf("%.2fM", float64(n)/1e6)
 }
 
+// _pnow / _psince are the parse-profiling clock. parseProfilingEnabled is an
+// untyped constant defined in a build-tagged companion file: false by default,
+// true under -tags sqdparseprof. With the default build the compiler folds these
+// to a zero Time and a literal 0, so the per-line / per-event timing calls and
+// the [PARSE 10s] summary block compile out entirely (no time.Now syscalls in
+// the hot loop). Build with -tags sqdparseprof to re-enable instrumentation.
+func _pnow() time.Time {
+	if parseProfilingEnabled {
+		return time.Now()
+	}
+	return time.Time{}
+}
+
+func _psince(t time.Time) int64 {
+	if parseProfilingEnabled {
+		return int64(time.Since(t))
+	}
+	return 0
+}
+
 func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, protoRing *ProtoRingBuffer, onBlock func(*ParsedBlock) error, onProtoBlock func(*ProtoEventBlock) error, endBlock uint64, onLine func(*ParsedBlock, *ProtoEventBlock, parsedLineMeta) error) (uint64, error) {
 	var topics [4]string
 	var dataHex string
@@ -117,7 +137,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 
 	rest := data
 	for len(rest) > 0 {
-		t0 := time.Now()
+		t0 := _pnow()
 		lineEnd := 0
 		for lineEnd < len(rest) && rest[lineEnd] != '\n' {
 			lineEnd++
@@ -131,11 +151,11 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		if len(line) == 0 {
 			continue
 		}
-		profLineScan += int64(time.Since(t0))
+		profLineScan += _psince(t0)
 
-		t0 = time.Now()
+		t0 = _pnow()
 		l := &jlexer.Lexer{Data: line}
-		profJSONLex += int64(time.Since(t0))
+		profJSONLex += _psince(t0)
 		var blockNum uint64
 		var blockTimestamp uint64
 		var blockHash string
@@ -148,7 +168,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 
 		l.Delim('{')
 		for !l.IsDelim('}') {
-			t0 := time.Now()
+			t0 := _pnow()
 			key := l.UnsafeFieldName(false)
 			l.WantColon()
 			switch key {
@@ -174,9 +194,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				blockTime = time.Unix(int64(blockTimestamp), 0).UTC() // Calculate once per block
 				blockHashDecoded = abiunpack.HashFromHex(blockHash)   // decode once per block, not per log
 				blockMeta = EventMeta{BlockNumber: blockNum, BlockTimestamp: blockTime, BlockHash: blockHashDecoded}
-				profHeaderParse += int64(time.Since(t0))
+				profHeaderParse += _psince(t0)
 			case "logs":
-				t0 := time.Now()
+				t0 := _pnow()
 				if endBlock > 0 && blockNum > endBlock {
 					lineSkipped = true
 					l.SkipRecursive()
@@ -185,7 +205,12 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				}
 				if ring != nil {
 					slot = ring.NextSlot(blockNum, blockHash)
-				} else {
+				} else if onBlock != nil {
+					// Only the onBlock consumer reads the struct slot. In proto mode
+					// (ring == nil, onBlock == nil) leave slot nil: this skips the
+					// throwaway *ParsedBlock alloc per block and the dead per-event
+					// struct copies below (guarded by slot != nil). The live event
+					// data still flows to protoSlot.
 					slot = &ParsedBlock{
 						BlockNumber: blockNum,
 						BlockHash:   blockHash,
@@ -195,7 +220,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					protoSlot = protoRing.NextProtoSlot(blockNum, blockHash)
 				}
 				l.Delim('[')
-				profLogsParse += int64(time.Since(t0))
+				profLogsParse += _psince(t0)
 				for !l.IsDelim(']') {
 					topics = [4]string{} // Reset topics array to prevent stale data from previous log
 					l.Delim('{')
@@ -205,7 +230,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					var txHash string
 					var address string
 
-					t0lf := time.Now()
+					t0lf := _pnow()
 					for !l.IsDelim('}') {
 						lkey := l.UnsafeFieldName(false)
 						l.WantColon()
@@ -239,9 +264,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 						l.WantComma()
 					}
 					l.Delim('}')
-					profLogFieldParse += int64(time.Since(t0lf))
+					profLogFieldParse += _psince(t0lf)
 
-						decodeStart := time.Now()
+						decodeStart := _pnow()
 					// EventMeta: copy block-level fields (pre-built once per block), fill per-log fields
 					meta := blockMeta
 					meta.ContractAddress = abiunpack.AddressFromHex(address)
@@ -249,10 +274,10 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					meta.TransactionIndex = txIndex
 					meta.LogIndex = logIndex
 
-						profHeaderParse += int64(time.Since(decodeStart))
+						profHeaderParse += _psince(decodeStart)
 					topic0 := topics[0]
 					_ = meta
-						decodeStart = time.Now()
+						decodeStart = _pnow()
 					_ = dataBytes
 
 					switch topic0 {
@@ -274,7 +299,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 							_ = ok
 							_ = word
 
-								abiStart := time.Now()
+								abiStart := _pnow()
 {{- range .IndexedDecodes}}
 							{{.}}
 {{- end}}
@@ -283,9 +308,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 {{- range .NonIndexedDecodes}}
 							{{.}}
 {{- end}}
-								profEventDecode += int64(time.Since(abiStart))
+								profEventDecode += _psince(abiStart)
 {{- end}}
-								appendStart := time.Now()
+								appendStart := _pnow()
 
 							eventCount++
 							if batches != nil {
@@ -296,7 +321,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 								slot.Sequence = append(slot.Sequence, uint8(EventType{{.GoTypeName}}))
 							}
 							if protoSlot != nil {
-								profBatchAppend += int64(time.Since(appendStart))
+								profBatchAppend += _psince(appendStart)
 								protoSlot.Append{{.GoTypeName}}(meta, &ev)
 							}
 						}
@@ -352,7 +377,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 						}
 					}
 
-						profEventDecode += int64(time.Since(decodeStart))
+						profEventDecode += _psince(decodeStart)
 					l.WantComma()
 				}
 				l.Delim(']')
@@ -386,8 +411,10 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 			}
 		}
 	}
-	// Accumulate profiling stats; print a summary every 10 seconds.
-	{
+	// Accumulate profiling stats; print a summary every 10 seconds. With the
+	// default build tag parseProfilingEnabled is a false constant, so this entire
+	// block (mutex, accumulation, and log.Printf) is dead-code eliminated.
+	if parseProfilingEnabled {
 		s := &_parseStats
 		s.mu.Lock()
 		now := time.Now()

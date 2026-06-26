@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/mailru/easyjson/jlexer"
 	"github.com/valyala/fastjson"
 )
 
@@ -54,8 +53,13 @@ func (p *FastJSONLParser) Parse(data []byte, onBlock func(*Block) error) error {
 }
 
 // ScanHeadersWithLine extracts only block identity and timestamp while skipping
-// the logs array. The returned hash and line alias data; callers retaining them
-// beyond the callback must clone the hash and own the input page.
+// the logs array. The returned line aliases data; callers retaining it beyond
+// the callback must own the input page. The hash is a fresh copy.
+//
+// It uses a hand-rolled byte scanner (no JSON lexer) that reads the three header
+// fields directly and never walks the logs array. The old jlexer path drove
+// SkipRecursive over the entire logs array of every line just to find the line's
+// closing brace; on log-dense pages that dominated this scan.
 func (p *FastJSONLParser) ScanHeadersWithLine(data []byte, onBlock func(number, timestamp uint64, hash string, line []byte) error) error {
 	for len(data) > 0 {
 		lineData := data
@@ -68,45 +72,142 @@ func (p *FastJSONLParser) ScanHeadersWithLine(data []byte, onBlock func(number, 
 		if len(lineData) == 0 {
 			continue
 		}
-
-		var number, timestamp uint64
-		var hash string
-		l := &jlexer.Lexer{Data: lineData}
-		l.Delim('{')
-		for !l.IsDelim('}') {
-			key := l.UnsafeFieldName(false)
-			l.WantColon()
-			if key == "header" {
-				l.Delim('{')
-				for !l.IsDelim('}') {
-					hkey := l.UnsafeFieldName(false)
-					l.WantColon()
-					switch hkey {
-					case "number":
-						number = l.Uint64()
-					case "timestamp":
-						timestamp = l.Uint64()
-					case "hash":
-						hash = l.UnsafeString()
-					default:
-						l.SkipRecursive()
-					}
-					l.WantComma()
-				}
-				l.Delim('}')
-			} else {
-				l.SkipRecursive()
-			}
-			l.WantComma()
+		number, timestamp, hash, ok := scanBlockRefHeader(lineData)
+		if !ok {
+			return fmt.Errorf("scan header: missing or malformed block header in %q", truncateForError(lineData))
 		}
-		if err := l.Error(); err != nil {
-			return fmt.Errorf("scan header: %w", err)
-		}
-		if err := onBlock(number, timestamp, hash, lineData); err != nil {
+		if err := onBlock(number, timestamp, bytesToString(hash), lineData); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+var (
+	scanHeaderKey    = []byte(`"header"`)
+	scanNumberKey    = []byte(`"number"`)
+	scanTimestampKey = []byte(`"timestamp"`)
+	scanHashKey      = []byte(`"hash"`)
+)
+
+// scanBlockRefHeader reads number/timestamp/hash from the JSONL block header
+// without a JSON parser. It bounds the field scan to the "header" object so a
+// "number"/"hash" key appearing inside the logs array can never be misread as a
+// block field. The number field is required (genesis block 0 is valid); a
+// missing or malformed header object returns ok=false. The returned hash aliases
+// line. Field order is irrelevant.
+func scanBlockRefHeader(line []byte) (number, timestamp uint64, hash []byte, ok bool) {
+	hdr, ok := headerObject(line)
+	if !ok {
+		return 0, 0, nil, false
+	}
+	number, ok = scanUintField(hdr, scanNumberKey)
+	if !ok {
+		return 0, 0, nil, false
+	}
+	timestamp, _ = scanUintField(hdr, scanTimestampKey)
+	hash, _ = scanStringField(hdr, scanHashKey)
+	return number, timestamp, hash, true
+}
+
+// headerObject returns the byte slice spanning the "header" object's braces
+// (inclusive of the outer { }), or ok=false if it is absent or unterminated.
+func headerObject(line []byte) ([]byte, bool) {
+	hi := bytes.Index(line, scanHeaderKey)
+	if hi < 0 {
+		return nil, false
+	}
+	rest := line[hi+len(scanHeaderKey):]
+	c := bytes.IndexByte(rest, ':')
+	if c < 0 {
+		return nil, false
+	}
+	rest = rest[c+1:]
+	for len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+		rest = rest[1:]
+	}
+	if len(rest) == 0 || rest[0] != '{' {
+		return nil, false
+	}
+	// The SQD header holds only scalar fields (number/hash/timestamp), so a brace
+	// depth walk safely finds its end; header values never contain braces.
+	depth := 0
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[:i+1], true
+			}
+		}
+	}
+	return nil, false
+}
+
+// scanUintField finds key inside b and parses the unsigned integer following its
+// colon. ok is false if the key is absent or no digits follow.
+func scanUintField(b, key []byte) (uint64, bool) {
+	i := bytes.Index(b, key)
+	if i < 0 {
+		return 0, false
+	}
+	rest := b[i+len(key):]
+	c := bytes.IndexByte(rest, ':')
+	if c < 0 {
+		return 0, false
+	}
+	rest = rest[c+1:]
+	for len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+		rest = rest[1:]
+	}
+	var n uint64
+	j := 0
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		n = n*10 + uint64(rest[j]-'0')
+		j++
+	}
+	if j == 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// scanStringField finds key inside b and returns the quoted string value that
+// follows its colon, aliasing b. ok is false if the key or value is absent.
+func scanStringField(b, key []byte) ([]byte, bool) {
+	i := bytes.Index(b, key)
+	if i < 0 {
+		return nil, false
+	}
+	rest := b[i+len(key):]
+	c := bytes.IndexByte(rest, ':')
+	if c < 0 {
+		return nil, false
+	}
+	rest = rest[c+1:]
+	for len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+		rest = rest[1:]
+	}
+	if len(rest) == 0 || rest[0] != '"' {
+		return nil, false
+	}
+	rest = rest[1:]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 {
+		return nil, false
+	}
+	return rest[:end], true
+}
+
+// truncateForError bounds the byte slice embedded in scan-header error messages.
+func truncateForError(b []byte) []byte {
+	const max = 120
+	if len(b) > max {
+		return b[:max]
+	}
+	return b
 }
 
 func (p *FastJSONLParser) ParseWithLine(data []byte, onBlock func(*Block, []byte) error) error {
