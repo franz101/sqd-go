@@ -387,6 +387,19 @@ func (p *parallelPrefetcher) getWork(ctx context.Context) (blockRange, bool) {
 		// dense stretch; an overshoot just yields a (re-queued) gap, never a miss.
 		from := p.nextBlock.Load()
 		if from <= p.endBlock && from <= window {
+			// In beast mode the portal may jump the cursor far beyond our claimed
+			// range, advancing nextEmit to a block number that no other in-flight
+			// worker's chunk starts at. If concurrent workers have already claimed
+			// intermediate ranges those chunks sit orphaned in p.ready and the
+			// consumer deadlocks waiting for a seq it will never see.
+			// Serialize fresh-cursor claims to one at a time in beast mode: the
+			// single in-flight worker's coveredTo becomes the next claim's r.from,
+			// so nextEmit always has a corresponding chunk. Gap claims are still
+			// parallel (they come from the block above and bypass this check).
+			if p.beastMode.Load() && p.activeWorkers > 0 {
+				p.cond.Wait()
+				continue
+			}
 			stride := p.currentGapSpan()
 			stride += stride / 4
 			if stride > adaptiveGapMax {
@@ -513,11 +526,14 @@ func (p *parallelPrefetcher) fetchOne(ctx context.Context, cl *client.Client, r 
 		// Beast mode tracking (skip-empties mode only; includeAllBlocks never has
 		// empty-marker-only responses since every block is always returned).
 		if !p.includeAllBlocks {
-			// A response with ≤1 newline is the extent-marker block only (no matching
-			// events in the scanned range). ≥2 newlines means at least one event block
-			// was found plus the extent marker.
-			lineCount := bytes.Count(rawCopy, []byte{'\n'})
-			isEmpty := lineCount <= 1
+			// A response with zero internal newlines (after trimming any trailing \n)
+			// is the extent-marker block only — no matching events in the scanned range.
+			// Trim trailing newlines first: some portal responses end with an extra \n
+			// that would make the count 1 even for a single-line extent-marker response,
+			// falsely treating every empty range as non-empty and preventing beast mode
+			// from re-engaging.
+			lineCount := bytes.Count(bytes.TrimRight(rawCopy, "\n"), []byte{'\n'})
+			isEmpty := lineCount == 0
 
 			if isEmpty {
 				if n := p.consecutiveEmpty.Add(1); n >= beastModeThreshold && !p.beastMode.Load() {
