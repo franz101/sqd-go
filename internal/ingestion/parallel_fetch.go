@@ -236,10 +236,18 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 		ready:            make(map[uint64]*fetchChunk),
 	}
 	p.nextBlock.Store(start)
-	// Start optimistic: assume an empty region so the first units are wide and one
-	// request jumps far. The estimate contracts as soon as a short (dense, or
-	// portal-natural-cap) response is observed.
+	// Start in beast mode (nil toBlock). The first request(s) serve as probes:
+	//   - Empty region:  portal jumps far; beast mode stays on and skips empties fast.
+	//   - Dense region:  portal returns ~N blocks with events; beast mode exits and
+	//                    gapSpan is snapped directly to N (not EWMA from 131072).
+	//                    Workers then claim N-block units in parallel, matching what
+	//                    sequential would do but overlapping the requests.
+	//
+	// Without this probe the old code set gapSpan=131072, claimed huge ranges, got
+	// 1500 blocks back, and cascaded into ~21 gap-fill requests for 9000 blocks vs
+	// sequential's 6 — making parallel 23% slower in dense regions.
 	p.gapSpan.Store(adaptiveGapMax)
+	p.beastMode.Store(true) // probe-first: beast mode until first density reading
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
