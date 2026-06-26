@@ -213,21 +213,10 @@ func _customProcessorEventCount() int {
 }
 `)
 
-	// Processor struct and FastJSONLProcessor implementation.
-	// Bridge: ParsedBlock -> Entities -> CustomProcessing.
-	b.WriteString("func parsedBlockToEntities(block *ParsedBlock) *Entities {\n")
-	b.WriteString("\tif block == nil {\n\t\treturn nil\n\t}\n")
-	b.WriteString("\treturn &Entities{\n")
-	for _, ev := range events {
-		b.WriteString("\t\t")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString(": block.")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString("s,\n")
-	}
-	b.WriteString("\t\tBlockNumber: block.BlockNumber,\n")
-	b.WriteString("\t}\n}\n\n")
-
+	// Processor struct and FastJSONLInsertProcessor implementation.
+	// Pure parse+insert path: no custom state sync in the hot loop.
+	// CustomProcessing (SyncToClickHouse per block) is intentionally not called here
+	// because it does a full table INSERT on every block which is prohibitively slow.
 	b.WriteString(`type Processor struct {
 	ring *OrderedHistoricRingBuffer
 }
@@ -240,31 +229,19 @@ func NewProcessor(_ bool) (*Processor, error) {
 	return &Processor{ring: ring}, nil
 }
 
-func (p *Processor) ProcessJSONL(ctx context.Context, store *sqd.Store, data []byte) (uint64, error) {
+func (p *Processor) ProcessJSONL(_ context.Context, _ *sqd.Store, data []byte) (uint64, error) {
 	if p == nil || len(data) == 0 {
 		return 0, nil
 	}
-	var s Store
-	if store != nil {
-		s = store
-	}
-	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
-		return CustomProcessing(ctx, s, parsedBlockToEntities(block))
-	})
+	return ParseJSONLV2(data, nil, p.ring, nil)
 }
 
-func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *sqd.Store, data []byte) (uint64, func(context.Context) error, error) {
+func (p *Processor) ProcessJSONLWithInserts(_ context.Context, store *sqd.Store, data []byte) (uint64, func(context.Context) error, error) {
 	if p == nil || len(data) == 0 {
 		return 0, nil, nil
 	}
-	var s Store
-	if store != nil {
-		s = store
-	}
 	batches := NewInsertBatches()
-	n, err := ParseJSONLV2(data, batches, p.ring, func(block *ParsedBlock) error {
-		return CustomProcessing(ctx, s, parsedBlockToEntities(block))
-	})
+	n, err := ParseJSONLV2(data, batches, p.ring, nil)
 	if err != nil || store == nil || store.InsertConn() == nil {
 		batches.Reset()
 		return n, nil, err
