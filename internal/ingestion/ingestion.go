@@ -342,7 +342,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		defer sqdFinalized.Close()
 	}
 	jsonl := parser.NewFastJSONLParser(1024)
-	replayBuf := NewReplayBuffer(8192) // ~8K blocks of replay capacity
+	replayBuf := NewReplayBuffer(65536) // ~8K blocks of replay capacity
 	// No-data-loss (Invariant 0): if the processor reports a durable commit
 	// horizon, the persisted checkpoint is gated so it never leads that horizon.
 	// On crash the run resumes from durable state and re-fetches the cheap gap.

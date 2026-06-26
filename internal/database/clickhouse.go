@@ -86,7 +86,18 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 		conn.Close()
 		return nil, fmt.Errorf("create database %s: %w", db, err)
 	}
-	insertConn, err := ch.Dial(ctx, opts)
+	insertOpts := opts
+	insertOpts.Settings = []ch.Setting{
+		{
+			Key:   "async_insert",
+			Value: "1",
+		},
+		{
+			Key:   "wait_for_async_insert",
+			Value: "0",
+		},
+	}
+	insertConn, err := ch.Dial(ctx, insertOpts)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("connect clickhouse insert connection: %w", err)

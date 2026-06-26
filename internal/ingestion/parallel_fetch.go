@@ -327,7 +327,7 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 // but tiny-payload chunks) and narrow in dense regions (many small-span chunks,
 // bounding buffered raw JSONL). Floored at the configured page window.
 func (p *parallelPrefetcher) windowLimit() uint64 {
-	w := p.currentGapSpan() * uint64(p.workers) * 2
+	w := p.currentGapSpan() * uint64(p.workers) * 8
 	if w < p.maxAhead {
 		w = p.maxAhead
 	}

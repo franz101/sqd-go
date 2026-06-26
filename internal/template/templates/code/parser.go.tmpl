@@ -5,6 +5,8 @@ package generated
 import (
 	"context"
 	"fmt"
+	"log"
+
 	"time"
 
 	"github.com/ClickHouse/ch-go"
@@ -81,8 +83,12 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 	var dataBytes []byte
 	var eventCount uint64
 
+	// Granular profiling: accumulate nanoseconds spent in each phase
+	var profLineScan, profJSONLex, profHeaderParse, profLogsParse, profEventDecode, profBatchAppend int64
+
 	rest := data
 	for len(rest) > 0 {
+		t0 := time.Now()
 		lineEnd := 0
 		for lineEnd < len(rest) && rest[lineEnd] != '\n' {
 			lineEnd++
@@ -96,8 +102,11 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		if len(line) == 0 {
 			continue
 		}
+		profLineScan += int64(time.Since(t0))
 
+		t0 = time.Now()
 		l := &jlexer.Lexer{Data: line}
+		profJSONLex += int64(time.Since(t0))
 		var blockNum uint64
 		var blockTimestamp uint64
 		var blockHash string
@@ -108,6 +117,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 
 		l.Delim('{')
 		for !l.IsDelim('}') {
+			t0 := time.Now()
 			key := l.UnsafeFieldName(false)
 			l.WantColon()
 			switch key {
@@ -130,7 +140,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				}
 				l.Delim('}')
 				blockTime = time.Unix(int64(blockTimestamp), 0).UTC() // Calculate once per block
+				profHeaderParse += int64(time.Since(t0))
 			case "logs":
+				t0 := time.Now()
 				if endBlock > 0 && blockNum > endBlock {
 					lineSkipped = true
 					l.SkipRecursive()
@@ -139,11 +151,17 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				}
 				if ring != nil {
 					slot = ring.NextSlot(blockNum, blockHash)
+				} else {
+					slot = &ParsedBlock{
+						BlockNumber: blockNum,
+						BlockHash:   blockHash,
+					}
 				}
 				if protoRing != nil {
 					protoSlot = protoRing.NextProtoSlot(blockNum, blockHash)
 				}
 				l.Delim('[')
+				profLogsParse += int64(time.Since(t0))
 				for !l.IsDelim(']') {
 					topics = [4]string{} // Reset topics array to prevent stale data from previous log
 					l.Delim('{')
@@ -187,6 +205,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					}
 					l.Delim('}')
 
+						decodeStart := time.Now()
 					// Event routing and decoding
 					meta := EventMeta{
 						BlockNumber:      blockNum,
@@ -198,8 +217,10 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 						LogIndex:         logIndex,
 					}
 
+						profHeaderParse += int64(time.Since(decodeStart))
 					topic0 := topics[0]
 					_ = meta
+						decodeStart = time.Now()
 					_ = dataBytes
 
 					switch topic0 {
@@ -221,6 +242,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 							_ = ok
 							_ = word
 
+								abiStart := time.Now()
 {{- range .IndexedDecodes}}
 							{{.}}
 {{- end}}
@@ -229,7 +251,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 {{- range .NonIndexedDecodes}}
 							{{.}}
 {{- end}}
+								profEventDecode += int64(time.Since(abiStart))
 {{- end}}
+								appendStart := time.Now()
 
 							eventCount++
 							if batches != nil {
@@ -240,6 +264,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 								slot.Sequence = append(slot.Sequence, uint8(EventType{{.GoTypeName}}))
 							}
 							if protoSlot != nil {
+								profBatchAppend += int64(time.Since(appendStart))
 								protoSlot.Append{{.GoTypeName}}(meta, &ev)
 							}
 						}
@@ -295,6 +320,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 						}
 					}
 
+						profEventDecode += int64(time.Since(decodeStart))
 					l.WantComma()
 				}
 				l.Delim(']')
@@ -327,6 +353,17 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				return eventCount, err
 			}
 		}
+	}
+	// Print detailed profiling for parsing performance
+	if eventCount > 0 {
+		log.Printf("[PARSE PROFILING] events=%d | line_scan=%s json_lex=%s header_parse=%s logs_parse=%s event_decode=%s batch_append=%s",
+			eventCount,
+			time.Duration(profLineScan).Round(time.Microsecond),
+			time.Duration(profJSONLex).Round(time.Microsecond),
+			time.Duration(profHeaderParse).Round(time.Microsecond),
+			time.Duration(profLogsParse).Round(time.Microsecond),
+			time.Duration(profEventDecode).Round(time.Microsecond),
+				time.Duration(profBatchAppend).Round(time.Microsecond))
 	}
 	return eventCount, nil
 }
