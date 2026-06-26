@@ -30,6 +30,8 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/sstable"
+	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
 // Default off-heap budgets. Both are hard caps; steady-state RSS ≈ Cache +
@@ -90,11 +92,17 @@ func totalRAMBytes() int64 {
 	return 0
 }
 
-// Store is a single-writer raw byte-slice KV backed by Pebble.
+// Store is a single-writer raw byte-slice KV. By default it is backed by Pebble;
+// with SQD_COLDCACHE_BACKEND=flat it is backed by the in-RAM flatcold store
+// (drop-in, same byte KV contract — see flatcold.go).
 type Store struct {
 	db    *pebble.DB
 	cache *pebble.Cache
 	dir   string
+
+	// flat, when non-nil, replaces the Pebble backend with the in-RAM flatcold store.
+	// Every method dispatches to it BEFORE the s.db==nil guards.
+	flat *flatcold
 
 	// neg is an optional in-memory negative-lookup Bloom filter (the V3 cold-tier
 	// optimization). When set, a Get whose key is provably absent skips Pebble
@@ -115,17 +123,7 @@ func (s *Store) EnableNegativeFilter(bitBudget uint64) {
 }
 
 func defaultNegativeFilterBits() uint64 {
-	if v := os.Getenv("SQD_COLDFILTER_BITS"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-			return n
-		}
-	}
-	if v := os.Getenv("SQD_BLOOM_KEYS"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
-			return n * 10
-		}
-	}
-	return 1 << 31
+	return envconfig.ColdFilterSize()
 }
 
 // FilterSkips returns how many Pebble Gets the negative filter has avoided.
@@ -139,14 +137,34 @@ func (s *Store) FilterSkips() uint64 {
 // Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
 // cacheBytes/memTableBytes <= 0 fall back to the defaults.
 func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
+	if envconfig.ColdCacheBackendType() == "flat" {
+		budget := cacheBytes
+		if budget <= 0 {
+			budget = envconfig.ColdCacheSize()
+			if budget <= 0 {
+				budget = defaultCacheBytes()
+			}
+		}
+		log.Printf("cold tier: in-RAM flat backend, budget %d MiB (SQD_COLDCACHE_BACKEND=flat)", budget>>20)
+		s := &Store{flat: newFlatcoldBudget(budget), dir: dir}
+		// The flat backend is capacity-bounded and EVICTS (CLOCK), unlike Pebble.
+		// The authoritative "hot+cold miss => provably new" fast path is only sound
+		// when a miss can be distinguished from an eviction: the negative filter
+		// provides that (a key ever written stays "maybe present" forever, so an
+		// evicted key still forces a ClickHouse check). Without it, evicted entries
+		// would be silently treated as new and reset to zero.
+		if bits := defaultNegativeFilterBits(); bits > 0 {
+			s.EnableNegativeFilter(bits)
+		}
+		return s, nil
+	}
 	if cacheBytes <= 0 {
-		if mb, err := strconv.ParseInt(os.Getenv("SQD_COLDCACHE_MB"), 10, 64); err == nil && mb > 0 {
-			cacheBytes = mb << 20
-		} else {
+		cacheBytes = envconfig.ColdCacheSize()
+		if cacheBytes <= 0 {
 			cacheBytes = defaultCacheBytes()
 		}
-		log.Printf("cold tier: block cache %d MiB (override with SQD_COLDCACHE_MB)", cacheBytes>>20)
 	}
+	log.Printf("cold tier: block cache %d MiB (override with SQD_COLDCACHE_MB)", cacheBytes>>20)
 	if memTableBytes == 0 {
 		memTableBytes = DefaultMemTableSize
 	}
@@ -166,6 +184,41 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 		MemTableStopWritesThreshold: 4,
 		DisableWAL:                  true, // ephemeral: CH is the durable truth
 	}
+
+	// Apply optimization profile from environment
+	if optim := envconfig.ColdCacheOptimizationProfile(); optim != "" {
+		switch optim {
+		case "largemem", "mixed":
+			// 64MB memtables with aggressive flush: +13% on mixed workloads
+			opts.MemTableSize = 64 << 20
+			opts.MemTableStopWritesThreshold = 2
+			log.Printf("cold tier: optimization profile 'largemem' (64MB memtables)")
+		case "nocomp", "write":
+			// No compression: +5% writes, +7% reads, +13% batch writes
+			// Set up levels with no compression
+			opts.Levels = make([]pebble.LevelOptions, 7)
+			for i := range opts.Levels {
+				opts.Levels[i].Compression = sstable.NoCompression
+			}
+			log.Printf("cold tier: optimization profile 'nocomp' (no compression)")
+		case "fast", "read":
+			// Optimized for reads
+			opts.Levels = make([]pebble.LevelOptions, 7)
+			for i := range opts.Levels {
+				opts.Levels[i].Compression = sstable.NoCompression
+			}
+			log.Printf("cold tier: optimization profile 'fastreads' (no compression)")
+		case "aggressive":
+			// Aggressive compaction
+			opts.L0CompactionThreshold = 2
+			opts.L0CompactionFileThreshold = 4
+			opts.MaxConcurrentCompactions = func() int { return 2 }
+			log.Printf("cold tier: optimization profile 'aggressive'")
+		default:
+			log.Printf("cold tier: unknown optimization profile '%s', using baseline", optim)
+		}
+	}
+
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		cache.Unref()
@@ -183,7 +236,17 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 // may pass transient (e.g. unsafe-aliased) slices. NoSync: the write is not
 // fsync'd — durability comes from ClickHouse, not here.
 func (s *Store) Put(key, value []byte) error {
-	if s == nil || s.db == nil {
+	if s == nil {
+		return nil
+	}
+	if s.flat != nil {
+		if s.neg != nil {
+			s.neg.add(key)
+		}
+		s.flat.put(key, value)
+		return nil
+	}
+	if s.db == nil {
 		return nil
 	}
 	if s.neg != nil {
@@ -199,17 +262,34 @@ type WriteBatch struct {
 	b     *pebble.Batch
 	neg   *negFilter
 	count int
+	flat  *flatcold // when set, Put writes through immediately (no batching needed)
 }
 
 func (s *Store) NewWriteBatch() *WriteBatch {
-	if s == nil || s.db == nil {
+	if s == nil {
+		return &WriteBatch{}
+	}
+	if s.flat != nil {
+		return &WriteBatch{flat: s.flat, neg: s.neg}
+	}
+	if s.db == nil {
 		return &WriteBatch{}
 	}
 	return &WriteBatch{db: s.db, b: s.db.NewBatch(), neg: s.neg}
 }
 
 func (w *WriteBatch) Put(key, value []byte) error {
-	if w == nil || w.b == nil {
+	if w == nil {
+		return nil
+	}
+	if w.flat != nil {
+		if w.neg != nil {
+			w.neg.add(key)
+		}
+		w.flat.put(key, value)
+		return nil
+	}
+	if w.b == nil {
 		return nil
 	}
 	if err := w.b.Set(key, value, nil); err != nil {
@@ -259,7 +339,13 @@ func (s *Store) MightContain(key []byte) bool {
 }
 
 func (s *Store) GetInto(dst []byte, key []byte) (bool, error) {
-	if s == nil || s.db == nil {
+	if s == nil {
+		return false, nil
+	}
+	if s.flat != nil {
+		return s.flat.getInto(dst, key), nil
+	}
+	if s.db == nil {
 		return false, nil
 	}
 	if !s.MightContain(key) {
@@ -280,7 +366,14 @@ func (s *Store) GetInto(dst []byte, key []byte) (bool, error) {
 // Get returns a COPY of the value stored under key (so it stays valid after the
 // internal pebble closer is released), and whether it was found.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
-	if s == nil || s.db == nil {
+	if s == nil {
+		return nil, false, nil
+	}
+	if s.flat != nil {
+		v, ok := s.flat.get(key)
+		return v, ok, nil
+	}
+	if s.db == nil {
 		return nil, false, nil
 	}
 	// Negative filter (V3): if the key was never written to the cold store, skip
@@ -303,7 +396,14 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 
 // Delete removes key (used when a hot entry is hard-deleted).
 func (s *Store) Delete(key []byte) error {
-	if s == nil || s.db == nil {
+	if s == nil {
+		return nil
+	}
+	if s.flat != nil {
+		s.flat.del(key)
+		return nil
+	}
+	if s.db == nil {
 		return nil
 	}
 	return s.db.Delete(key, pebble.NoSync)
@@ -311,7 +411,14 @@ func (s *Store) Delete(key []byte) error {
 
 // Close releases the database and its off-heap cache, then removes the directory.
 func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
+		return nil
+	}
+	if s.flat != nil {
+		s.flat = nil
+		return nil
+	}
+	if s.db == nil {
 		return nil
 	}
 	err := s.db.Close()

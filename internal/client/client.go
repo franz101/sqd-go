@@ -18,6 +18,9 @@ const zstdEncoding = "zstd"
 type LogFilter struct {
 	Address []string `json:"address,omitempty"`
 	Topic0  []string `json:"topic0,omitempty"`
+	Topic1  []string `json:"topic1,omitempty"`
+	Topic2  []string `json:"topic2,omitempty"`
+	Topic3  []string `json:"topic3,omitempty"`
 }
 
 type Query struct {

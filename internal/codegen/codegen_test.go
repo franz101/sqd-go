@@ -85,6 +85,9 @@ chains:
 	assertContains(t, schemaGo, "type Log struct")
 	assertContains(t, schemaGo, "type SyncState struct")
 
+	parserGo := readText(t, filepath.Join(root, "generated", "parser.go"))
+	assertContains(t, parserGo, "func ParseJSONLProtoStream(data []byte, batches *InsertBatches, ring *ProtoRingBuffer")
+
 	processor := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
 	assertNotContains(t, processor, "type Entities struct")
 	assertContains(t, processor, "type AddressPosition struct")
@@ -216,12 +219,39 @@ type MemoryMarketSchema struct {
 	assertNotContains(t, hotState, "inner *clock.Cache")
 	assertContains(t, hotState, "func NewHoldingsClockCache(capacity uint64) *HoldingsClockCache")
 	assertContains(t, hotState, "type MarketsClockCache struct")
+	assertContains(t, hotState, "h = clockHash20(h, key.Account[:])")
+	assertContains(t, hotState, "h = clockHash32(h, key.AssetID[:])")
+	assertContains(t, hotState, "h = clockHash32(h, key.ID[:])")
+	assertContains(t, hotState, "func clockHash20(seed uint64, b []byte) uint64")
+	assertContains(t, hotState, "func clockHash32(seed uint64, b []byte) uint64")
+	assertNotContains(t, hotState, "clockHash64")
+	accountHash := strings.Index(hotState, "h = clockHash20(h, key.Account[:])")
+	assetHash := strings.Index(hotState, "h = clockHash32(h, key.AssetID[:])")
+	if accountHash < 0 || assetHash <= accountHash {
+		t.Fatalf("multi-field key hash order is not Account then AssetID")
+	}
+	assertContains(t, hotState, "return uint32(h^(h>>32)) & c.mask")
+	assertContains(t, hotState, "type BatchResolverMetrics struct")
+	assertContains(t, hotState, "HotHits      uint64")
+	assertContains(t, hotState, "ColdHits     uint64")
+	assertContains(t, hotState, "DBFallbacks  uint64")
+	assertContains(t, hotState, "QueuedMisses uint64")
+	assertContains(t, hotState, "UniqueMisses uint64")
+	assertContains(t, hotState, "RoundTrips   uint64")
+	assertContains(t, hotState, "func (r *MemoryHoldingBatchResolver) Lookup(key HoldingsClockKey) (MemoryHolding, bool)")
+	assertContains(t, hotState, "func (r *MemoryHoldingBatchResolver) EnableMetrics(enabled bool)")
+	assertContains(t, hotState, "func (r *MemoryHoldingBatchResolver) MetricsEnabled() bool")
+	assertContains(t, hotState, "func (r *MemoryHoldingBatchResolver) SnapshotAndResetMetrics() BatchResolverMetrics")
+	assertContains(t, hotState, "r.metrics.QueuedMisses++")
+	assertContains(t, hotState, "r.metrics.UniqueMisses += uint64(len(uniqueList))")
+	assertContains(t, hotState, "r.metrics.DBFallbacks += uint64(len(uniqueList))")
+	assertContains(t, hotState, "r.metrics.RoundTrips++")
 	assertContains(t, hotState, "type MemoryHoldingBatch struct")
 	assertContains(t, hotState, "func (b *MemoryHoldingBatch) Insert(ctx context.Context, conn *ch.Client, db string) error")
 	assertContains(t, hotState, "func NewHotState(capacity uint64) *HotState")
 }
 
-func TestGenerateDefaultForkUsesCollapsingMergeTreeAndManifest(t *testing.T) {
+func TestGenerateDefaultForkUsesPlainMergeTreeAndManifest(t *testing.T) {
 	root := t.TempDir()
 	configYAML := []byte(`name: hot_lbtc
 store_raw_logs: true
@@ -248,18 +278,20 @@ chains:
 		t.Fatalf("manifest fork = %q, want default", manifest.Fork)
 	}
 
+	// No duplicates are possible (prune > lastBlock before re-insert), so event
+	// tables are plain MergeTree with no sign column.
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
-	assertContains(t, schema, "sign Int8 DEFAULT 1")
-	assertContains(t, schema, ") ENGINE = CollapsingMergeTree(sign)")
+	assertNotContains(t, schema, "sign Int8")
+	assertContains(t, schema, ") ENGINE = MergeTree()")
 	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `hot_lbtc`.`lbtc_transfer_events`")
 	assertContains(t, schema, "PRIMARY KEY (`from`, `to`, block_number, transaction_index, log_index)")
 
 	views := readText(t, filepath.Join(root, ".sqd", "generated", "views.sql"))
-	assertContains(t, views, "FROM `hot_lbtc`.logs FINAL")
-	assertContains(t, views, "AND sign = 1")
+	assertNotContains(t, views, "FINAL")
+	assertNotContains(t, views, "sign = 1")
 }
 
-func TestGenerateImplicitDefaultForkUsesCollapsingMergeTree(t *testing.T) {
+func TestGenerateImplicitDefaultForkUsesPlainMergeTree(t *testing.T) {
 	root := t.TempDir()
 	configYAML := []byte(`name: ring_lbtc
 chains:
@@ -278,7 +310,7 @@ chains:
 	}
 
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
-	assertContains(t, schema, ") ENGINE = CollapsingMergeTree(sign)")
+	assertContains(t, schema, ") ENGINE = MergeTree()")
 }
 
 func TestGenerateStateHandlesFromCustomSchemaAndConfig(t *testing.T) {
@@ -333,9 +365,23 @@ type MemoryHoldingSchema struct {
 	assertContains(t, stateGo, "Position       PositionState")
 	assertContains(t, stateGo, "func (h PositionState) Get(account common.Address, assetID common.Hash) (*Position, bool)")
 	assertContains(t, stateGo, "func (h PositionState) Save(value *Position, meta EventMeta)")
+	assertContains(t, stateGo, "func (s *State) StartCommit(ctx context.Context, store Store, blockNumber uint64) bool")
+	assertContains(t, stateGo, "func (s *State) PollCommit() error")
+	assertContains(t, stateGo, "val, ok := h.state.HotState.Holdings.GetByFields(account, assetID)")
+	assertNotContains(t, stateGo, "MetricsEnabled()")
 	assertContains(t, stateGo, "h.state.HotState.UpdateMemoryHolding(*value)")
 	assertNotContains(t, stateGo, "Internal"+"PositionState")
 	assertNotContains(t, stateGo, "User"+"PositionKey")
+
+	// Both async-insert modes are generated; SQD_ASYNC_INSERT_FLUSH picks at runtime.
+	// Fire-and-forget (wait=0) plus an explicit queue flush, and the default per-insert
+	// wait (wait=1) that keeps read-backs race-free.
+	hotStateGo := readText(t, filepath.Join(root, "generated", "hotstate.go"))
+	assertContains(t, hotStateGo, `{Key: "wait_for_async_insert", Value: "0", Important: true}`)
+	assertContains(t, hotStateGo, `{Key: "wait_for_async_insert", Value: "1", Important: true}`)
+	assertContains(t, hotStateGo, `Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"`)
+	assertContains(t, hotStateGo, "func asyncInsertFireAndForget() bool")
+	assertContains(t, hotStateGo, "SQD_ASYNC_INSERT_FLUSH")
 
 	processorGo := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
 	assertContains(t, processorGo, "hot.HoldingsResolver.Queue(HoldingsClockKey{Account: ev.Account, AssetID: ev.AssetID})")
@@ -489,6 +535,10 @@ type DummyStateSchema struct {
 	assertContains(t, emptyProc, "var CustomProcessFn func(state *State, block *ParsedBlock) error")
 	assertContains(t, emptyProc, "func CustomProcessing(ctx context.Context, store Store, state *State, block *ParsedBlock) error")
 	assertContains(t, emptyProc, "func NewProcessor(protoMode bool) (*Processor, error)")
+	assertContains(t, emptyProc, "func (p *Processor) ProcessJSONL(ctx context.Context, store *sqd.Store, data []byte) (uint64, error)")
+	assertContains(t, emptyProc, "func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *sqd.Store, data []byte) (uint64, func(context.Context) error, error)")
+	assertContains(t, emptyProc, "func (p *Processor) ParseBatchForInserts(store *sqd.Store, data []byte, endBlock uint64, onParsed func(sqd.BatchParsedBlock) error)")
+	assertContains(t, emptyProc, "func (p *Processor) ProcessParsedBlock(ctx context.Context, store *sqd.Store, block any) error")
 	assertContains(t, emptyProc, "const defaultRingBufferSize uint32 = 8192")
 	assertContains(t, emptyProc, "var stateStore Store")
 	assertContains(t, emptyProc, "p.State.Store = stateStore")

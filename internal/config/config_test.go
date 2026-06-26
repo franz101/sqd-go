@@ -93,8 +93,8 @@ func TestForkModeDefaultsToDefault(t *testing.T) {
 	if got := cfg.ForkMode(); got != ForkModeDefault {
 		t.Fatalf("fork mode = %q, want %q", got, ForkModeDefault)
 	}
-	if !cfg.ForkMode().UsesCollapsingMergeTree() {
-		t.Fatal("default fork mode should use CollapsingMergeTree")
+	if cfg.ForkMode().UsesCollapsingMergeTree() {
+		t.Fatal("default fork mode should use plain MergeTree (no duplicates are possible)")
 	}
 }
 
@@ -116,20 +116,21 @@ func TestValidateRejectsUnknownForkMode(t *testing.T) {
 	}
 }
 
-func TestForkModeUsesCollapsingMergeTree(t *testing.T) {
+func TestForkModeNeverUsesCollapsingMergeTree(t *testing.T) {
+	// Reingestion prunes block_number > lastBlock before re-inserting, so no
+	// duplicates are ever possible and plain MergeTree suffices for every mode.
 	tests := []struct {
 		mode ForkMode
-		want bool
 	}{
-		{ForkModeDefault, true},
-		{ForkMode(""), true},
-		{ForkModeSqd, false},
-		{ForkModeRingBuffer, false},
+		{ForkModeDefault},
+		{ForkMode("")},
+		{ForkModeSqd},
+		{ForkModeRingBuffer},
 	}
 
 	for _, tt := range tests {
-		if got := tt.mode.UsesCollapsingMergeTree(); got != tt.want {
-			t.Errorf("mode %q UsesCollapsingMergeTree() = %t, want %t", tt.mode, got, tt.want)
+		if got := tt.mode.UsesCollapsingMergeTree(); got != false {
+			t.Errorf("mode %q UsesCollapsingMergeTree() = %t, want false", tt.mode, got)
 		}
 	}
 }

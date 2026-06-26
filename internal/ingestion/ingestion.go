@@ -1,6 +1,7 @@
 package ingestion
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/database"
+	"github.com/franz101/sqd-go/internal/envconfig"
 	"github.com/franz101/sqd-go/internal/monitoring"
 	"github.com/franz101/sqd-go/internal/parser"
 )
@@ -48,10 +51,23 @@ type Options struct {
 	ColdCache    bool
 	ColdCacheDir string // base directory for cold-tier files (default os.TempDir()/sqd-coldcache)
 
+	// Prefetch enables the two-pass batch prefetch (see PrefetchProcessor): each
+	// block is dispatched once to collect its read-set, resolved in one round-trip
+	// per entity, then dispatched again against a warm cache. Collapses the lazy
+	// path's one-SELECT-per-missing-key into one SELECT per entity per block. Default
+	// off; most useful in resume/cursor mode against a populated ClickHouse.
+	Prefetch bool
+
 	// ParallelFetch fetches the finalized backfill range with concurrent range
 	// workers (cursor mode only). The immutable finalized region is fetched out
 	// of order and re-serialized for the in-order consumer; see parallel_fetch.go.
 	ParallelFetch bool
+
+	// ReindexFrom is the block number to reindex from. If set, all blocks with
+	// numbers greater than this value are deleted from ClickHouse using lightweight
+	// DELETE, and indexing starts from this block. Data at or below this block is
+	// preserved.
+	ReindexFrom uint64
 }
 
 const (
@@ -172,7 +188,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom, opts.Prefetch); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -180,7 +196,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64, prefetch bool) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -195,9 +211,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	}
 	log.Printf("Chain %d: %d event types, %d filter(s)", chain.ID, len(decoders), len(filters))
 	storeBlocks := cfg.ShouldStoreBlocks()
+	if reindexFrom > 0 {
+		log.Printf("[REINDEX] Deleting all blocks > %d using lightweight DELETE...", reindexFrom)
+		if err := rollbackAfterBlock(ctx, store, forkMode, chain.ID, reindexFrom); err != nil {
+			return fmt.Errorf("reindex rollback: %w", err)
+		}
+		log.Printf("[REINDEX] Lightweight DELETE completed for blocks > %d", reindexFrom)
+	}
 	currentBlock := chain.StartBlock
 	if flagStartBlock > 0 {
 		currentBlock = flagStartBlock
+	}
+	if reindexFrom > 0 && reindexFrom > currentBlock {
+		currentBlock = reindexFrom
+		log.Printf("[REINDEX] Starting from block %d (from --reindex-from)", currentBlock)
 	}
 	state := NewForkTracker(forkMode)
 	if coldCache {
@@ -215,6 +242,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			log.Printf("Chain %d: cold tier enabled (dir=%s authoritative=%v cursor=%v)", chain.ID, dir, authoritative, cursorMode)
 		} else {
 			log.Printf("Chain %d: cold cache requested but processor does not implement ColdCacheProcessor", chain.ID)
+		}
+	}
+	if prefetch {
+		if pp, ok := proc.(PrefetchProcessor); ok {
+			pp.EnablePrefetch(true)
+			log.Printf("Chain %d: --prefetch enabled (two-pass batch read-set prefetch)", chain.ID)
+		} else {
+			log.Printf("Chain %d: prefetch requested but processor does not implement PrefetchProcessor", chain.ID)
 		}
 	}
 	if cursorMode {
@@ -313,6 +348,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// On crash the run resumes from durable state and re-fetches the cheap gap.
 	committedReporter, _ := proc.(CommitHorizonReporter)
 	flusher, _ := proc.(Flusher)
+	processorProfileReporter, _ := proc.(ProcessorProfileReporter)
 	// durableCheckpoint is the highest block number written to sync_state so far.
 	var durableCheckpoint uint64
 	// Fork-recovery snapshots are only needed near/above the finalized head
@@ -326,13 +362,34 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		snapshotController = sc
 		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
 	}
+	backfillGC := cursorMode && !snapshotsActive
+	var previousGOGC int
+	if backfillGC {
+		previousGOGC = debug.SetGCPercent(200)
+	}
+	defer func() {
+		if backfillGC {
+			debug.SetGCPercent(previousGOGC)
+		}
+	}()
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
-	useParseDecodeV2 := os.Getenv("SQD_PARSE_DECODE_V2") != "" && fastJSONLOK
-	if os.Getenv("SQD_PARSE_DECODE_V2") != "" && !fastJSONLOK {
+	useParseDecodeV2 := envconfig.ParseDecodeV2Enabled() && fastJSONLOK
+	if envconfig.ParseDecodeV2Enabled() && !fastJSONLOK {
 		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 requested, but processor does not implement FastJSONLProcessor; using default processor path", chain.ID)
 	}
 	if useParseDecodeV2 {
 		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 enabled for custom processor", chain.ID)
+	}
+	fastInsertProc, fastInsertOK := proc.(FastJSONLInsertProcessor)
+	singleParse := useParseDecodeV2 && fastInsertOK && !storeBlocks && !cfg.ShouldStoreRawLogs() &&
+		os.Getenv("SQD_SINGLE_PARSE") != "0"
+	batchProc, batchProcOK := proc.(FastBatchParseProcessor)
+	batchParse := singleParse && batchProcOK && batchProc.SupportsBatchParse() &&
+		os.Getenv("SQD_PRODUCER_PARSE") != "0"
+	if batchParse {
+		log.Printf("Chain %d: producer-parse pipeline enabled (one generated parse; consumer runs state math)", chain.ID)
+	} else if singleParse {
+		log.Printf("Chain %d: single-parse pipeline enabled (generated decode feeds state and event inserts)", chain.ID)
 	}
 	totalBlocks, totalEvents := uint64(0), uint64(0)
 	startTime := time.Now()
@@ -489,10 +546,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					bound, ok := parallelFinalizedBound(cursorMode, pBlock, lastFinalized, effectiveEndBlock)
 					switch {
 					case ok && bound >= pBlock+parallelMinSpan(parallelPageSize, parallelWorkers):
-						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, parallelPageSize, parallelWorkers, parallelLimiter)
+						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, uint64(parallelPageSize), parallelWorkers, parallelLimiter)
 						parallelBound.Store(bound)
 						prefetch.launch(pCtx)
-						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, page %d, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, prefetch.pageSize, parallelRPS, parallelSkipEmpties)
+						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, parallelRPS, parallelSkipEmpties)
 					case cursorMode && lastFinalized == 0:
 						// Finalized head not learned yet — the first sequential fetch
 						// will populate it. Retry on the next iteration; don't latch.
@@ -507,6 +564,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				var rangeLabel string
 				var fromPrefetch bool
 				var prefetchedTo uint64
+				var requestedTo uint64
 				var err error
 				var lastFetchDur time.Duration
 				if prefetch != nil {
@@ -526,7 +584,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						if pCtx.Err() != nil {
 							return
 						}
-						log.Printf("Chain %d: parallel fetch error at [%d-%d]: %v; resuming sequential fetch", chain.ID, page.from, page.to, page.err)
+						log.Printf("Chain %d: parallel fetch error at [%d-%d]: %v; resuming sequential fetch", chain.ID, page.from, page.coveredTo, page.err)
 						prefetch = nil
 						parallelDone = true
 						pBlock = page.from
@@ -536,8 +594,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					pBlock = page.from
 					pHash = "" // finalized region: no parent-hash chaining
 					response = client.Response{Raw: page.raw, Head: page.head}
-					rangeLabel = fmt.Sprintf("[%d-%d]", page.from, page.to)
-					prefetchedTo = page.to
+					rangeLabel = fmt.Sprintf("[%d-%d]", page.from, page.coveredTo)
+					prefetchedTo = page.coveredTo
 					fromPrefetch = true
 				} else {
 					toBlockPtr, label, ok := nextProducerRequestRange(pBlock, pageSize, adaptivePageSize, lastFinalized, effectiveEndBlock, cursorMode)
@@ -545,6 +603,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						return
 					}
 					rangeLabel = label
+					if toBlockPtr != nil {
+						requestedTo = *toBlockPtr
+					}
 
 					// Catch-up fetches go through /finalized-stream; the request shape
 					// (parentBlockHash, includeAllBlocks) stays identical, so fork
@@ -633,86 +694,200 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 
 				parseStart := time.Now()
+				if batchParse {
+					// Finalized pages cannot participate in fork replay, so their
+					// raw lines need not survive this parse call. Near the live
+					// head retain one owned page for replay safety.
+					parseRaw := raw
+					retainRawLines := true
+					if response.Head.Finalized != nil {
+						var requestedEnd uint64
+						switch {
+						case fromPrefetch:
+							requestedEnd = prefetchedTo
+						default:
+							requestedEnd = requestedTo
+						}
+						if requestedEnd > 0 && requestedEnd <= response.Head.Finalized.Number {
+							retainRawLines = false
+						}
+					}
+					if retainRawLines {
+						parseRaw = retainReplayJSONLPage(raw)
+					}
+					var endBlock uint64
+					if effectiveEndBlock != nil {
+						endBlock = *effectiveEndBlock
+					}
+					batchStartBlock := pBlock
+					var pending BatchParsedBlock
+					var havePending bool
+					eventCount, batchFlush, parseErr := batchProc.ParseBatchForInserts(store, parseRaw, endBlock, func(parsed BatchParsedBlock) error {
+						if !retainRawLines {
+							parsed.RawLine = nil
+						}
+						for {
+							consumerBlock := currentConsumerBlock.Load()
+							if parsed.Number >= consumerBlock && parsed.Number-consumerBlock >= uint64(replayBuf.capacity)-100 {
+								waitStart := time.Now()
+								select {
+								case <-pCtx.Done():
+									profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+									return pCtx.Err()
+								case <-time.After(10 * time.Millisecond):
+								}
+								profProducerBackpressureNanos.Add(int64(time.Since(waitStart)))
+								continue
+							}
+							break
+						}
+						if havePending {
+							replayBuf.WriteParsed(chain.ID, pending, response.Head.Finalized, false, rangeLabel, batchStartBlock, nil, 0)
+							pHash = pending.Hash
+						}
+						pending = parsed
+						havePending = true
+						return nil
+					})
+					if parseErr != nil {
+						if pCtx.Err() != nil {
+							return
+						}
+						sendSignal(producerSignal{err: parseErr})
+						return
+					}
+					profParseNanos.Add(int64(time.Since(parseStart)))
+					profIters.Add(1)
+					if havePending {
+						replayBuf.WriteParsed(chain.ID, pending, response.Head.Finalized, true, rangeLabel, batchStartBlock, batchFlush, eventCount)
+						pHash = pending.Hash
+						if fromPrefetch {
+							pBlock = prefetchedTo + 1
+							continue
+						}
+						next := pending.Number + 1
+						if pageSize == 0 && next > batchStartBlock {
+							span := next - batchStartBlock
+							adaptivePageSize = nextPageSize(adaptivePageSize, adaptivePageSize, span, false, minAdaptivePageSize, maxAdaptivePageSize)
+							adaptivePageSize = clampPageForLatency(adaptivePageSize, span, lastFetchDur, targetFetchDur, minAdaptivePageSize)
+						}
+						pBlock = next
+					} else {
+						if batchFlush != nil {
+							_ = batchFlush(pCtx)
+						}
+						if fromPrefetch {
+							pBlock = prefetchedTo + 1
+						} else {
+							pBlock++
+						}
+					}
+					continue
+				}
 				var decodeDur time.Duration
 				var decodedBlocks []decodedBlock
 				var dataScratch []byte
-				err = jsonl.ParseWithLine(raw, func(block *parser.Block, rawLine []byte) error {
-					if effectiveEndBlock != nil && block.Header.Number > *effectiveEndBlock {
+				rawForParse := raw
+				if useParseDecodeV2 {
+					// Portal/client response buffers may be reused as soon as the
+					// producer starts its next fetch. Replay entries outlive that
+					// fetch, so retain one owned copy per page and let each rawLine
+					// slice reference it. Copying the page once avoids both
+					// corruption and one allocation per block.
+					rawForParse = retainReplayJSONLPage(raw)
+				}
+				if singleParse {
+					err = jsonl.ScanHeadersWithLine(rawForParse, func(number, timestamp uint64, hash string, rawLine []byte) error {
+						if effectiveEndBlock != nil && number > *effectiveEndBlock {
+							return nil
+						}
+						decodedBlocks = append(decodedBlocks, decodedBlock{
+							number:    number,
+							hash:      strings.Clone(hash),
+							timestamp: time.Unix(int64(timestamp), 0).UTC(),
+							raw:       rawLine,
+						})
 						return nil
-					}
-					blockHash := strings.Clone(block.Header.Hash)
-					blockTS := time.Unix(int64(block.Header.Timestamp), 0).UTC()
-
-					var blockEvents []parser.DecodedEvent
-					var blockCustomLogs []CustomLog
-					blockTypedEvents := make(map[string][]parser.DecodedEvent)
-
-					for _, lg := range block.Logs {
-						if len(lg.Topics) == 0 {
-							continue
-						}
-						d0 := time.Now()
-						topic0 := abiunpack.DecodeTopicHash(lg.Topics[0])
-						def, ok := decoders[topic0]
-						if !ok {
-							decodeDur += time.Since(d0)
-							continue
-						}
-						if !def.MatchesAddress(lg.Address) {
-							decodeDur += time.Since(d0)
-							continue
-						}
-						dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
-						ev, err := def.Decode(lg.Address, lg.Topics, dataScratch)
-						decodeDur += time.Since(d0)
-						if err != nil {
-							continue
-						}
-						ev.ChainID = chain.ID
-						ev.BlockNumber = block.Header.Number
-						ev.BlockTimestamp = blockTS
-						ev.BlockHash = blockHash
-						ev.TxHash = strings.Clone(lg.TransactionHash)
-						ev.TxIndex = lg.TransactionIndex
-						ev.LogIndex = lg.LogIndex
-						ev.Address = strings.Clone(lg.Address)
-						blockEvents = append(blockEvents, *ev)
-
-						if !useParseDecodeV2 {
-							blockCustomLogs = append(blockCustomLogs, CustomLog{
-								ChainID:          chain.ID,
-								BlockNumber:      block.Header.Number,
-								BlockTimestamp:   blockTS,
-								BlockHash:        blockHash,
-								ContractAddress:  strings.Clone(lg.Address),
-								TransactionHash:  strings.Clone(lg.TransactionHash),
-								TransactionIndex: lg.TransactionIndex,
-								LogIndex:         lg.LogIndex,
-								Topics:           cloneStrings(lg.Topics),
-								Data:             strings.Clone(lg.Data),
-							})
-						}
-
-						if table, ok := typedTables.lookup(ev.Address, ev.EventName); ok {
-							blockTypedEvents[table.Name] = append(blockTypedEvents[table.Name], *ev)
-						}
-					}
-
-					var blockRaw []byte
-					if useParseDecodeV2 {
-						blockRaw = rawLine
-					}
-					decodedBlocks = append(decodedBlocks, decodedBlock{
-						number:      block.Header.Number,
-						hash:        blockHash,
-						timestamp:   blockTS,
-						events:      blockEvents,
-						logs:        blockCustomLogs,
-						typedEvents: blockTypedEvents,
-						raw:         blockRaw,
 					})
-					return nil
-				})
+				} else {
+					err = jsonl.ParseWithLine(rawForParse, func(block *parser.Block, rawLine []byte) error {
+						if effectiveEndBlock != nil && block.Header.Number > *effectiveEndBlock {
+							return nil
+						}
+						blockHash := strings.Clone(block.Header.Hash)
+						blockTS := time.Unix(int64(block.Header.Timestamp), 0).UTC()
+
+						var blockEvents []parser.DecodedEvent
+						var blockCustomLogs []CustomLog
+						blockTypedEvents := make(map[string][]parser.DecodedEvent)
+
+						for _, lg := range block.Logs {
+							if len(lg.Topics) == 0 {
+								continue
+							}
+							d0 := time.Now()
+							topic0 := abiunpack.DecodeTopicHash(lg.Topics[0])
+							def, ok := decoders[topic0]
+							if !ok {
+								decodeDur += time.Since(d0)
+								continue
+							}
+							if !def.MatchesAddress(lg.Address) {
+								decodeDur += time.Since(d0)
+								continue
+							}
+							dataScratch = abiunpack.AppendHexBytes(dataScratch[:0], lg.Data)
+							ev, err := def.Decode(lg.Address, lg.Topics, dataScratch)
+							decodeDur += time.Since(d0)
+							if err != nil {
+								continue
+							}
+							ev.ChainID = chain.ID
+							ev.BlockNumber = block.Header.Number
+							ev.BlockTimestamp = blockTS
+							ev.BlockHash = blockHash
+							ev.TxHash = strings.Clone(lg.TransactionHash)
+							ev.TxIndex = lg.TransactionIndex
+							ev.LogIndex = lg.LogIndex
+							ev.Address = strings.Clone(lg.Address)
+							blockEvents = append(blockEvents, *ev)
+
+							if !useParseDecodeV2 {
+								blockCustomLogs = append(blockCustomLogs, CustomLog{
+									ChainID:          chain.ID,
+									BlockNumber:      block.Header.Number,
+									BlockTimestamp:   blockTS,
+									BlockHash:        blockHash,
+									ContractAddress:  strings.Clone(lg.Address),
+									TransactionHash:  strings.Clone(lg.TransactionHash),
+									TransactionIndex: lg.TransactionIndex,
+									LogIndex:         lg.LogIndex,
+									Topics:           cloneStrings(lg.Topics),
+									Data:             strings.Clone(lg.Data),
+								})
+							}
+
+							if table, ok := typedTables.lookup(ev.Address, ev.EventName); ok {
+								blockTypedEvents[table.Name] = append(blockTypedEvents[table.Name], *ev)
+							}
+						}
+
+						var blockRaw []byte
+						if useParseDecodeV2 {
+							blockRaw = rawLine
+						}
+						decodedBlocks = append(decodedBlocks, decodedBlock{
+							number:      block.Header.Number,
+							hash:        blockHash,
+							timestamp:   blockTS,
+							events:      blockEvents,
+							logs:        blockCustomLogs,
+							typedEvents: blockTypedEvents,
+							raw:         blockRaw,
+						})
+						return nil
+					})
+				}
 				if err != nil {
 					sendSignal(producerSignal{err: err})
 					return
@@ -810,6 +985,8 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	lastStatsTime := startTime
 	lastStatsBlocks := uint64(0)
 	lastStatsEvents := uint64(0)
+	lastProfileTotals := profileTotals{}
+	lastProcessorProfile := ProcessorProfile{}
 	// Chain-coverage tracking. The consumer cursor (currentConsumerBlockVal)
 	// advances on every block AND every confirmed-empty gap-skip (sparse
 	// --parallel-fetch), so its delta is the honest, mode-independent progress
@@ -857,6 +1034,41 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			coverage, coverageRate, avgCoverageRate,
 			deltaBlocks, deltaEvents, interval.Round(time.Millisecond), fetchNote,
 			totalBlockCount, totalEventCount)
+		currentProfileTotals := profileTotals{
+			fetch:                time.Duration(profFetchNanos.Load()),
+			parse:                time.Duration(profParseNanos.Load()),
+			decode:               time.Duration(profDecodeNanos.Load()),
+			marshal:              time.Duration(profMarshalNanos.Load()),
+			insert:               time.Duration(profInsertNanos.Load()),
+			custom:               time.Duration(profCustomNanos.Load()),
+			consumerWait:         time.Duration(profConsumerWaitNanos.Load()),
+			producerBackpressure: time.Duration(profProducerBackpressureNanos.Load()),
+			iterations:           profIters.Load(),
+		}
+		profileDelta := currentProfileTotals.delta(lastProfileTotals)
+		log.Printf("Chain %d: profile %s | fetch=%s parse=%s decode=%s marshal=%s insert=%s custom=%s | consumer_wait=%s producer_backpressure=%s | parse_iterations=%d",
+			chain.ID, reason,
+			profileDelta.fetch.Round(time.Millisecond),
+			profileDelta.parse.Round(time.Millisecond),
+			profileDelta.decode.Round(time.Millisecond),
+			profileDelta.marshal.Round(time.Millisecond),
+			profileDelta.insert.Round(time.Millisecond),
+			profileDelta.custom.Round(time.Millisecond),
+			profileDelta.consumerWait.Round(time.Millisecond),
+			profileDelta.producerBackpressure.Round(time.Millisecond),
+			profileDelta.iterations)
+		lastProfileTotals = currentProfileTotals
+		if processorProfileReporter != nil {
+			currentProcessorProfile := processorProfileReporter.ProcessorProfile()
+			processorDelta := currentProcessorProfile.Delta(lastProcessorProfile)
+			log.Printf("Chain %d: processor profile %s | condition_resolve=%s condition_round_trips=%d | fpmm_resolve=%s fpmm_round_trips=%d",
+				chain.ID, reason,
+				processorDelta.ConditionResolveDuration.Round(time.Millisecond),
+				processorDelta.ConditionRoundTrips,
+				processorDelta.FPMMResolveDuration.Round(time.Millisecond),
+				processorDelta.FPMMRoundTrips)
+			lastProcessorProfile = currentProcessorProfile
+		}
 		lastStatsTime = now
 		lastStatsBlocks = totalBlockCount
 		lastStatsEvents = totalEventCount
@@ -880,6 +1092,50 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		batchRawJSONL = batchRawJSONL[:0]
 		pendingBatchBlocks = 0
 	}
+	type pendingCursorInsert struct {
+		done      chan error
+		syncState database.SyncState
+		block     uint64
+	}
+	var pendingInsert *pendingCursorInsert
+	drainPendingInsert := func() error {
+		if pendingInsert == nil {
+			return nil
+		}
+		pending := pendingInsert
+		pendingInsert = nil
+		if err := <-pending.done; err != nil {
+			return err
+		}
+		if err := store.SaveSyncState(ctx, chain.ID, pending.syncState); err != nil {
+			return fmt.Errorf("update sync state %d: %w", pending.block, err)
+		}
+		if pending.block%10 == 0 {
+			if err := store.TruncateSyncState(ctx, chain.ID, pending.block); err != nil {
+				log.Printf("Chain %d: truncate sync state error: %v", chain.ID, err)
+			}
+		}
+		lastCheckpoint = pending.block
+		return nil
+	}
+	kickPendingInsert := func(flush func(context.Context) error, syncState database.SyncState, block uint64) {
+		done := make(chan error, 1)
+		pendingInsert = &pendingCursorInsert{done: done, syncState: syncState, block: block}
+		go func() {
+			insertStart := time.Now()
+			var err error
+			if flush != nil {
+				err = flush(ctx)
+			}
+			profInsertNanos.Add(int64(time.Since(insertStart)))
+			done <- err
+		}()
+	}
+	defer func() {
+		if pendingInsert != nil {
+			<-pendingInsert.done
+		}
+	}()
 	for {
 		if entry, ok := replayBuf.GetBlock(currentConsumerBlockVal); ok {
 			// Accumulate data for batch insertion
@@ -892,7 +1148,15 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			for tableName, events := range entry.typedEvents {
 				batchTypedEvents[tableName] = append(batchTypedEvents[tableName], events...)
 			}
-			if useParseDecodeV2 {
+			if batchParse {
+				if entry.proto != nil {
+					procStart := time.Now()
+					if err := batchProc.ProcessParsedBlock(ctx, store, entry.proto); err != nil {
+						return fmt.Errorf("producer-parsed processor error at block %d: %w", entry.number, err)
+					}
+					profCustomNanos.Add(int64(time.Since(procStart)))
+				}
+			} else if useParseDecodeV2 {
 				if len(entry.raw) > 0 {
 					batchRawJSONL = append(batchRawJSONL, entry.raw...)
 					batchRawJSONL = append(batchRawJSONL, '\n')
@@ -912,6 +1176,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					if entry.number+snapshotEnableMargin >= entry.finalized.Number {
 						snapshotController.SetSnapshotsEnabled(true)
 						snapshotsActive = true
+						if backfillGC {
+							debug.SetGCPercent(previousGOGC)
+							backfillGC = false
+						}
 						log.Printf("Chain %d: snapshots enabled — consumer block %d is within %d of finalized head %d",
 							chain.ID, entry.number, snapshotEnableMargin, entry.finalized.Number)
 					}
@@ -923,57 +1191,93 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			pendingBatchBlocks++
 
 			if entry.isLastInBatch {
-				insertStart := time.Now()
+				if batchParse {
+					atomic.AddUint64(&totalEvents, entry.batchEvents)
+					if cursorMode {
+						if err := drainPendingInsert(); err != nil {
+							return fmt.Errorf("previous producer-parse event insert: %w", err)
+						}
+						current := state.Current()
+						if current != nil {
+							kickPendingInsert(entry.batchFlush, forkSyncState(state, current), entry.number)
+						}
+					} else if entry.batchFlush != nil {
+						insertStart := time.Now()
+						if err := entry.batchFlush(ctx); err != nil {
+							return fmt.Errorf("producer-parse event insert: %w", err)
+						}
+						profInsertNanos.Add(int64(time.Since(insertStart)))
+					}
+				} else if singleParse {
+					if len(batchRawJSONL) > 0 {
+						procStart := time.Now()
+						eventCount, flush, err := fastInsertProc.ProcessJSONLWithInserts(ctx, store, batchRawJSONL)
+						profCustomNanos.Add(int64(time.Since(procStart)))
+						if err != nil {
+							return fmt.Errorf("single-parse processor error: %w", err)
+						}
+						atomic.AddUint64(&totalEvents, eventCount)
+						if flush != nil {
+							insertStart := time.Now()
+							if err := flush(ctx); err != nil {
+								return fmt.Errorf("single-parse event insert: %w", err)
+							}
+							profInsertNanos.Add(int64(time.Since(insertStart)))
+						}
+					}
+				} else {
+					insertStart := time.Now()
 
-				// 1. Logs insertion
-				if cfg.ShouldStoreRawLogs() && len(batchDecodedEvents) > 0 {
-					if err := baseInserter.InsertLogs(ctx, batchDecodedEvents); err != nil {
-						return fmt.Errorf("InsertLogs: %w", err)
+					// 1. Logs insertion
+					if cfg.ShouldStoreRawLogs() && len(batchDecodedEvents) > 0 {
+						if err := baseInserter.InsertLogs(ctx, batchDecodedEvents); err != nil {
+							return fmt.Errorf("InsertLogs: %w", err)
+						}
+					}
+
+					// 2. Typed events insertion
+					for tableName, events := range batchTypedEvents {
+						if len(events) == 0 {
+							continue
+						}
+						inserter := typedInserters[tableName]
+						if inserter == nil {
+							return fmt.Errorf("missing TypedInserter for %s", tableName)
+						}
+						if err := inserter.Insert(ctx, events); err != nil {
+							return fmt.Errorf("InsertTypedLogs(%s): %w", tableName, err)
+						}
+					}
+
+					// 3. Optional block ledger insertion
+					if storeBlocks && len(batchBlockRows) > 0 {
+						if err := baseInserter.InsertBlocks(ctx, batchBlockRows); err != nil {
+							return fmt.Errorf("InsertBlocks: %w", err)
+						}
+					}
+					profInsertNanos.Add(int64(time.Since(insertStart)))
+
+					// The producer self-advances (it tracked the last block's hash and
+					// kept fetching), so there is no per-page advance handshake to send
+					// here — the consumer just proceeds to the custom processor.
+
+					// 4. Custom Processor
+					if useParseDecodeV2 && len(batchRawJSONL) > 0 {
+						procStart := time.Now()
+						if _, err := fastJSONLProc.ProcessJSONL(ctx, store, batchRawJSONL); err != nil {
+							return fmt.Errorf("custom processor v2 error: %w", err)
+						}
+						profCustomNanos.Add(int64(time.Since(procStart)))
+					} else if proc != nil && len(batchCustomLogs) > 0 {
+						procStart := time.Now()
+						if err := proc.Process(ctx, store, batchCustomLogs); err != nil {
+							return fmt.Errorf("custom processor error: %w", err)
+						}
+						profCustomNanos.Add(int64(time.Since(procStart)))
 					}
 				}
 
-				// 2. Typed events insertion
-				for tableName, events := range batchTypedEvents {
-					if len(events) == 0 {
-						continue
-					}
-					inserter := typedInserters[tableName]
-					if inserter == nil {
-						return fmt.Errorf("missing TypedInserter for %s", tableName)
-					}
-					if err := inserter.Insert(ctx, events); err != nil {
-						return fmt.Errorf("InsertTypedLogs(%s): %w", tableName, err)
-					}
-				}
-
-				// 3. Optional block ledger insertion
-				if storeBlocks && len(batchBlockRows) > 0 {
-					if err := baseInserter.InsertBlocks(ctx, batchBlockRows); err != nil {
-						return fmt.Errorf("InsertBlocks: %w", err)
-					}
-				}
-				profInsertNanos.Add(int64(time.Since(insertStart)))
-
-				// The producer self-advances (it tracked the last block's hash and
-				// kept fetching), so there is no per-page advance handshake to send
-				// here — the consumer just proceeds to the custom processor.
-
-				// 4. Custom Processor
-				if useParseDecodeV2 && len(batchRawJSONL) > 0 {
-					procStart := time.Now()
-					if _, err := fastJSONLProc.ProcessJSONL(ctx, store, batchRawJSONL); err != nil {
-						return fmt.Errorf("custom processor v2 error: %w", err)
-					}
-					profCustomNanos.Add(int64(time.Since(procStart)))
-				} else if proc != nil && len(batchCustomLogs) > 0 {
-					procStart := time.Now()
-					if err := proc.Process(ctx, store, batchCustomLogs); err != nil {
-						return fmt.Errorf("custom processor error: %w", err)
-					}
-					profCustomNanos.Add(int64(time.Since(procStart)))
-				}
-
-				if cursorMode {
+				if cursorMode && !batchParse {
 					current := state.Current()
 					if current != nil {
 						if err := saveForkState(ctx, store, chain.ID, state, current); err != nil {
@@ -1024,7 +1328,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					}
 				}
 
-				lastCheckpoint = entry.number
+				if !cursorMode || !batchParse {
+					lastCheckpoint = entry.number
+				}
 				resetBatch()
 			}
 
@@ -1062,6 +1368,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 		if producerDone {
 			// Checked the buffer, it's empty, and the producer has completed cleanly
+			if err := drainPendingInsert(); err != nil {
+				return fmt.Errorf("final producer-parse event insert: %w", err)
+			}
 			break
 		}
 
@@ -1070,11 +1379,15 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		case <-ctx.Done():
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			log.Printf("Chain %d: interrupted at block %d", chain.ID, currentConsumerBlockVal)
+			_ = drainPendingInsert()
 			return ctx.Err()
 
 		case sig := <-errChan:
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			if sig.forkErr != nil {
+				if err := drainPendingInsert(); err != nil {
+					return fmt.Errorf("drain producer-parse event insert before fork rollback: %w", err)
+				}
 				forkErr := sig.forkErr
 				log.Printf("[FORK DETECTED] Chain %d: fork detected! Previous blocks sent by portal: %v", chain.ID, forkErr.PreviousBlocks)
 				safe, ok := state.HandleFork(forkErr.PreviousBlocks)
@@ -1132,6 +1445,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				}
 
 				replayBuf.PruneAfter(safe.Number)
+				if batchParse {
+					batchProc.ReclaimParseBatches()
+				}
 				if pendingBatchBlocks > 0 {
 					log.Printf("[ROLLBACK] Discarding %d uncommitted batch block(s) after fork rollback", pendingBatchBlocks)
 					resetBatch()
@@ -1143,6 +1459,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				continue
 			}
 			if sig.err != nil {
+				if err := drainPendingInsert(); err != nil {
+					return fmt.Errorf("drain producer-parse event insert after producer error: %w", err)
+				}
 				return fmt.Errorf("producer error: %w", sig.err)
 			}
 
@@ -1151,6 +1470,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 		case finalized := <-finalizedChan:
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
+			if err := drainPendingInsert(); err != nil {
+				return fmt.Errorf("drain producer-parse event insert at live tail: %w", err)
+			}
 			state.ApplyBatch(finalized, nil)
 			if pendingBatchBlocks == 0 {
 				current := state.Current()
@@ -1200,6 +1522,46 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	}
 
 	return nil
+}
+
+type profileTotals struct {
+	fetch                time.Duration
+	parse                time.Duration
+	decode               time.Duration
+	marshal              time.Duration
+	insert               time.Duration
+	custom               time.Duration
+	consumerWait         time.Duration
+	producerBackpressure time.Duration
+	iterations           int64
+}
+
+func (p profileTotals) delta(previous profileTotals) profileTotals {
+	return profileTotals{
+		fetch:                nonNegativeDurationDelta(p.fetch, previous.fetch),
+		parse:                nonNegativeDurationDelta(p.parse, previous.parse),
+		decode:               nonNegativeDurationDelta(p.decode, previous.decode),
+		marshal:              nonNegativeDurationDelta(p.marshal, previous.marshal),
+		insert:               nonNegativeDurationDelta(p.insert, previous.insert),
+		custom:               nonNegativeDurationDelta(p.custom, previous.custom),
+		consumerWait:         nonNegativeDurationDelta(p.consumerWait, previous.consumerWait),
+		producerBackpressure: nonNegativeDurationDelta(p.producerBackpressure, previous.producerBackpressure),
+		iterations:           maxInt64(p.iterations-previous.iterations, 0),
+	}
+}
+
+func nonNegativeDurationDelta(current, previous time.Duration) time.Duration {
+	if current < previous {
+		return 0
+	}
+	return current - previous
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func printProfile(fetch, parse, decode, marshal, insert, custom, consumerWait, producerBackpressure time.Duration, iters int, totalBlocks, totalEvents uint64, startTime time.Time, memBefore, memAfter runtime.MemStats) {
@@ -1322,7 +1684,7 @@ func minEndBlock(current *uint64, candidate uint64) *uint64 {
 func chainEndpoint(chainID uint64, hot bool) string {
 	// Allow overriding the portal endpoint (e.g. a local mock or mirror) for
 	// integration testing the full ingestion pipeline against fixture data.
-	if v := os.Getenv("SQD_PORTAL_ENDPOINT"); v != "" {
+	if v := envconfig.PortalEndpointURL(); v != "" {
 		return v
 	}
 	suffix := "/finalized-stream"
@@ -1356,12 +1718,16 @@ func rollbackAfterBlock(ctx context.Context, store *database.Store, mode config.
 }
 
 func saveForkState(ctx context.Context, store *database.Store, chainID uint64, state ForkTracker, current *client.BlockRef) error {
+	return store.SaveSyncState(ctx, chainID, forkSyncState(state, current))
+}
+
+func forkSyncState(state ForkTracker, current *client.BlockRef) database.SyncState {
 	finalized := state.FinalizedHighWatermark()
-	return store.SaveSyncState(ctx, chainID, database.SyncState{
+	return database.SyncState{
 		Current:       blockRefToSyncCursor(*current),
 		Finalized:     blockRefPtrToSyncCursor(finalized),
 		RollbackChain: blockRefsToSyncCursors(filterUnfinalizedRollbackChain(state.RecentUnfinalizedBlocks(), finalized)),
-	})
+	}
 }
 
 func syncCursorPtrToBlockRef(cursor *database.SyncCursor) *client.BlockRef {
@@ -1413,6 +1779,10 @@ func cloneStrings(in []string) []string {
 	return out
 }
 
+func retainReplayJSONLPage(raw []byte) []byte {
+	return bytes.Clone(raw)
+}
+
 type typedTableIndex struct {
 	byAddressEvent map[string]database.TypedEventTable
 	byEvent        map[string]database.TypedEventTable
@@ -1439,7 +1809,18 @@ func buildTypedTableIndex(chain *config.Chain) (typedTableIndex, error) {
 			if err != nil {
 				return index, fmt.Errorf("%s.%s: %w", contract.Name, event.Event, err)
 			}
-			viewName := uniqueLower(used, toSnake(contract.Name+"_"+name))
+			// Derive the table name exactly like codegen's buildEventSpecs: honor
+			// an explicit `name:` override. Without this, an overridden event
+			// (e.g. ExchangeV2.OrderFilled named OrderFilledV2) resolves to a table
+			// name that schema.sql never created -> UNKNOWN_TABLE on insert (the
+			// crash at exchange_v2_order_filled_events). The index itself stays
+			// keyed by the base event name, which is what decoded logs carry and
+			// what lookup() receives.
+			tableNameEvent := name
+			if event.Name != nil && strings.TrimSpace(*event.Name) != "" {
+				tableNameEvent = strings.TrimSpace(*event.Name)
+			}
+			viewName := uniqueLower(used, toSnake(contract.Name+"_"+tableNameEvent))
 
 			var filteredArgs []database.TypedEventArg
 			for _, arg := range args {

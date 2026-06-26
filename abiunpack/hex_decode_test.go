@@ -56,6 +56,14 @@ func TestDecodeTopicHashMatchesCommon(t *testing.T) {
 	}
 }
 
+func TestHashFromHexMatchesCommon(t *testing.T) {
+	for _, in := range hashInputs {
+		if got, want := HashFromHex(in), common.HexToHash(in); got != want {
+			t.Errorf("HashFromHex(%q) = %s, want %s", in, got.Hex(), want.Hex())
+		}
+	}
+}
+
 // Fuzz-style sweep: every byte value in every position of an address/hash must
 // round-trip identically to go-ethereum.
 func TestHexDecodersByteSweep(t *testing.T) {
@@ -69,10 +77,14 @@ func TestHexDecodersByteSweep(t *testing.T) {
 		if got, want := DecodeTopicHash(hash), common.HexToHash(hash); got != want {
 			t.Errorf("DecodeTopicHash(%q) = %s, want %s", hash, got.Hex(), want.Hex())
 		}
+		if got, want := HashFromHex(hash), common.HexToHash(hash); got != want {
+			t.Errorf("HashFromHex(%q) = %s, want %s", hash, got.Hex(), want.Hex())
+		}
 	}
 }
 
 var addrSink common.Address
+var hashSink common.Hash
 
 func TestAddressFromHexZeroAlloc(t *testing.T) {
 	addr := "0x8236a87084f8b84306f72007f36f2618a5634494"
@@ -83,5 +95,15 @@ func TestAddressFromHexZeroAlloc(t *testing.T) {
 	// is a real cut, not a no-op.
 	if n := testing.AllocsPerRun(1000, func() { addrSink = common.HexToAddress(addr) }); n == 0 {
 		t.Error("expected common.HexToAddress to allocate; test premise is stale")
+	}
+}
+
+func TestHashFromHexZeroAlloc(t *testing.T) {
+	hash := "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	if n := testing.AllocsPerRun(1000, func() { hashSink = HashFromHex(hash) }); n != 0 {
+		t.Errorf("HashFromHex allocates %.1f objects/call, want 0", n)
+	}
+	if n := testing.AllocsPerRun(1000, func() { hashSink = common.HexToHash(hash) }); n == 0 {
+		t.Error("expected common.HexToHash to allocate; test premise is stale")
 	}
 }

@@ -53,35 +53,44 @@ package generated
 }
 
 func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
-	host := os.Getenv("CLICKHOUSE_HOST")
-	if host == "" {
-		host = "127.0.0.1"
+	// Connection settings are read straight from the environment: generated code
+	// is a standalone module and must not import sqd-go internal packages. These
+	// defaults mirror internal/envconfig.ClickHouse.
+	host := "127.0.0.1"
+	if v := os.Getenv("CLICKHOUSE_HOST"); v != "" {
+		host = v
 	}
 	port := 9000
 	if v := os.Getenv("CLICKHOUSE_NATIVE_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			port = p
+		if n, err := strconv.Atoi(v); err == nil {
+			port = n
 		}
 	}
-	user := os.Getenv("CLICKHOUSE_USER")
-	if user == "" {
-		user = "default"
+	user := "default"
+	if v := os.Getenv("CLICKHOUSE_USER"); v != "" {
+		user = v
+	}
+	password := "sqd-clickhouse"
+	if v := os.Getenv("CLICKHOUSE_PASSWORD"); v != "" {
+		password = v
 	}
 	return ch.Dial(ctx, ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
 		Database: "default",
 		User:     user,
-		Password: os.Getenv("CLICKHOUSE_PASSWORD"),
+		Password: password,
 	})
 }
 
 func recoveryRecencyClause() string {
-	v := os.Getenv("SQD_RECOVERY_MIN_BLOCK")
-	if v == "" {
-		return ""
+	// SQD_RECOVERY_MIN_BLOCK floor, read inline (see recoveryDialConn).
+	var mb uint64
+	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			mb = uint64(n)
+		}
 	}
-	mb, err := strconv.ParseUint(v, 10, 64)
-	if err != nil || mb == 0 {
+	if mb == 0 {
 		return ""
 	}
 	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " >= " + strconv.FormatUint(mb, 10)
@@ -173,6 +182,33 @@ feed:
 	return firstErr
 }
 
+// asyncInsertFireAndForget reports whether commits use wait_for_async_insert=0.
+// Fire-and-forget is faster but only guarantees rows are queryable after an
+// explicit SYSTEM FLUSH ASYNC INSERT QUEUE, which Commit issues at each commit
+// boundary. The default (unset) keeps wait_for_async_insert=1, which waits per
+// insert so a read-back right after Commit always sees the rows. Toggle with
+// SQD_ASYNC_INSERT_FLUSH=1.
+func asyncInsertFireAndForget() bool {
+	v := os.Getenv("SQD_ASYNC_INSERT_FLUSH")
+	return v == "1" || v == "true"
+}
+
+func asyncInsertSettings() []ch.Setting {
+	if asyncInsertFireAndForget() {
+		return []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "0", Important: true}}
+	}
+	return []ch.Setting{{Key: "async_insert", Value: "1", Important: true}, {Key: "wait_for_async_insert", Value: "1", Important: true}}
+}
+
+// flushAsyncInserts drains the server-side async-insert queue so subsequent
+// read-backs see all committed rows. No-op unless fire-and-forget is enabled.
+func flushAsyncInserts(ctx context.Context, conn *ch.Client) error {
+	if conn == nil || !asyncInsertFireAndForget() {
+		return nil
+	}
+	return conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
+}
+
 `)
 	} else {
 		b.WriteString("\n")
@@ -202,6 +238,7 @@ feed:
 func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []eventSpec) {
 	imports := map[string]string{
 		`"context"`:                              "",
+		`"encoding/binary"`:                      "",
 		`"fmt"`:                                  "",
 		`"strings"`:                              "",
 		`"sync"`:                                 "",
@@ -215,12 +252,21 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 		imports[`"math/big"`] = ""
 	}
 	if len(tables) > 0 {
+		imports[`"strconv"`] = ""
+		imports[`"time"`] = ""
+	}
+	if len(hotStateSpecs(tables)) > 0 {
+		// The cold-recovery runtime reads ClickHouse settings and the recovery
+		// floor from the environment (generated code must not import internal
+		// packages), so it needs os + strconv.
 		imports[`"os"`] = ""
 		imports[`"strconv"`] = ""
 	}
 	if customTablesUseColdCache(tables) {
-		// Cold tier (Pebble) stores pointer-free hot values as raw bytes; the
-		// unsafe memcpy is zero-transformation and filepath builds the per-cache dir.
+		// Cold tier (Pebble): pointer-free values are stored as raw bytes via
+		// zero-transformation unsafe memcpy; pointer-bearing (but serializable)
+		// values go through a generated marshal/unmarshal codec. filepath builds
+		// the per-cache dir; unsafe keys the cold lookups (keys are always flat).
 		imports[`"path/filepath"`] = ""
 		imports[`"unsafe"`] = ""
 	}
@@ -236,7 +282,7 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 			case strings.Contains(field.Type, "decimal."):
 				imports[`"github.com/shopspring/decimal"`] = ""
 			case strings.Contains(field.Type, "protomath."):
-				imports[`"github.com/franz101/sqd-go/drafts/protomath"`] = ""
+				imports[`"github.com/franz101/sqd-go/protomath"`] = ""
 			}
 		}
 	}
@@ -321,11 +367,18 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	// Cache struct. The index is a pointer-free chained hash over an arena (A3):
 	// buckets[h] = ring index of a chain head (-1 = empty); next[ringIdx] = next
 	// ring index in the same bucket (-1 = end). Replaces a sync.Map[key]idx whose
-	// boxed key+idx interfaces were ~3 GC-scanned objects per live entry. Single
-	// writer (one processor goroutine) => the index needs no locking; the CLOCK
-	// entry flags stay atomic so concurrent readers (if ever reintroduced) still see
-	// torn-free flag transitions.
+	// boxed key+idx interfaces were ~3 GC-scanned objects per live entry. The
+	// runtime uses one processor owner after startup. Atomics on slot flags do not
+	// make the full cache concurrent-safe because the index and values are plain;
+	// they remain because the measured atomic-free candidate was not a consistent
+	// full-workload improvement.
 	fmt.Fprintf(b, `type %[1]s struct {
+	// buckets, next, ring form a fixed-size clock replacement cache.
+	// SINGLE-OWNER CONTRACT: This cache is NOT thread-safe. All operations
+	// must occur from a single goroutine (the processor). Concurrent access
+	// will corrupt the linked-list structures and cause data races.
+	// The atomics used for entry flags (inUse, referenced) protect only
+	// the per-slot state, NOT the cache index structures.
 	buckets  []int32
 	next     []int32
 	ring     []%[2]s
@@ -333,9 +386,11 @@ func renderClockCache(b *bytes.Buffer, spec hotStateSpec) {
 	capacity uint64
 	hand     uint64
 	size     uint64
-	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes).
-	// nil unless attached via HotState.EnableColdCache (pointer-free entities only).
-	cold *coldcache.Store
+	// cold is an optional Pebble-backed tier holding evicted entries (raw bytes for
+	// pointer-free entities, or a marshaled payload for serializable ones). nil
+	// unless attached via HotState.EnableColdCache.
+	cold    *coldcache.Store
+	metrics *BatchResolverMetrics
 }
 
 func New%[1]s(capacity uint64) *%[1]s {
@@ -364,11 +419,19 @@ func New%[1]s(capacity uint64) *%[1]s {
 
 `, spec.cacheType, spec.entryType)
 
-	// keyHash folds every key field's bytes (all keys are common.Hash/Address byte
-	// arrays) into a bucket index.
+	// keyHash folds fixed-width keys by machine words. Hash and address keys are
+	// already uniformly distributed, so byte-at-a-time FNV adds work without
+	// improving the cache index distribution.
 	fmt.Fprintf(b, "func (c *%s) keyHash(key %s) uint32 {\n\th := uint64(1469598103934665603)\n", spec.cacheType, spec.keyType)
 	for _, field := range keyFields {
-		fmt.Fprintf(b, "\th = clockHash64(h, key.%s[:])\n", field.Name)
+		switch field.Type {
+		case "common.Address":
+			fmt.Fprintf(b, "\th = clockHash20(h, key.%s[:])\n", field.Name)
+		case "common.Hash":
+			fmt.Fprintf(b, "\th = clockHash32(h, key.%s[:])\n", field.Name)
+		default:
+			fmt.Fprintf(b, "\th = clockHashBytes(h, key.%s[:])\n", field.Name)
+		}
 	}
 	b.WriteString("\treturn uint32(h^(h>>32)) & c.mask\n}\n\n")
 
@@ -407,13 +470,19 @@ func (c *%[1]s) idxUnlink(key %[2]s) {
 `, spec.cacheType, spec.keyType)
 
 	coldOn := entityUsesCold(spec.table)
+	coldFree := coldOn && isPointerFreeEntity(spec.table) // raw-bytes unsafe memcpy
+	coldSer := coldOn && !coldFree                        // binary marshal/unmarshal codec
 	// spill: on CLOCK eviction, write the victim (value or tombstone) to the cold
 	// tier BEFORE overwriting it, so a later re-reference is served from disk and a
 	// dirty-but-evicted entry isn't lost before Commit reads it.
 	spill := ""
-	if coldOn {
+	if coldFree {
 		spill = "\t\t\tif c.cold != nil {\n" +
 			"\t\t\t\tc.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), unsafe.Slice((*byte)(unsafe.Pointer(&e.value)), unsafe.Sizeof(e.value)))\n" +
+			"\t\t\t}\n"
+	} else if coldSer {
+		spill = "\t\t\tif c.cold != nil {\n" +
+			"\t\t\t\tc.cold.Put(unsafe.Slice((*byte)(unsafe.Pointer(&e.key)), unsafe.Sizeof(e.key)), marshalCold" + valueType + "(e.value))\n" +
 			"\t\t\t}\n"
 	}
 	fmt.Fprintf(b, `func (c *%[1]s) Set(value %[3]s) {
@@ -463,7 +532,7 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 
 `, spec.cacheType, spec.keyType, valueType, spill)
 
-	if coldOn {
+	if coldFree {
 		// Cold-consult on hot miss: an evicted entry (spilled on eviction) is served
 		// from Pebble (~8µs) instead of a ClickHouse round-trip (~1.9ms), then
 		// promoted back into the hot ring. A cold tombstone round-trips as a value
@@ -473,15 +542,59 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 		e := &c.ring[idx]
 		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 			atomic.StoreUint32(&e.referenced, 1)
+			if c.metrics != nil {
+				c.metrics.HotHits++
+			}
 			return e.value, true
 		}
 	}
 	if c.cold != nil {
-		if vb, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&key)), unsafe.Sizeof(key))); found {
-			var v %[3]s
-			copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), vb)
+		// GetInto copies the stored bytes straight into v (a fixed-size value
+		// whose layout matches the bytes written on eviction), avoiding the
+		// per-hit []byte allocation that the value-returning cold.Get does. key is
+		// copied to a local first: taking &key directly forces the key parameter
+		// to the heap on EVERY Get (escape analysis is flow-insensitive), including
+		// hot hits that never reach this cold branch. &k keeps the escape contained.
+		k := key
+		var v %[3]s
+		if found, _ := c.cold.GetInto(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))); found {
 			c.SetByKey(key, v)
+			if c.metrics != nil {
+				c.metrics.ColdHits++
+			}
 			return v, true
+		}
+	}
+	return %[3]s{}, false
+}
+
+`, spec.cacheType, spec.keyType, valueType)
+	} else if coldSer {
+		// Serialized cold-consult: pointer-bearing values can't use the zero-copy
+		// GetInto memcpy, so a hot miss fetches the marshaled bytes from Pebble and
+		// decodes them (one alloc per cold hit — still far cheaper than a ClickHouse
+		// round-trip), then promotes the entry back into the hot ring.
+		fmt.Fprintf(b, `func (c *%[1]s) Get(key %[2]s) (%[3]s, bool) {
+	if idx, ok := c.idxLookup(key); ok {
+		e := &c.ring[idx]
+		if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
+			atomic.StoreUint32(&e.referenced, 1)
+			if c.metrics != nil {
+				c.metrics.HotHits++
+			}
+			return e.value, true
+		}
+	}
+	if c.cold != nil {
+		k := key
+		if data, found, _ := c.cold.Get(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k))); found {
+			if v, ok := unmarshalCold%[3]s(data); ok {
+				c.SetByKey(key, v)
+				if c.metrics != nil {
+					c.metrics.ColdHits++
+				}
+				return v, true
+			}
 		}
 	}
 	return %[3]s{}, false
@@ -497,6 +610,9 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 	e := &c.ring[idx]
 	if atomic.LoadUint32(&e.inUse) == 1 && e.key == key {
 		atomic.StoreUint32(&e.referenced, 1)
+		if c.metrics != nil {
+			c.metrics.HotHits++
+		}
 		return e.value, true
 	}
 	return %[3]s{}, false
@@ -524,6 +640,30 @@ func (c *%[1]s) SetByKey(key %[2]s, value %[3]s) {
 			b.WriteString(lowerFirst(field.Name))
 		}
 		b.WriteString("})\n}\n\n")
+
+		if coldOn {
+			// ColdMightContain reports whether the key may have ever been written to
+			// the cold tier (negative-filter probe; no false negatives). A hot+cold
+			// miss with ColdMightContain==false is provably new, so the authoritative
+			// read path may skip ClickHouse. A miss with ==true may be an evicted
+			// entry (the bounded flat backend evicts), so ClickHouse must be checked.
+			b.WriteString("func (c *")
+			b.WriteString(spec.cacheType)
+			b.WriteString(") ColdMightContain(")
+			renderClockKeyParams(b, keyFields)
+			b.WriteString(") bool {\n\tif c == nil || c.cold == nil {\n\t\treturn false\n\t}\n\tk := ")
+			b.WriteString(spec.keyType)
+			b.WriteString("{")
+			for i, field := range keyFields {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(field.Name)
+				b.WriteString(": ")
+				b.WriteString(lowerFirst(field.Name))
+			}
+			b.WriteString("}\n\treturn c.cold.MightContain(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)))\n}\n\n")
+		}
 	}
 
 	// coldDel mirrors a hard delete into the cold tier so a rolled-back key cannot
@@ -597,6 +737,9 @@ func (c *%[1]s) Len() uint64 {
 }
 
 `, spec.cacheType, spec.keyType, valueType, coldDel)
+	if coldSer {
+		renderColdCodec(b, spec)
+	}
 }
 
 func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
@@ -681,10 +824,12 @@ func renderCustomBatch(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(spec.batchType)
 	b.WriteString(") Insert(ctx context.Context, conn *ch.Client, db string) error {\n\tif b.Rows() == 0 {\n\t\treturn nil\n\t}\n\treturn conn.Do(ctx, ch.Query{Body: fmt.Sprintf(")
 	b.WriteString(strconv.Quote("INSERT INTO %s.%s " + customInsertColumnList(spec.table) + " VALUES"))
-	// wait_for_async_insert MUST be 1: hot-state commits are read back on
-	// prefetch/recovery/rollback. With wait=0 (fire-and-forget) a SELECT after
-	// Commit can miss un-flushed rows, returning stale/partial state under load.
-	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: []ch.Setting{{Key: \"async_insert\", Value: \"1\", Important: true}, {Key: \"wait_for_async_insert\", Value: \"1\", Important: true}}})\n}\n\n")
+	// Insert settings are flag-selected by asyncInsertSettings(): the default
+	// waits per insert (wait_for_async_insert=1) so the hot-state read-backs on
+	// prefetch/recovery/rollback always see committed rows; SQD_ASYNC_INSERT_FLUSH
+	// switches to fire-and-forget (wait=0) with an explicit queue flush at each
+	// commit boundary (see asyncInsertSettings / flushAsyncInserts).
+	b.WriteString(", quoteIdent(db), quoteIdent(b.TableName())), Input: b.input, Settings: asyncInsertSettings()})\n}\n\n")
 }
 
 func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
@@ -740,6 +885,14 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
 		b.WriteString(spec.keyType)
 		b.WriteString("(v)\n\t\t\treturn put(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)), unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)))\n\t\t})\n\t}\n")
+	} else if isColdSerializableEntity(spec.table) {
+		b.WriteString("\tif c.cold != nil {\n\t\treturn recoverColdParallel(ctx, conn, recoveryBucketCount, c.cold, run, func(v ")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString(", put func(key, val []byte) error) error {\n\t\t\tk := New")
+		b.WriteString(spec.keyType)
+		b.WriteString("(v)\n\t\t\treturn put(unsafe.Slice((*byte)(unsafe.Pointer(&k)), unsafe.Sizeof(k)), marshalCold")
+		b.WriteString(spec.table.GoTypeName)
+		b.WriteString("(v))\n\t\t})\n\t}\n")
 	}
 	b.WriteString("\tfor bucket := 0; bucket < recoveryBucketCount; bucket++ {\n\t\tif err := run(ctx, conn, bucket, c.Set); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n\n")
 }
@@ -773,6 +926,14 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	b.WriteString("\t// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,\n")
 	b.WriteString("\t// so the lazy state Get skips the ClickHouse point-SELECT entirely.\n")
 	b.WriteString("\tcoldAuthoritative bool\n")
+	b.WriteString("\t// prefetchEnabled turns on the two-pass batch prefetch (--prefetch): each\n")
+	b.WriteString("\t// block is dispatched once in recordMode to collect the read-set, resolved in\n")
+	b.WriteString("\t// one round-trip per entity, then dispatched again for real against a warm cache.\n")
+	b.WriteString("\tprefetchEnabled bool\n")
+	b.WriteString("\t// recordMode is set for the duration of a prefetch dry-run pass. While set,\n")
+	b.WriteString("\t// the lazy state Get queues misses instead of resolving them synchronously,\n")
+	b.WriteString("\t// and Save is suppressed (the dry run has no committed side effects).\n")
+	b.WriteString("\trecordMode bool\n")
 	b.WriteString("}\n\n")
 
 	b.WriteString("func NewHotState(capacity uint64) *HotState {\n\tif capacity == 0 {\n\t\tcapacity = DefaultClockCacheCapacity\n\t}\n")
@@ -872,6 +1033,31 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 	}
 	b.WriteString("\treturn nil\n}\n\n")
 
+	// Prefetch (--prefetch) plumbing. EnablePrefetch turns on the two-pass batch
+	// prefetch; SetRecordMode brackets the dry-run pass; ResolveAllPending drains
+	// every entity resolver's queued misses in one round-trip each. Default-off:
+	// callers that never enable it get byte-for-byte the prior lazy behaviour.
+	b.WriteString("func (s *HotState) EnablePrefetch(enabled bool) {\n\tif s != nil {\n\t\ts.prefetchEnabled = enabled\n\t}\n}\n\n")
+	b.WriteString("func (s *HotState) PrefetchEnabled() bool {\n\treturn s != nil && s.prefetchEnabled\n}\n\n")
+	b.WriteString("func (s *HotState) SetRecordMode(on bool) {\n\tif s != nil {\n\t\ts.recordMode = on\n\t}\n}\n\n")
+	b.WriteString("func (s *HotState) RecordMode() bool {\n\treturn s != nil && s.recordMode\n}\n\n")
+
+	// ResolveAllPending flushes every resolver's queued misses to ClickHouse in a
+	// single round-trip per entity (vs the lazy path's one round-trip per missing
+	// key). A resolver with no queued misses early-returns, so this is cheap when a
+	// block touched only a subset of entities.
+	b.WriteString("func (s *HotState) ResolveAllPending(ctx context.Context, conn *ch.Client, db string) error {\n")
+	b.WriteString("\tif s == nil || conn == nil {\n\t\treturn nil\n\t}\n")
+	for _, spec := range specs {
+		if spec.table.IsEvent {
+			continue
+		}
+		b.WriteString("\tif err := s.")
+		b.WriteString(spec.baseName)
+		b.WriteString("Resolver.Resolve(ctx, conn, db); err != nil {\n\t\treturn err\n\t}\n")
+	}
+	b.WriteString("\treturn nil\n}\n\n")
+
 	// Generate Update methods
 	for _, spec := range specs {
 		if spec.table.IsEvent {
@@ -937,6 +1123,9 @@ func renderHotStateType(b *bytes.Buffer, specs []hotStateSpec) {
 		b.WriteString(")\n")
 		b.WriteString("\t}\n")
 	}
+	// Drain the async-insert queue so the next read-back sees these rows (no-op
+	// unless SQD_ASYNC_INSERT_FLUSH is set; see flushAsyncInserts).
+	b.WriteString("\tif err := flushAsyncInserts(ctx, conn); err != nil {\n\t\treturn err\n\t}\n")
 	b.WriteString("\treturn nil\n}\n")
 
 	// Generate Restore methods for journal rollback
@@ -978,7 +1167,36 @@ func renderHotStateHelpers(b *bytes.Buffer, tables []customTableSpec, events []e
 	// + next []int32 chain), so the GC scans two flat integer slices instead of the
 	// millions of boxed interface objects a sync.Map[key]idx allocated.
 	b.WriteString(`
-func clockHash64(seed uint64, b []byte) uint64 {
+// BatchResolverMetrics are cumulative until SnapshotAndResetMetrics is called.
+// Resolver access follows the processor's single-owner state contract.
+type BatchResolverMetrics struct {
+	HotHits      uint64
+	ColdHits     uint64
+	DBFallbacks  uint64
+	QueuedMisses uint64
+	UniqueMisses uint64
+	RoundTrips   uint64
+	ResolveNanos uint64
+}
+
+func clockHashWord(seed, word uint64) uint64 {
+	return (seed ^ word) * 1099511628211
+}
+
+func clockHash20(seed uint64, b []byte) uint64 {
+	h := clockHashWord(seed, binary.LittleEndian.Uint64(b[0:8]))
+	h = clockHashWord(h, binary.LittleEndian.Uint64(b[8:16]))
+	return clockHashWord(h, uint64(binary.LittleEndian.Uint32(b[16:20])))
+}
+
+func clockHash32(seed uint64, b []byte) uint64 {
+	h := clockHashWord(seed, binary.LittleEndian.Uint64(b[0:8]))
+	h = clockHashWord(h, binary.LittleEndian.Uint64(b[8:16]))
+	h = clockHashWord(h, binary.LittleEndian.Uint64(b[16:24]))
+	return clockHashWord(h, binary.LittleEndian.Uint64(b[24:32]))
+}
+
+func clockHashBytes(seed uint64, b []byte) uint64 {
 	h := seed
 	for _, x := range b {
 		h ^= uint64(x)
@@ -1491,6 +1709,15 @@ func customTablesUseType(tables []customTableSpec, typ string) bool {
 	return false
 }
 
+// notFlatType reports whether a Go type string carries a pointer/slice/map/string
+// (or time.Time), disqualifying it from the zero-transformation unsafe memcpy used
+// by the pointer-free cold path, and (for keys) from the cold tier entirely.
+func notFlatType(t string) bool {
+	return strings.HasPrefix(t, "[]") || strings.HasPrefix(t, "*") ||
+		strings.HasPrefix(t, "map[") || strings.Contains(t, "string") ||
+		t == "time.Time"
+}
+
 // isPointerFreeEntity reports whether the entity's in-memory value AND key are
 // free of pointers/slices/strings, so they can be stored in the Pebble cold tier
 // as raw bytes via unsafe memcpy (zero-transformation). Slice-bearing entities
@@ -1498,29 +1725,63 @@ func customTablesUseType(tables []customTableSpec, typ string) bool {
 // and keep the ClickHouse-fallback lazy-load path. Note: memoryGoType maps
 // time.Time -> int64 for non-event entities, so timestamps don't disqualify them.
 func isPointerFreeEntity(table customTableSpec) bool {
-	notFlat := func(t string) bool {
-		return strings.HasPrefix(t, "[]") || strings.HasPrefix(t, "*") ||
-			strings.HasPrefix(t, "map[") || strings.Contains(t, "string") ||
-			t == "time.Time"
-	}
 	for _, field := range table.Fields {
-		if notFlat(memoryGoType(field, table.IsEvent)) {
+		if notFlatType(memoryGoType(field, table.IsEvent)) {
 			return false
 		}
 	}
 	for _, field := range table.keyFields() {
-		if notFlat(field.Type) {
+		if notFlatType(field.Type) {
 			return false
 		}
 	}
 	return true
 }
 
-// entityUsesCold reports whether a (non-event, pointer-free) entity participates
-// in the Pebble cold tier. Events are append-only (no lazy Get-by-key), so they
-// never need it.
+// coldFieldEncodable reports whether a field's (memory-resolved) Go type can be
+// encoded by the generated binary cold codec: fixed scalars, fixed-size byte
+// arrays (common.Hash/common.Address/uint256.Int), and slices whose elements are
+// fixed-size byte arrays. Strings, decimals, maps and structs are NOT encodable —
+// an entity with such a field stays on the ClickHouse-fallback lazy-load path.
+func coldFieldEncodable(field customFieldSpec, isEvent bool) bool {
+	switch memoryGoType(field, isEvent) {
+	case "bool", "uint8", "int8", "uint16", "int16", "uint32", "int32",
+		"uint", "int", "uint64", "int64":
+		return true
+	case "common.Hash", "common.Address", "uint256.Int":
+		return true
+	case "[]common.Hash", "[]uint256.Int", "[]common.Address":
+		return true
+	}
+	return false
+}
+
+// isColdSerializableEntity reports whether a pointer-BEARING entity can still use
+// the Pebble cold tier via a generated marshal/unmarshal codec (its only pointers
+// are slices of fixed-size elements). The key must be pointer-free because cold
+// keys are always encoded via unsafe memcpy; values are encoded field-by-field.
+// This lets slice-bearing entities (Condition's []uint256.Int payouts, Market's
+// []common.Hash question_ids) avoid the per-miss ClickHouse SELECT storm.
+func isColdSerializableEntity(table customTableSpec) bool {
+	for _, field := range table.keyFields() {
+		if notFlatType(field.Type) {
+			return false
+		}
+	}
+	for _, field := range table.Fields {
+		if !coldFieldEncodable(field, table.IsEvent) {
+			return false
+		}
+	}
+	return true
+}
+
+// entityUsesCold reports whether a (non-event) entity participates in the Pebble
+// cold tier — either as a pointer-free value (raw-bytes memcpy) or a serializable
+// one (binary codec). Events are append-only (no lazy Get-by-key), so they never
+// need it.
 func entityUsesCold(table customTableSpec) bool {
-	return !table.IsEvent && isPointerFreeEntity(table)
+	return !table.IsEvent && (isPointerFreeEntity(table) || isColdSerializableEntity(table))
 }
 
 // customTablesUseColdCache reports whether any entity can use the cold tier;
@@ -1532,6 +1793,181 @@ func customTablesUseColdCache(tables []customTableSpec) bool {
 		}
 	}
 	return false
+}
+
+// coldFixedWidth returns the on-wire byte width of a fixed-size resolved Go type
+// (scalar or [N]byte array), or 0 for slices (variable length). Used to size
+// decode bounds checks and the slice-element sanity cap.
+func coldFixedWidth(goType string) int {
+	switch goType {
+	case "bool", "uint8", "int8":
+		return 1
+	case "uint16", "int16":
+		return 2
+	case "uint32", "int32":
+		return 4
+	case "uint", "int", "uint64", "int64":
+		return 8
+	case "common.Hash":
+		return 32
+	case "common.Address":
+		return 20
+	case "uint256.Int":
+		return 32
+	}
+	return 0
+}
+
+// coldSliceElem maps a slice element type to its resolved Go element type for the
+// types the cold codec supports ([]common.Hash, []uint256.Int, []common.Address).
+// Returns ("", false) for unsupported element types.
+func coldSliceElem(goType string) (string, bool) {
+	switch goType {
+	case "[]common.Hash":
+		return "common.Hash", true
+	case "[]uint256.Int":
+		return "uint256.Int", true
+	case "[]common.Address":
+		return "common.Address", true
+	}
+	return "", false
+}
+
+// coldEncodeExpr returns a Go statement that appends the encoding of expression
+// `e` (of resolved Go type `t`) to the []byte `b`. Only valid for fixed types.
+func coldEncodeExpr(e, t string) string {
+	switch t {
+	case "bool":
+		return "if " + e + " { b = append(b, 1) } else { b = append(b, 0) }"
+	case "uint8", "int8":
+		return "b = append(b, byte(" + e + "))"
+	case "uint16", "int16":
+		return "b = binary.LittleEndian.AppendUint16(b, uint16(" + e + "))"
+	case "uint32", "int32":
+		return "b = binary.LittleEndian.AppendUint32(b, uint32(" + e + "))"
+	case "uint", "int", "uint64", "int64":
+		return "b = binary.LittleEndian.AppendUint64(b, uint64(" + e + "))"
+	case "common.Hash", "common.Address":
+		return "b = append(b, " + e + "[:]...)"
+	case "uint256.Int":
+		return "{ _x := " + e + ".Bytes32(); b = append(b, _x[:]...) }"
+	}
+	return ""
+}
+
+// coldDecodeAssign returns Go statements that read one value of resolved Go type
+// `t` from data[off:] into the lvalue `dst`, advancing off, with a bounds guard
+// that returns (zero, false) on truncation. Only valid for fixed types.
+func coldDecodeAssign(dst, t string) []string {
+	w := coldFixedWidth(t)
+	switch t {
+	case "bool":
+		return []string{"if off+1 > len(data) { return v, false }", dst + " = data[off] != 0", "off++"}
+	case "uint8":
+		return []string{"if off+1 > len(data) { return v, false }", dst + " = uint8(data[off])", "off++"}
+	case "int8":
+		return []string{"if off+1 > len(data) { return v, false }", dst + " = int8(data[off])", "off++"}
+	case "uint16":
+		return []string{"if off+2 > len(data) { return v, false }", dst + " = binary.LittleEndian.Uint16(data[off:])", "off += 2"}
+	case "int16":
+		return []string{"if off+2 > len(data) { return v, false }", dst + " = int16(binary.LittleEndian.Uint16(data[off:]))", "off += 2"}
+	case "uint32":
+		return []string{"if off+4 > len(data) { return v, false }", dst + " = binary.LittleEndian.Uint32(data[off:])", "off += 4"}
+	case "int32":
+		return []string{"if off+4 > len(data) { return v, false }", dst + " = int32(binary.LittleEndian.Uint32(data[off:]))", "off += 4"}
+	case "uint", "uint64":
+		return []string{"if off+8 > len(data) { return v, false }", dst + " = binary.LittleEndian.Uint64(data[off:])", "off += 8"}
+	case "int", "int64":
+		return []string{"if off+8 > len(data) { return v, false }", dst + " = int64(binary.LittleEndian.Uint64(data[off:]))", "off += 8"}
+	case "common.Hash", "common.Address":
+		return []string{
+			fmt.Sprintf("if off+%d > len(data) { return v, false }", w),
+			fmt.Sprintf("copy(%s[:], data[off:off+%d])", dst, w),
+			fmt.Sprintf("off += %d", w),
+		}
+	case "uint256.Int":
+		return []string{"if off+32 > len(data) { return v, false }", dst + ".SetBytes32(data[off:off+32])", "off += 32"}
+	}
+	return nil
+}
+
+// renderColdCodec emits marshalCold<T>/unmarshalCold<T> for a serializable
+// (pointer-bearing) entity: a compact, deterministic binary encoding (LE
+// scalars, raw bytes for Hash/Address/uint256, uvarint-length-prefixed slices,
+// Tombstone trailer). Used by the spill/Get/Recover cold paths in place of the
+// unsafe memcpy used by pointer-free entities.
+func renderColdCodec(b *bytes.Buffer, spec hotStateSpec) {
+	t := spec.table.GoTypeName
+	b.WriteString("func marshalCold")
+	b.WriteString(t)
+	b.WriteString("(v ")
+	b.WriteString(t)
+	b.WriteString(") []byte {\n")
+	b.WriteString("\tb := make([]byte, 0, 128)\n")
+	for _, field := range spec.table.Fields {
+		gt := memoryGoType(field, spec.table.IsEvent)
+		if elem, ok := coldSliceElem(gt); ok {
+			b.WriteString("\tb = binary.AppendUvarint(b, uint64(len(v.")
+			b.WriteString(field.Name)
+			b.WriteString(")))\n")
+			b.WriteString("\tfor i := range v.")
+			b.WriteString(field.Name)
+			b.WriteString(" {\n\t\t")
+			b.WriteString(coldEncodeExpr("v."+field.Name+"[i]", elem))
+			b.WriteString("\n\t}\n")
+			continue
+		}
+		b.WriteString("\t")
+		b.WriteString(coldEncodeExpr("v."+field.Name, gt))
+		b.WriteString("\n")
+	}
+	b.WriteString("\tif v.Tombstone { b = append(b, 1) } else { b = append(b, 0) }\n")
+	b.WriteString("\treturn b\n}\n\n")
+
+	b.WriteString("func unmarshalCold")
+	b.WriteString(t)
+	b.WriteString("(data []byte) (")
+	b.WriteString(t)
+	b.WriteString(", bool) {\n")
+	b.WriteString("\tv, off := ")
+	b.WriteString(t)
+	b.WriteString("{}, 0\n")
+	for _, field := range spec.table.Fields {
+		gt := memoryGoType(field, spec.table.IsEvent)
+		if elem, ok := coldSliceElem(gt); ok {
+			w := coldFixedWidth(elem)
+			b.WriteString("\t{\n")
+			b.WriteString("\t\tif off > len(data) { return v, false }\n")
+			b.WriteString("\t\tn, sz := binary.Uvarint(data[off:])\n")
+			b.WriteString("\t\tif sz <= 0 { return v, false }\n")
+			b.WriteString("\t\toff += sz\n")
+			fmt.Fprintf(b, "\t\tif n > uint64(len(data)-off)/%d { return v, false }\n", w)
+			b.WriteString("\t\tv.")
+			b.WriteString(field.Name)
+			b.WriteString(" = make([]")
+			b.WriteString(elem)
+			b.WriteString(", n)\n")
+			b.WriteString("\t\tfor i := range v.")
+			b.WriteString(field.Name)
+			b.WriteString(" {\n")
+			for _, line := range coldDecodeAssign("v."+field.Name+"[i]", elem) {
+				b.WriteString("\t\t\t")
+				b.WriteString(line)
+				b.WriteString("\n")
+			}
+			b.WriteString("\t\t}\n")
+			b.WriteString("\t}\n")
+			continue
+		}
+		for _, line := range coldDecodeAssign("v."+field.Name, gt) {
+			b.WriteString("\t")
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\tif off+1 > len(data) { return v, false }\n")
+	b.WriteString("\tv.Tombstone = data[off] != 0\n")
+	b.WriteString("\treturn v, true\n}\n\n")
 }
 
 func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
@@ -1546,7 +1982,18 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(cacheType)
 	b.WriteString("\n\tmisses []")
 	b.WriteString(keyType)
-	b.WriteString("\n}\n\n")
+	// C4: per-Resolve scratch reused across blocks (cleared, not reallocated).
+	// The resolver is single-owner (consumer goroutine; see GEN-003B), so no
+	// synchronization is needed on these.
+	b.WriteString("\n\tuniqueKeys map[")
+	b.WriteString(keyType)
+	b.WriteString("]struct{}")
+	b.WriteString("\n\tuniqueList []")
+	b.WriteString(keyType)
+	b.WriteString("\n\tfoundKeys map[")
+	b.WriteString(keyType)
+	b.WriteString("]struct{}")
+	b.WriteString("\n\tmetricsEnabled bool\n\tmetrics BatchResolverMetrics\n}\n\n")
 
 	b.WriteString("func New")
 	b.WriteString(resolverType)
@@ -1560,32 +2007,72 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
+	b.WriteString(") Lookup(key ")
+	b.WriteString(keyType)
+	b.WriteString(") (")
+	b.WriteString(valueType)
+	b.WriteString(", bool) {\n")
+	b.WriteString("\treturn r.cache.Get(key)\n}\n\n")
+
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
 	b.WriteString(") Queue(key ")
 	b.WriteString(keyType)
-	b.WriteString(") {\n\tif _, ok := r.cache.Get(key); !ok {\n\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
+	b.WriteString(") {\n\tif _, ok := r.Lookup(key); !ok {\n")
+	b.WriteString("\t\tif r.metricsEnabled {\n\t\t\tr.metrics.QueuedMisses++\n\t\t}\n")
+	b.WriteString("\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
 
 	b.WriteString("// Pending reports how many missed keys are queued for the next Resolve.\n")
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
 	b.WriteString(") Pending() int {\n\treturn len(r.misses)\n}\n\n")
 
+	b.WriteString("// EnableMetrics toggles resolver counters for a bounded observation interval.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") EnableMetrics(enabled bool) {\n")
+	b.WriteString("\tr.metricsEnabled = enabled\n")
+	b.WriteString("\tif enabled {\n\t\tr.cache.metrics = &r.metrics\n\t} else {\n\t\tr.cache.metrics = nil\n\t}\n")
+	b.WriteString("}\n\n")
+
+	b.WriteString("// MetricsEnabled reports whether resolver counters are active.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") MetricsEnabled() bool {\n\treturn r.metricsEnabled\n}\n\n")
+
+	b.WriteString("// Metrics returns cumulative single-owner resolver counters.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") Metrics() BatchResolverMetrics {\n\treturn r.metrics\n}\n\n")
+
+	b.WriteString("// SnapshotAndResetMetrics returns the current counters and starts a new interval.\n")
+	b.WriteString("func (r *")
+	b.WriteString(resolverType)
+	b.WriteString(") SnapshotAndResetMetrics() BatchResolverMetrics {\n")
+	b.WriteString("\tmetrics := r.metrics\n\tr.metrics = BatchResolverMetrics{}\n\treturn metrics\n}\n\n")
+
 	b.WriteString("func (r *")
 	b.WriteString(resolverType)
 	b.WriteString(") Resolve(ctx context.Context, conn *ch.Client, db string) error {\n")
 	b.WriteString("\tif len(r.misses) == 0 {\n\t\treturn nil\n\t}\n\n")
-	b.WriteString("\tuniqueKeys := make(map[")
+	b.WriteString("\tif r.uniqueKeys == nil {\n\t\tr.uniqueKeys = make(map[")
 	b.WriteString(keyType)
-	b.WriteString("]struct{})\n")
-	b.WriteString("\tvar uniqueList []")
-	b.WriteString(keyType)
-	b.WriteString("\n\tfor _, key := range r.misses {\n")
-	b.WriteString("\t\tif _, ok := uniqueKeys[key]; !ok {\n")
-	b.WriteString("\t\t\tuniqueKeys[key] = struct{}{}\n")
+	b.WriteString("]struct{})\n\t}\n")
+	b.WriteString("\tclear(r.uniqueKeys)\n")
+	b.WriteString("\tuniqueList := r.uniqueList[:0]\n")
+	b.WriteString("\tfor _, key := range r.misses {\n")
+	b.WriteString("\t\tif _, ok := r.uniqueKeys[key]; !ok {\n")
+	b.WriteString("\t\t\tr.uniqueKeys[key] = struct{}{}\n")
 	b.WriteString("\t\t\tuniqueList = append(uniqueList, key)\n")
 	b.WriteString("\t\t}\n")
 	b.WriteString("\t}\n")
-	b.WriteString("\tr.misses = nil\n\n")
+	b.WriteString("\tr.uniqueList = uniqueList\n")
+	b.WriteString("\tr.misses = r.misses[:0]\n\n")
 	b.WriteString("\tif len(uniqueList) == 0 {\n\t\treturn nil\n\t}\n\n")
+	b.WriteString("\tif r.metricsEnabled {\n")
+	b.WriteString("\t\tr.metrics.UniqueMisses += uint64(len(uniqueList))\n")
+	b.WriteString("\t\tr.metrics.DBFallbacks += uint64(len(uniqueList))\n")
+	b.WriteString("\t}\n\n")
 
 	keyFields := spec.table.keyFields()
 	if len(keyFields) > 1 {
@@ -1659,9 +2146,11 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	}
 	b.WriteString("\t}\n")
 
-	b.WriteString("\tfoundKeys := make(map[")
+	b.WriteString("\tif r.foundKeys == nil {\n\t\tr.foundKeys = make(map[")
 	b.WriteString(keyType)
-	b.WriteString("]struct{})\n")
+	b.WriteString("]struct{})\n\t}\n")
+	b.WriteString("\tclear(r.foundKeys)\n")
+	b.WriteString("\tfoundKeys := r.foundKeys\n")
 	b.WriteString("\tq := ch.Query{\n")
 	b.WriteString("\t\tBody:   queryStr,\n")
 	b.WriteString("\t\tResult: results,\n")
@@ -1709,7 +2198,11 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString("\t\t\treturn nil\n")
 	b.WriteString("\t\t},\n")
 	b.WriteString("\t}\n")
-	b.WriteString("\tif err := conn.Do(ctx, q); err != nil {\n\t\treturn err\n\t}\n")
+	b.WriteString("\tvar resolveStart time.Time\n")
+	b.WriteString("\tif r.metricsEnabled {\n\t\tr.metrics.RoundTrips++\n\t\tresolveStart = time.Now()\n\t}\n")
+	b.WriteString("\terr := conn.Do(ctx, q)\n")
+	b.WriteString("\tif r.metricsEnabled {\n\t\tr.metrics.ResolveNanos += uint64(time.Since(resolveStart))\n\t}\n")
+	b.WriteString("\tif err != nil {\n\t\treturn err\n\t}\n")
 	b.WriteString("\tfor _, key := range uniqueList {\n")
 	b.WriteString("\t\tif _, found := foundKeys[key]; !found {\n")
 	b.WriteString("\t\t\ttombstone := ")

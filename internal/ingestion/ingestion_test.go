@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"strconv"
@@ -11,10 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/franz101/sqd-go/abiunpack"
 	"github.com/franz101/sqd-go/internal/client"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/parser"
-	"github.com/franz101/sqd-go/abiunpack"
+	"github.com/holiman/uint256"
 )
 
 func TestNextRequestRangeCursorCapsToLocalEnd(t *testing.T) {
@@ -150,6 +152,79 @@ func TestPrintProfilePrintsWithoutParseIterations(t *testing.T) {
 	}
 }
 
+func TestProfileTotalsDelta(t *testing.T) {
+	previous := profileTotals{
+		fetch:                10 * time.Millisecond,
+		parse:                20 * time.Millisecond,
+		decode:               5 * time.Millisecond,
+		marshal:              3 * time.Millisecond,
+		insert:               7 * time.Millisecond,
+		custom:               11 * time.Millisecond,
+		consumerWait:         13 * time.Millisecond,
+		producerBackpressure: 17 * time.Millisecond,
+		iterations:           4,
+	}
+	current := profileTotals{
+		fetch:                14 * time.Millisecond,
+		parse:                29 * time.Millisecond,
+		decode:               8 * time.Millisecond,
+		marshal:              5 * time.Millisecond,
+		insert:               12 * time.Millisecond,
+		custom:               18 * time.Millisecond,
+		consumerWait:         15 * time.Millisecond,
+		producerBackpressure: 23 * time.Millisecond,
+		iterations:           7,
+	}
+
+	got := current.delta(previous)
+	want := profileTotals{
+		fetch:                4 * time.Millisecond,
+		parse:                9 * time.Millisecond,
+		decode:               3 * time.Millisecond,
+		marshal:              2 * time.Millisecond,
+		insert:               5 * time.Millisecond,
+		custom:               7 * time.Millisecond,
+		consumerWait:         2 * time.Millisecond,
+		producerBackpressure: 6 * time.Millisecond,
+		iterations:           3,
+	}
+	if got != want {
+		t.Fatalf("delta = %+v, want %+v", got, want)
+	}
+
+	if got := previous.delta(current); got != (profileTotals{}) {
+		t.Fatalf("counter reset delta = %+v, want zero", got)
+	}
+}
+
+func TestProcessorProfileDelta(t *testing.T) {
+	previous := ProcessorProfile{
+		ConditionResolveDuration: 5 * time.Millisecond,
+		ConditionRoundTrips:      7,
+		FPMMResolveDuration:      11 * time.Millisecond,
+		FPMMRoundTrips:           13,
+	}
+	current := ProcessorProfile{
+		ConditionResolveDuration: 17 * time.Millisecond,
+		ConditionRoundTrips:      10,
+		FPMMResolveDuration:      30 * time.Millisecond,
+		FPMMRoundTrips:           18,
+	}
+	want := ProcessorProfile{
+		ConditionResolveDuration: 12 * time.Millisecond,
+		ConditionRoundTrips:      3,
+		FPMMResolveDuration:      19 * time.Millisecond,
+		FPMMRoundTrips:           5,
+	}
+
+	if got := current.Delta(previous); got != want {
+		t.Fatalf("delta = %+v, want %+v", got, want)
+	}
+	if got := previous.Delta(current); got != (ProcessorProfile{}) {
+		t.Fatalf("counter reset delta = %+v, want zero", got)
+	}
+}
+
 func TestFastJSONLParserRetainedStringsSurviveParserReuse(t *testing.T) {
 	p := parser.NewFastJSONLParser(2)
 
@@ -185,6 +260,30 @@ func TestFastJSONLParserRetainedStringsSurviveParserReuse(t *testing.T) {
 	}
 }
 
+func TestRetainReplayJSONLPageOwnsResponseBytes(t *testing.T) {
+	response := []byte("{\"header\":{\"number\":1}}\n{\"header\":{\"number\":2}}\n")
+	retained := retainReplayJSONLPage(response)
+
+	var lines [][]byte
+	p := parser.NewFastJSONLParser(2)
+	if err := p.ParseWithLine(retained, func(_ *parser.Block, rawLine []byte) error {
+		lines = append(lines, rawLine)
+		return nil
+	}); err != nil {
+		t.Fatalf("parse retained page: %v", err)
+	}
+
+	for i := range response {
+		response[i] = 'x'
+	}
+	if got, want := string(lines[0]), `{"header":{"number":1}}`; got != want {
+		t.Fatalf("first retained line changed after source reuse: got %q, want %q", got, want)
+	}
+	if got, want := string(lines[1]), `{"header":{"number":2}}`; got != want {
+		t.Fatalf("second retained line changed after source reuse: got %q, want %q", got, want)
+	}
+}
+
 func TestIngestionDecodeScratchDoesNotCorruptSecondLogData(t *testing.T) {
 	contracts := []config.ChainContractConfig{{
 		Name:    "Scratch",
@@ -215,7 +314,19 @@ func TestIngestionDecodeScratchDoesNotCorruptSecondLogData(t *testing.T) {
 			if err != nil {
 				t.Fatalf("decode log %d: %v", lg.LogIndex, err)
 			}
-			values = append(values, ev.Params["value"].(string))
+			// Handle both native uint256.Int and normalized string types
+			var valStr string
+			switch v := ev.Params["value"].(type) {
+			case string:
+				valStr = v
+			case *uint256.Int:
+				valStr = v.Dec()
+			case uint256.Int:
+				valStr = v.Dec()
+			default:
+				valStr = fmt.Sprintf("%v", v)
+			}
+			values = append(values, valStr)
 		}
 		return nil
 	}); err != nil {

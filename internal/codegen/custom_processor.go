@@ -263,14 +263,52 @@ func CustomProcessing(ctx context.Context, store Store, entities *Entities) erro
 
 	b.WriteString(`import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/franz101/sqd-go/sqd"
 )
+
+// hexToHash / hexToAddress decode a 0x-prefixed fixed-length hex string straight
+// into the result array, with no intermediate []byte allocation (common.HexToHash
+// and common.HexToAddress allocate via common.FromHex). They fall back to the
+// stdlib helpers for any unexpected length. unsafe.Slice hands hex.Decode a
+// read-only view of the immutable input string, so there is no string->[]byte copy.
+func hexToHash(s string) common.Hash {
+	body := s
+	if len(body) >= 2 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X') {
+		body = body[2:]
+	}
+	if len(body) != 2*common.HashLength {
+		return common.HexToHash(s)
+	}
+	var h common.Hash
+	if _, err := hex.Decode(h[:], unsafe.Slice(unsafe.StringData(body), len(body))); err != nil {
+		return common.HexToHash(s)
+	}
+	return h
+}
+
+func hexToAddress(s string) common.Address {
+	body := s
+	if len(body) >= 2 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X') {
+		body = body[2:]
+	}
+	if len(body) != 2*common.AddressLength {
+		return common.HexToAddress(s)
+	}
+	var a common.Address
+	if _, err := hex.Decode(a[:], unsafe.Slice(unsafe.StringData(body), len(body))); err != nil {
+		return common.HexToAddress(s)
+	}
+	return a
+}
 
 // CustomProcessFn is the callback you register from your project package to
 // run custom business logic on each block. Assign it in an init() function:
@@ -335,8 +373,25 @@ func CustomProcessing(ctx context.Context, store Store, state *State, block *Par
 		return nil
 	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily
-	// (GetUserPosition/GetCondition/...) from durable ClickHouse state.
+
+	// --prefetch: two-pass batch prefetch. Pass 1 dispatches the handler in
+	// recordMode to collect the block's read-set (every state Get queues its missing
+	// key instead of resolving it one-by-one; Save is suppressed so the dry run has
+	// no side effects), then resolves all queued keys in a single round-trip per
+	// entity. Pass 2 (below) runs for real against the now-warm cache. This collapses
+	// the lazy path's one-SELECT-per-missing-key into one SELECT per entity per block.
+	// Opt-in (EnablePrefetch); any key the dry run misses still falls back to lazy.
+	if CustomProcessFn != nil && state.HotState != nil && state.HotState.prefetchEnabled && store != nil && store.Conn() != nil {
+		state.HotState.recordMode = true
+		err := CustomProcessFn(state, block)
+		state.HotState.recordMode = false
+		if err != nil {
+			return err
+		}
+		if err := state.HotState.ResolveAllPending(ctx, store.Conn(), store.DB()); err != nil {
+			return err
+		}
+	}
 
 	// Process block
 	if CustomProcessFn != nil {
@@ -354,7 +409,21 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 		return nil
 	}
 	state.Store = store
-	// Prefetch intentionally disabled: hot-state misses are resolved lazily.
+
+	// --prefetch: two-pass batch prefetch (see CustomProcessing for the rationale).
+	// Pass 1 collects the read-set in recordMode and batch-resolves it; pass 2 below
+	// applies for real against the warm cache. Opt-in; lazy fallback otherwise.
+	if CustomProcessProtoFn != nil && state.HotState != nil && state.HotState.prefetchEnabled && store != nil && store.Conn() != nil {
+		state.HotState.recordMode = true
+		err := CustomProcessProtoFn(state, block)
+		state.HotState.recordMode = false
+		if err != nil {
+			return err
+		}
+		if err := state.HotState.ResolveAllPending(ctx, store.Conn(), store.DB()); err != nil {
+			return err
+		}
+	}
 
 	if CustomProcessProtoFn != nil {
 		if err := CustomProcessProtoFn(state, block); err != nil {
@@ -366,6 +435,9 @@ func CustomProcessingProto(ctx context.Context, store Store, state *State, block
 }
 
 func commitCustomProcessing(ctx context.Context, store Store, state *State, blockNumber uint64) error {
+	if err := state.PollCommit(); err != nil {
+		return fmt.Errorf("async state commit: %w", err)
+	}
 	// Hybrid commit cadence. Commit when EITHER bound is hit, whichever first:
 	//   - maxBlocks (SQD_COMMIT_INTERVAL, default 5000): the crash re-fetch budget.
 	//     Bounds how many blocks a crash must re-fetch+re-process from the durable
@@ -386,6 +458,8 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 	if envVal := os.Getenv("SQD_COMMIT_MAX_INTERVAL"); envVal != "" {
 		if parsed, err := time.ParseDuration(envVal); err == nil && parsed > 0 {
 			maxInterval = parsed
+		} else if seconds, err := strconv.ParseUint(envVal, 10, 64); err == nil && seconds > 0 {
+			maxInterval = time.Duration(seconds) * time.Second
 		}
 	}
 
@@ -393,31 +467,27 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 	if state.lastCommitWallNanos == 0 {
 		state.lastCommitWallNanos = nowNanos
 	}
+	pruneInterval := uint64(100000)
+	if envVal := os.Getenv("CLICKHOUSE_PRUNE_INTERVAL"); envVal != "" {
+		parsed, err := strconv.ParseUint(envVal, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid CLICKHOUSE_PRUNE_INTERVAL %q: %w", envVal, err)
+		}
+		pruneInterval = parsed
+	}
+	if state.LastSyncBlock >= state.LastPruneBlock+pruneInterval {
+		if err := CompactionPruneState(ctx, store, state.LastSyncBlock); err != nil {
+			return fmt.Errorf("prune ClickHouse state at block %d: %w", state.LastSyncBlock, err)
+		}
+		state.LastPruneBlock = state.LastSyncBlock
+	}
+
 	blocksElapsed := blockNumber >= state.LastSyncBlock+maxBlocks
 	timeElapsed := time.Duration(nowNanos-state.lastCommitWallNanos) >= maxInterval
-	if blocksElapsed || timeElapsed {
+	if (blocksElapsed || timeElapsed) && !state.CommitInFlight() {
 		state.lastCommitWallNanos = nowNanos
 		state.SaveSnapshot(blockNumber)
-		if err := state.Commit(ctx, store); err != nil {
-			return err
-		}
-
-		pruneInterval := uint64(100000)
-		if envVal := os.Getenv("CLICKHOUSE_PRUNE_INTERVAL"); envVal != "" {
-			parsed, err := strconv.ParseUint(envVal, 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid CLICKHOUSE_PRUNE_INTERVAL %q: %w", envVal, err)
-			}
-			pruneInterval = parsed
-		}
-		if blockNumber >= state.LastPruneBlock+pruneInterval {
-			if err := CompactionPruneState(ctx, store, blockNumber); err != nil {
-				return fmt.Errorf("prune ClickHouse state at block %d: %w", blockNumber, err)
-			}
-			state.LastPruneBlock = blockNumber
-		}
-
-		state.LastSyncBlock = blockNumber
+		state.StartCommit(ctx, store, blockNumber)
 	}
 	return nil
 }
@@ -442,7 +512,12 @@ type Processor struct {
 	protoRing *ProtoRingBuffer
 	State     *State
 	ProtoMode bool
+
+	insertBatches *InsertBatches
+	batchFree     chan *InsertBatches
 }
+
+const insertBatchPoolSize = 4
 
 func NewProcessor(protoMode bool) (*Processor, error) {
 	var ring *OrderedHistoricRingBuffer
@@ -465,6 +540,189 @@ func NewProcessor(protoMode bool) (*Processor, error) {
 		State:     NewState(),
 		ProtoMode: protoMode,
 	}, nil
+}
+
+// ProcessJSONL implements ingestion.FastJSONLProcessor without importing an
+// internal package: sqd.Store is a public alias of the runtime store type.
+// Parsing directly into the generated ring avoids cloning CustomLog strings
+// and decoding those logs again through Process.
+func (p *Processor) ProcessJSONL(ctx context.Context, store *sqd.Store, data []byte) (uint64, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+			if err != nil {
+				return 0, err
+			}
+			p.protoRing = ring
+		}
+		return ParseJSONLProto(data, nil, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	}
+	if p.ring == nil {
+		ring, err := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, err
+		}
+		p.ring = ring
+	}
+	return ParseJSONLV2(data, nil, p.ring, func(block *ParsedBlock) error {
+		return CustomProcessing(ctx, stateStore, p.State, block)
+	})
+}
+
+// ProcessJSONLWithInserts performs the generated decode once for both custom
+// state processing and typed event insertion. The caller must run the returned
+// flush before processing another batch.
+func (p *Processor) ProcessJSONLWithInserts(ctx context.Context, store *sqd.Store, data []byte) (uint64, func(context.Context) error, error) {
+	if p == nil || len(data) == 0 {
+		return 0, nil, nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	if p.insertBatches == nil {
+		p.insertBatches = NewInsertBatches()
+	} else {
+		p.insertBatches.Reset()
+	}
+	batches := p.insertBatches
+
+	var n uint64
+	var err error
+	if p.ProtoMode {
+		if p.protoRing == nil {
+			ring, ringErr := NewProtoRingBuffer(defaultRingBufferSize)
+			if ringErr != nil {
+				return 0, nil, ringErr
+			}
+			p.protoRing = ring
+		}
+		n, err = ParseJSONLProto(data, batches, p.protoRing, func(block *ProtoEventBlock) error {
+			return CustomProcessingProto(ctx, stateStore, p.State, block)
+		})
+	} else {
+		if p.ring == nil {
+			ring, ringErr := NewOrderedHistoricRingBuffer(defaultRingBufferSize)
+			if ringErr != nil {
+				return 0, nil, ringErr
+			}
+			p.ring = ring
+		}
+		n, err = ParseJSONLV2(data, batches, p.ring, func(block *ParsedBlock) error {
+			return CustomProcessing(ctx, stateStore, p.State, block)
+		})
+	}
+	if err != nil || store == nil || store.Conn() == nil {
+		batches.Reset()
+		return n, nil, err
+	}
+	flush := func(flushCtx context.Context) error {
+		defer batches.Reset()
+		return batches.Insert(flushCtx, store.InsertConn(), store.DB())
+	}
+	return n, flush, nil
+}
+
+func (p *Processor) SupportsBatchParse() bool {
+	return p != nil && p.ProtoMode
+}
+
+// ParseBatchForInserts runs the generated parse on the producer and streams
+// ready proto-ring slots to the consumer. A bounded batch pool prevents the
+// producer from outrunning the consumer while allowing the two stages to
+// overlap.
+func (p *Processor) ParseBatchForInserts(store *sqd.Store, data []byte, endBlock uint64, onParsed func(sqd.BatchParsedBlock) error) (uint64, func(context.Context) error, error) {
+	if p == nil || !p.ProtoMode || len(data) == 0 {
+		return 0, nil, nil
+	}
+	if p.protoRing == nil {
+		ring, err := NewProtoRingBuffer(defaultRingBufferSize)
+		if err != nil {
+			return 0, nil, err
+		}
+		p.protoRing = ring
+	}
+	if p.batchFree == nil {
+		p.batchFree = make(chan *InsertBatches, 2*insertBatchPoolSize)
+		for i := 0; i < insertBatchPoolSize; i++ {
+			p.batchFree <- NewInsertBatches()
+		}
+	}
+	batches := <-p.batchFree
+	n, err := ParseJSONLProtoStream(data, batches, p.protoRing, endBlock, func(proto *ProtoEventBlock, number, timestamp uint64, hash string, line []byte) error {
+		if onParsed == nil {
+			return nil
+		}
+		return onParsed(sqd.BatchParsedBlock{
+			Number:    number,
+			Hash:      strings.Clone(hash),
+			Timestamp: time.Unix(int64(timestamp), 0).UTC(),
+			RawLine:   line,
+			Block:     proto,
+		})
+	})
+	if err != nil {
+		batches.Reset()
+		p.batchFree <- batches
+		return n, nil, err
+	}
+	flush := func(flushCtx context.Context) error {
+		defer func() {
+			batches.Reset()
+			p.batchFree <- batches
+		}()
+		if store == nil || store.InsertConn() == nil {
+			return nil
+		}
+		return batches.Insert(flushCtx, store.InsertConn(), store.DB())
+	}
+	return n, flush, nil
+}
+
+func (p *Processor) ProcessParsedBlock(ctx context.Context, store *sqd.Store, block any) error {
+	if p == nil || block == nil {
+		return nil
+	}
+	protoBlock, ok := block.(*ProtoEventBlock)
+	if !ok || protoBlock == nil {
+		return nil
+	}
+	if p.State == nil {
+		p.State = NewState()
+	}
+	var stateStore Store
+	if store != nil {
+		stateStore = store
+	}
+	p.State.Store = stateStore
+	return CustomProcessingProto(ctx, stateStore, p.State, protoBlock)
+}
+
+func (p *Processor) ReclaimParseBatches() {
+	if p == nil || p.batchFree == nil {
+		return
+	}
+	for len(p.batchFree) < insertBatchPoolSize {
+		p.batchFree <- NewInsertBatches()
+	}
 }
 
 func (p *Processor) Process(ctx context.Context, store *sqd.Store, logs []sqd.CustomLog) error {
@@ -518,15 +776,15 @@ func (p *Processor) Process(ctx context.Context, store *sqd.Store, logs []sqd.Cu
 			meta := EventMeta{
 				BlockNumber:      lg.BlockNumber,
 				BlockTimestamp:   lg.BlockTimestamp,
-				BlockHash:        common.HexToHash(lg.BlockHash),
-				ContractAddress:  common.HexToAddress(lg.ContractAddress),
-				TransactionHash:  common.HexToHash(lg.TransactionHash),
+				BlockHash:        hexToHash(lg.BlockHash),
+				ContractAddress:  hexToAddress(lg.ContractAddress),
+				TransactionHash:  hexToHash(lg.TransactionHash),
 				TransactionIndex: lg.TransactionIndex,
 				LogIndex:         lg.LogIndex,
 			}
 			topics := make([]common.Hash, len(lg.Topics))
 			for i, t := range lg.Topics {
-				topics[i] = common.HexToHash(t)
+				topics[i] = hexToHash(t)
 			}
 			curProtoBlock.AppendFromLog(meta.ContractAddress, topics, common.FromHex(lg.Data), meta)
 		}
@@ -565,9 +823,9 @@ func (p *Processor) Process(ctx context.Context, store *sqd.Store, logs []sqd.Cu
 		meta := EventMeta{
 			BlockNumber:      lg.BlockNumber,
 			BlockTimestamp:   lg.BlockTimestamp,
-			BlockHash:        common.HexToHash(lg.BlockHash),
-			ContractAddress:  common.HexToAddress(lg.ContractAddress),
-			TransactionHash:  common.HexToHash(lg.TransactionHash),
+			BlockHash:        hexToHash(lg.BlockHash),
+			ContractAddress:  hexToAddress(lg.ContractAddress),
+			TransactionHash:  hexToHash(lg.TransactionHash),
 			TransactionIndex: lg.TransactionIndex,
 			LogIndex:         lg.LogIndex,
 		}
@@ -614,6 +872,11 @@ func (p *Processor) RestoreToBlock(blockNumber uint64) (uint64, error) {
 	if p == nil {
 		return 0, nil
 	}
+	if p.State != nil {
+		if err := p.State.WaitCommit(context.Background()); err != nil {
+			return p.State.LastSyncBlock, fmt.Errorf("wait for state commit before restore: %w", err)
+		}
+	}
 	if p.ring != nil {
 		p.ring.Reset()
 	}
@@ -650,8 +913,8 @@ func (p *Processor) LoadFromDatabase(ctx context.Context, blockNumber uint64) er
 	return nil
 }
 
-// CommittedBlock returns the highest block whose hot state has been durably
-// committed to ClickHouse (wait_for_async_insert=1). The ingestion checkpoint
+// CommittedBlock returns the highest block whose hot state has passed the
+// generated async-insert durability barrier. The ingestion checkpoint
 // must never lead this horizon, so a crash resumes from durable state and
 // re-fetches the (cheap) gap rather than losing un-committed updates.
 func (p *Processor) CommittedBlock() uint64 {
@@ -670,6 +933,9 @@ func (p *Processor) Flush(ctx context.Context, store *sqd.Store, blockNumber uin
 		return 0, nil
 	}
 	if store != nil {
+		if err := p.State.WaitCommit(ctx); err != nil {
+			return p.State.LastSyncBlock, err
+		}
 		if err := p.State.Commit(ctx, store); err != nil {
 			return p.State.LastSyncBlock, err
 		}
@@ -688,6 +954,20 @@ func (p *Processor) SetSnapshotsEnabled(enabled bool) {
 		return
 	}
 	p.State.SetSnapshotsEnabled(enabled)
+}
+
+// EnablePrefetch turns on the two-pass batch prefetch (--prefetch): each block is
+// dispatched once in recordMode to collect its read-set, resolved in one round-trip
+// per entity, then dispatched again for real against a warm cache. This trades a
+// second (cheap, CPU-only) handler pass for collapsing the lazy path's
+// one-SELECT-per-missing-key into one SELECT per entity per block — a large win when
+// cold misses dominate (resume / cursor mode against a populated ClickHouse).
+// No-op if state is nil. Requires re-runnable handlers (side effects only via Save).
+func (p *Processor) EnablePrefetch(enabled bool) {
+	if p == nil || p.State == nil || p.State.HotState == nil {
+		return
+	}
+	p.State.HotState.EnablePrefetch(enabled)
 }
 
 // EnableColdCache attaches the Pebble cold tier to the hot caches (pointer-free

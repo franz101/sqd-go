@@ -13,15 +13,17 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/franz101/sqd-go/internal/parser"
 	"github.com/franz101/sqd-go/abiunpack"
+	"github.com/franz101/sqd-go/internal/parser"
 	"github.com/holiman/uint256"
 )
 
 // Store wraps a ClickHouse native-protocol connection and the target database name.
 type Store struct {
-	conn *ch.Client
-	db   string
+	conn       *ch.Client
+	insertConn *ch.Client
+	commitConn *ch.Client
+	db         string
 }
 
 // BlockRow is a single row in the blocks table, used during fork tracking.
@@ -69,12 +71,13 @@ type EnsureTablesOptions struct {
 // NewClickHouse connects to ClickHouse via the native protocol, creates the
 // target database if it doesn't exist, and returns a Store.
 func NewClickHouse(ctx context.Context, host string, port int, user, password, db string) (*Store, error) {
-	conn, err := ch.Dial(ctx, ch.Options{
+	opts := ch.Options{
 		Address:  fmt.Sprintf("%s:%d", host, port),
 		Database: "default",
 		User:     user,
 		Password: password,
-	})
+	}
+	conn, err := ch.Dial(ctx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("connect clickhouse: %w", err)
 	}
@@ -82,7 +85,18 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 		conn.Close()
 		return nil, fmt.Errorf("create database %s: %w", db, err)
 	}
-	return &Store{conn: conn, db: db}, nil
+	insertConn, err := ch.Dial(ctx, opts)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("connect clickhouse insert connection: %w", err)
+	}
+	commitConn, err := ch.Dial(ctx, opts)
+	if err != nil {
+		_ = insertConn.Close()
+		conn.Close()
+		return nil, fmt.Errorf("connect clickhouse commit connection: %w", err)
+	}
+	return &Store{conn: conn, insertConn: insertConn, commitConn: commitConn, db: db}, nil
 }
 
 // DropClickHouseDatabase drops the named database (used by --restart).
@@ -101,7 +115,30 @@ func DropClickHouseDatabase(ctx context.Context, host string, port int, user, pa
 }
 
 func (s *Store) Close() error {
+	if s.insertConn != nil {
+		_ = s.insertConn.Close()
+	}
+	if s.commitConn != nil {
+		_ = s.commitConn.Close()
+	}
 	return s.conn.Close()
+}
+
+// InsertConn is dedicated to generated event-batch writes so they can overlap
+// state processing on Conn without concurrent use of one ch.Client.
+func (s *Store) InsertConn() *ch.Client {
+	if s == nil {
+		return nil
+	}
+	return s.insertConn
+}
+
+// CommitConn is dedicated to durable generated state commits.
+func (s *Store) CommitConn() *ch.Client {
+	if s == nil {
+		return nil
+	}
+	return s.commitConn
 }
 
 func (s *Store) Conn() *ch.Client {
@@ -841,7 +878,22 @@ func (s *Store) TruncateAfterBlock(ctx context.Context, chainID, lastBlock uint6
 			return fmt.Errorf("rollback %s: %w", table.Name, err)
 		}
 	}
-	log.Printf("[ROLLBACK] issued lightweight delete for %d table(s) with blocks > %d in %s", len(tables), lastBlock, time.Since(start).Round(time.Millisecond))
+
+	// Delete from sync_state where last_block > lastBlock
+	syncQ := fmt.Sprintf("DELETE FROM %s.sync_state WHERE chain_id = %d AND last_block > %d SETTINGS lightweight_deletes_sync = 1", quoteIdent(s.db), chainID, lastBlock)
+	if rollbackSQL {
+		log.Printf("[ROLLBACK] delete sync_state for blocks > %d: %s", lastBlock, syncQ)
+	}
+	if err := s.conn.Do(ctx, ch.Query{Body: syncQ}); err != nil {
+		return fmt.Errorf("rollback sync_state: %w", err)
+	}
+
+	// No OPTIMIZE TABLE FINAL: the no-duplicates invariant (prune block_number >
+	// lastBlock before re-insert) means a lightweight DELETE leaves every table
+	// correct. OPTIMIZE FINAL rewrites whole tables — the 42 GiB
+	// exchange_order_filled_events optimize alone took 8.5+ min — which is what
+	// made rollback take 9+ minutes. Background merges compact parts async.
+	log.Printf("[ROLLBACK] issued lightweight delete for %d table(s) and sync_state with blocks > %d in %s", len(tables), lastBlock, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -866,6 +918,14 @@ func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint6
 			}
 			if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
 				return fmt.Errorf("rollback %s: %w", table.Name, err)
+			}
+			// Call OPTIMIZE TABLE FINAL
+			optQ := fmt.Sprintf("OPTIMIZE TABLE %s.%s FINAL", quoteIdent(s.db), quoteIdent(table.Name))
+			if rollbackSQL {
+				log.Printf("[ROLLBACK] optimize table %q: %s", table.Name, optQ)
+			}
+			if err := s.conn.Do(ctx, ch.Query{Body: optQ}); err != nil {
+				return fmt.Errorf("optimize %s: %w", table.Name, err)
 			}
 			deleted++
 			continue
@@ -900,9 +960,34 @@ func (s *Store) CollapseAfterBlock(ctx context.Context, chainID, lastBlock uint6
 		if err := s.conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("collapse rollback %s: %w", table.Name, err)
 		}
+		// Call OPTIMIZE TABLE FINAL
+		optQ := fmt.Sprintf("OPTIMIZE TABLE %s.%s FINAL", quoteIdent(s.db), quoteIdent(table.Name))
+		if rollbackSQL {
+			log.Printf("[ROLLBACK] optimize collapsing table %q: %s", table.Name, optQ)
+		}
+		if err := s.conn.Do(ctx, ch.Query{Body: optQ}); err != nil {
+			return fmt.Errorf("optimize collapsing table %s: %w", table.Name, err)
+		}
 		signFlipped++
 	}
-	log.Printf("[ROLLBACK] issued rollback for %d table(s) with blocks > %d in %s (%d sign-flip, %d lightweight delete)", len(tables), lastBlock, time.Since(start).Round(time.Millisecond), signFlipped, deleted)
+
+	// Delete from sync_state where last_block > lastBlock
+	syncQ := fmt.Sprintf("DELETE FROM %s.sync_state WHERE chain_id = %d AND last_block > %d SETTINGS lightweight_deletes_sync = 1", quoteIdent(s.db), chainID, lastBlock)
+	if rollbackSQL {
+		log.Printf("[ROLLBACK] delete sync_state for blocks > %d: %s", lastBlock, syncQ)
+	}
+	if err := s.conn.Do(ctx, ch.Query{Body: syncQ}); err != nil {
+		return fmt.Errorf("rollback sync_state: %w", err)
+	}
+	optSyncQ := fmt.Sprintf("OPTIMIZE TABLE %s.sync_state FINAL", quoteIdent(s.db))
+	if rollbackSQL {
+		log.Printf("[ROLLBACK] optimize sync_state: %s", optSyncQ)
+	}
+	if err := s.conn.Do(ctx, ch.Query{Body: optSyncQ}); err != nil {
+		return fmt.Errorf("optimize sync_state: %w", err)
+	}
+
+	log.Printf("[ROLLBACK] issued rollback and optimize final for %d table(s) and sync_state with blocks > %d in %s (%d sign-flip, %d lightweight delete)", len(tables), lastBlock, time.Since(start).Round(time.Millisecond), signFlipped, deleted)
 	return nil
 }
 

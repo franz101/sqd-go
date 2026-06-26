@@ -204,7 +204,7 @@ package polymarket
 
 import (
     "github.com/ethereum/go-ethereum/common"
-    "github.com/franz101/sqd-go/drafts/protomath"
+    "github.com/franz101/sqd-go/protomath"
     "github.com/holiman/uint256"
 )
 

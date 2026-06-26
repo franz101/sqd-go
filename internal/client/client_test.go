@@ -58,6 +58,38 @@ func TestFetchRawIncludesBoundedToBlock(t *testing.T) {
 	}
 }
 
+func TestFetchIncludesIndexedTopicFilters(t *testing.T) {
+	var got Query
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	c := New(server.URL)
+	defer c.Close()
+	toBlock := uint64(20)
+	filters := []LogFilter{{
+		Topic0: []string{"0xtopic0"},
+		Topic1: []string{"0xtopic1"},
+		Topic2: []string{"0xtopic2"},
+		Topic3: []string{"0xtopic3"},
+	}}
+	if _, err := c.FetchRaw(context.Background(), 10, &toBlock, filters); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Logs) != 1 {
+		t.Fatalf("logs = %#v, want one filter", got.Logs)
+	}
+	if got.Logs[0].Topic1[0] != "0xtopic1" ||
+		got.Logs[0].Topic2[0] != "0xtopic2" ||
+		got.Logs[0].Topic3[0] != "0xtopic3" {
+		t.Fatalf("indexed topics were not preserved: %#v", got.Logs[0])
+	}
+}
+
 func TestFetchWithParentIncludesForkCursorAndAllBlocks(t *testing.T) {
 	var got map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -105,7 +105,9 @@ func (r *OrderedHistoricRingBuffer) resetSlotSlices(slot *ParsedBlock) {
 `)
 
 	for _, ev := range events {
-		buf.WriteString(fmt.Sprintf("\tslot.%ss = slot.%ss[:0]\n", ev.GoTypeName, ev.GoTypeName))
+		// Add capacity guard to prevent unbounded memory growth
+		buf.WriteString(fmt.Sprintf("\tif cap(slot.%ss) > 1024 {\n\t\tslot.%ss = make([]%s, 0, 128)\n\t} else {\n\t\tslot.%ss = slot.%ss[:0]\n\t}\n",
+			ev.GoTypeName, ev.GoTypeName, ev.GoTypeName, ev.GoTypeName, ev.GoTypeName))
 	}
 
 	buf.WriteString(`}

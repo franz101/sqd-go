@@ -48,8 +48,14 @@ func (cfg *Config) ForkMode() ForkMode {
 	return mode
 }
 
+// UsesCollapsingMergeTree reports whether event tables should use
+// CollapsingMergeTree(sign). It always returns false: reingestion prunes
+// block_number > lastBlock before re-inserting, so a given
+// (block_number, log_index) is written exactly once per run and duplicates are
+// impossible. Plain MergeTree is therefore sufficient, which also lets rollback
+// be N lightweight DELETEs (no sign-flip INSERT, no OPTIMIZE TABLE FINAL).
 func (m ForkMode) UsesCollapsingMergeTree() bool {
-	return m == "" || m == ForkModeDefault
+	return false
 }
 
 func (m ForkMode) Valid() bool {

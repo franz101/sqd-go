@@ -20,7 +20,7 @@ import (
 // runDev loads the project, runs codegen, starts docker compose, then runs the
 // ingestion pipeline. On exit it tears down docker compose. Use this for local
 // development where ClickHouse is managed by compose.
-func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool) int {
+func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
@@ -56,13 +56,13 @@ func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, en
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch)
 }
 
 // runStartPipeline loads the project, runs codegen, then starts ingestion.
 // Unlike runDev it does not manage docker compose — the user is responsible for
 // running ClickHouse externally.
-func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool) int {
+func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -77,7 +77,7 @@ func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBl
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch)
 }
 
 func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
@@ -123,7 +123,7 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 // the pipeline falls back to the legacy JSON-decoded path with struct-based
 // event processing. This is useful for debugging or when proto support has not
 // been validated for a new contract.
-func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string, parallelFetch bool) int {
+func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool) int {
 	if protoMode {
 		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
 	}
@@ -160,6 +160,17 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 		}
 	}
 
+	var reindexFrom uint64 = 0
+	if reindexFromStr != "" {
+		if val, err := parseUintFlag("--reindex-from", reindexFromStr, 0); err == nil {
+			reindexFrom = val
+			log.Printf("REINDEX FROM BLOCK %d: will delete all blocks > %d using lightweight DELETE", val, val)
+		} else {
+			fmt.Fprintf(os.Stderr, "invalid --reindex-from value: %v\n", err)
+			return 1
+		}
+	}
+
 	opts := ingestion.Options{
 		ClickHouseHost:     envOrDefault("CLICKHOUSE_HOST", "127.0.0.1"),
 		ClickHousePort:     envOrDefaultInt("CLICKHOUSE_NATIVE_PORT", 9000),
@@ -172,6 +183,11 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 		PageSize:           pageSize,
 		ColdCache:          resolveColdCache(noColdCache, project.Config.ColdCache),
 		ParallelFetch:      parallelFetch,
+		ReindexFrom:        reindexFrom,
+		Prefetch:           prefetch,
+	}
+	if prefetch {
+		log.Printf("PREFETCH ENABLED: two-pass batch read-set prefetch (one ClickHouse SELECT per entity per block instead of one per missing key)")
 	}
 	if parallelFetch {
 		workers, pageBlocks, rps := ingestion.ParallelFetchSettings()
