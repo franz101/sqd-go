@@ -72,12 +72,12 @@ dev-uniswap:
 	go run . dev $(UNISWAP_DIR)
 
 uniswap-fast:
-	SQD_PARSE_DECODE_V2=1 SQD_METRICS_CH=1 SQD_METRICS_CH_INTERVAL=2s SQD_PARALLEL_RPS=5 SQD_PARALLEL_FETCHERS=6 go run . dev $(UNISWAP_DIR) --parallel-fetch --no-replay --restart
+	SQD_PARSE_DECODE_V2=1 SQD_METRICS_CH=1 SQD_METRICS_CH_INTERVAL=2s SQD_PARALLEL_RPS=10 SQD_PARALLEL_FETCHERS=12 go run . dev $(UNISWAP_DIR) --parallel-fetch --no-replay --restart
 
 uniswap-fast-tmux:
 	-tmux kill-session -t sqd-fast 2>/dev/null
 	tmux new-session -d -s sqd-fast
-	tmux send-keys -t sqd-fast "SQD_PARSE_DECODE_V2=1 SQD_METRICS_CH=1 SQD_METRICS_CH_INTERVAL=2s SQD_PARALLEL_RPS=5 SQD_PARALLEL_FETCHERS=6 go run . dev examples/uniswap --parallel-fetch --no-replay" Enter
+	tmux send-keys -t sqd-fast "SQD_PARSE_DECODE_V2=1 SQD_METRICS_CH=1 SQD_METRICS_CH_INTERVAL=2s SQD_PARALLEL_RPS=10 SQD_PARALLEL_FETCHERS=12 go run . dev examples/uniswap --parallel-fetch --no-replay" Enter
 	tmux attach-session -t sqd-fast
 
 restart-uniswap:
