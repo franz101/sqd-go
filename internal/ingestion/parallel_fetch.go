@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -121,25 +122,11 @@ type fetchChunk struct {
 	err         error       // fetch error if any
 }
 
-// parallelPrefetcher fetches a bounded, fully-finalized block range using N
-// concurrent workers (paced by one shared rate limiter) and hands chunks
-// (individual portal responses) to a single consumer in strict ascending
-// block order. It exists because the sequential producer is bound by per-page
-// HTTP round-trip latency to the portal, not by data, so a deep backfill is
-// round-trip bound; running N cursor loops concurrently keeps the portal's
-// request budget saturated.
-//
-// The chunk-based design ensures visible progress immediately: the first
-// successful response becomes available to the consumer without waiting
-// for the entire 10,000-block page to accumulate. Chunks are reordered
-// so the in-order consumer is unaffected by out-of-order completion.
-//
-// Correctness rests on the range being at or below the finalized head: those
-// blocks are immutable, so workers skip the parent-hash fork-detection handshake
-// (parentBlockHash="") and fetch disjoint ranges out of order. The reorder
-// buffer (the ready map + nextEmit) re-serializes them so the in-order consumer
-// is unaffected. With includeAllBlocks=false the chunks are sparse and the
-// consumer skips the empty block-number gaps (see ReplayBuffer.CeilBlock).
+type blockRange struct {
+	from uint64
+	to   uint64
+}
+
 type parallelPrefetcher struct {
 	endpoint         string
 	filters          []client.LogFilter
@@ -151,14 +138,16 @@ type parallelPrefetcher struct {
 	maxAhead         uint64 // bounded look-ahead window, in block numbers
 	limiter          *rateLimiter
 
-	nextClaim atomic.Uint64 // next work range index to claim
+	nextBlock atomic.Uint64 // next fresh block to claim
 
-	mu        sync.Mutex
-	cond      *sync.Cond
-	ready     map[uint64]*fetchChunk
-	nextEmit  uint64 // next expected sequence number (starts at startBlock)
-	stopClaim bool   // an errored chunk was delivered; stop claiming new work
-	doneWG    bool   // all workers have exited
+	mu            sync.Mutex
+	cond          *sync.Cond
+	ready         map[uint64]*fetchChunk
+	nextEmit      uint64 // next expected sequence number (starts at startBlock)
+	stopClaim     bool   // an errored chunk was delivered; stop claiming new work
+	doneWG        bool   // all workers have exited
+	activeWorkers int    // number of workers currently fetching
+	gaps          []blockRange // high-priority gaps
 }
 
 func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeAllBlocks bool, start, end, pageSize uint64, workers int, limiter *rateLimiter) *parallelPrefetcher {
@@ -183,20 +172,20 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 		limiter:          limiter,
 		ready:            make(map[uint64]*fetchChunk),
 	}
+	p.nextBlock.Store(start)
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
 
-// launch starts the worker pool plus two helper goroutines: one flips doneWG once
-// every worker exits, and one broadcasts on cancellation so workers blocked on the
-// look-ahead window and a consumer blocked in Next wake to observe ctx.Err().
 func (p *parallelPrefetcher) launch(ctx context.Context) {
-	// Initialize nextEmit to the start block (sequences are block-based)
 	p.nextEmit = p.startBlock
-
 	var wg sync.WaitGroup
 	for range p.workers {
-		wg.Go(func() { p.worker(ctx) })
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.worker(ctx)
+		}()
 	}
 	go func() {
 		wg.Wait()
@@ -260,6 +249,43 @@ func (p *parallelPrefetcher) Next(ctx context.Context) (*fetchChunk, bool) {
 		p.cond.Wait()
 	}
 }
+func (p *parallelPrefetcher) getWork(ctx context.Context) (blockRange, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for {
+		if ctx.Err() != nil || p.stopClaim {
+			return blockRange{}, false
+		}
+
+		if len(p.gaps) > 0 {
+			gap := p.gaps[0]
+			if gap.from <= p.nextEmit+p.maxAhead {
+				p.gaps = p.gaps[1:]
+				p.activeWorkers++
+				return gap, true
+			}
+		}
+
+		from := p.nextBlock.Load()
+		if from <= p.endBlock {
+			if from <= p.nextEmit+p.maxAhead {
+				to := min(from+p.pageSize-1, p.endBlock)
+				p.nextBlock.Store(to + 1)
+				p.activeWorkers++
+				return blockRange{from: from, to: to}, true
+			}
+		}
+
+		if from > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
+			p.stopClaim = true
+			p.cond.Broadcast()
+			return blockRange{}, false
+		}
+
+		p.cond.Wait()
+	}
+}
 
 func (p *parallelPrefetcher) worker(ctx context.Context) {
 	cl := client.New(p.endpoint)
@@ -267,97 +293,60 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 
 	workerID := rand.Intn(10000) // for debug identification
 	for {
-		if ctx.Err() != nil {
+		r, ok := p.getWork(ctx)
+		if !ok {
 			return
 		}
+
+		if !p.fetchAndDeliverChunks(ctx, cl, r, workerID) {
+			p.mu.Lock()
+			p.activeWorkers--
+			if p.nextBlock.Load() > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
+				p.stopClaim = true
+				p.cond.Broadcast()
+			}
+			p.mu.Unlock()
+			return
+		}
+
 		p.mu.Lock()
-		stop := p.stopClaim
+		p.activeWorkers--
+		if p.nextBlock.Load() > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
+			p.stopClaim = true
+			p.cond.Broadcast()
+		}
 		p.mu.Unlock()
-		if stop {
-			return
-		}
-
-		// Claim the next work range
-		claimIdx := p.nextClaim.Add(1) - 1
-		from := p.startBlock + claimIdx*p.pageSize
-		if from > p.endBlock {
-			return
-		}
-
-		if !p.waitForWindow(ctx, from) {
-			return
-		}
-
-		// Fetch this range and deliver chunks as they arrive
-		if !p.fetchAndDeliverChunks(ctx, cl, from, claimIdx, workerID) {
-			return // fatal error or context cancelled
-		}
 	}
 }
 
-// waitForWindow blocks until the worker is within the look-ahead window.
-func (p *parallelPrefetcher) waitForWindow(ctx context.Context, from uint64) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for {
-		if ctx.Err() != nil || p.stopClaim {
-			return false
-		}
-		if from <= p.nextEmit+p.maxAhead {
-			return true
-		}
-		p.cond.Wait()
-	}
-}
-
-// fetchAndDeliverChunks fetches a work range and delivers each portal response
-// as a separate chunk immediately. Returns false on fatal error.
-func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *client.Client, from uint64, claimIdx uint64, workerID int) bool {
-	cur := from
-	pageEnd := min(from+p.pageSize-1, p.endBlock)
+func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *client.Client, r blockRange, workerID int) bool {
+	cur := r.from
 	attempt := 0
-	chunkIdx := uint64(0) // chunk index within this page
 
-	for cur <= pageEnd {
+	for cur <= r.to {
 		if ctx.Err() != nil {
-			return false
-		}
-		if !p.waitForWindow(ctx, cur) {
 			return false
 		}
 
 		if err := p.limiter.wait(ctx); err != nil {
-			seq := claimIdx*100 + chunkIdx // rough sequence based on page position
-			p.deliverChunk(&fetchChunk{
-				seq:  seq,
-				from: cur,
-				err:  err,
-			})
+			p.deliverChunk(&fetchChunk{seq: cur, from: cur, err: err})
 			return false
 		}
 
-		toPin := pageEnd
+		toPin := r.to
 		resp, err := cl.FetchWithParent(ctx, cur, &toPin, "", p.includeAllBlocks, p.filters)
 		if err != nil {
 			if ctx.Err() != nil {
-				seq := claimIdx*100 + chunkIdx
-				p.deliverChunk(&fetchChunk{
-					seq:  seq,
-					from: cur,
-					err:  ctx.Err(),
-				})
+				p.deliverChunk(&fetchChunk{seq: cur, from: cur, err: ctx.Err()})
 				return false
 			}
-			// Transient error - retry with backoff
 			attempt++
 			if attempt > parallelMaxAttempts {
-				seq := claimIdx*100 + chunkIdx
-				errChunk := &fetchChunk{
-					seq:  seq,
+				p.deliverChunk(&fetchChunk{
+					seq:  cur,
 					from: cur,
-					err:  fmt.Errorf("worker %d claim %d: parallel fetch gave up after %d attempts: %w", workerID, claimIdx, attempt, err),
-				}
-				p.deliverChunk(errChunk)
+					err:  fmt.Errorf("worker %d: parallel fetch gave up after %d attempts: %w", workerID, attempt, err),
+				})
 				return false
 			}
 			p.backoff(ctx, attempt)
@@ -365,21 +354,13 @@ func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *clie
 		}
 
 		attempt = 0
+		seq := cur
 
-		// Calculate sequence based on block position (not delivery order)
-		// This ensures chunks are emitted in block order even when delivered out of order
-		seq := cur // use starting block number as sequence
-
-		// Parse the last block number from this response
 		coveredTo := cur
 		if len(resp.Raw) > 0 {
 			last, lerr := lastBlockNumber(resp.Raw)
 			if lerr != nil {
-				p.deliverChunk(&fetchChunk{
-					seq:  seq,
-					from: cur,
-					err:  fmt.Errorf("worker %d claim %d: parse last block: %w", workerID, claimIdx, lerr),
-				})
+				p.deliverChunk(&fetchChunk{seq: seq, from: cur, err: fmt.Errorf("worker %d: parse last block: %w", workerID, lerr)})
 				return false
 			}
 			if last >= cur {
@@ -387,11 +368,9 @@ func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *clie
 			}
 		}
 
-		// Copy the response bytes since they're from the client's reused buffer
 		rawCopy := make([]byte, len(resp.Raw))
 		copy(rawCopy, resp.Raw)
 
-		// Deliver this chunk immediately (even if empty)
 		p.deliverChunk(&fetchChunk{
 			seq:         seq,
 			from:        cur,
@@ -401,7 +380,6 @@ func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *clie
 			head:        resp.Head,
 		})
 
-		// Check if we should stop (error chunk was delivered)
 		p.mu.Lock()
 		stop := p.stopClaim
 		p.mu.Unlock()
@@ -409,17 +387,33 @@ func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *clie
 			return false
 		}
 
-		// If coveredTo reached pageEnd, we're done with this range
-		// Note: empty response doesn't mean we're done - continue to next block
-		if coveredTo >= pageEnd {
+		if coveredTo >= r.to {
 			return true
 		}
-		// Empty response (no blocks in this specific range) - continue to next block
-		// The loop will increment cur and try again
 
-		// Move to next block after what we just covered
+		remainingSpan := r.to - coveredTo
+		batchSize := p.pageSize / 10
+		if batchSize < 100 {
+			batchSize = 100
+		}
+
+		if remainingSpan > batchSize {
+			p.mu.Lock()
+			nextStart := coveredTo + 1
+			for nextStart <= r.to {
+				nextEnd := min(nextStart+batchSize-1, r.to)
+				p.gaps = append(p.gaps, blockRange{from: nextStart, to: nextEnd})
+				nextStart = nextEnd + 1
+			}
+			sort.Slice(p.gaps, func(i, j int) bool {
+				return p.gaps[i].from < p.gaps[j].from
+			})
+			p.cond.Broadcast()
+			p.mu.Unlock()
+			return true
+		}
+
 		cur = coveredTo + 1
-		chunkIdx++
 	}
 
 	return true
