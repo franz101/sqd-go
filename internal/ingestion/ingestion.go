@@ -1526,6 +1526,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		}
 	}
 
+	if store != nil {
+		if err := store.FlushAsyncInserts(ctx); err != nil {
+			log.Printf("Chain %d: error flushing async inserts on exit: %v", chain.ID, err)
+		}
+	}
+
 	// Emit a final stats line on clean completion so the last cursor position and
 	// full chain coverage are recorded, not just left in the profile below (periodic
 	// ticks can miss the final advance on a fast backfill).

@@ -63,7 +63,7 @@ func TestIntegrationIndexSmallRange(t *testing.T) {
 	host, port, password := chEnv()
 	dbName := fmt.Sprintf("integration_test_%d", time.Now().UnixNano())
 
-	endBlock := uint64(22000100)
+	endBlock := uint64(22000500)
 	cfg := &config.Config{
 		Name: dbName,
 		Chains: []config.Chain{{
@@ -121,8 +121,9 @@ func TestIntegrationIndexSmallRange(t *testing.T) {
 		ClickHousePassword: password,
 		ClickHouseDatabase: dbName,
 		Restart:            false,
-		CursorMode:         false,
+		CursorMode:         true,
 		PageSize:           0,
+		ParallelFetch:      true,
 	}
 
 	err = Run(ctx, cfg, opts)
