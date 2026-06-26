@@ -16,7 +16,8 @@ func init() {
 	cachedTemplates = make(map[string]*template.Template)
 
 	funcMap := template.FuncMap{
-		"add": func(a, b int) int { return a + b },
+		"add":  func(a, b int) int { return a + b },
+		"join": strings.Join,
 	}
 
 	// Pre-load and parse all templates
