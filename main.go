@@ -3,6 +3,7 @@ import (
 	"os"
 
 	"github.com/franz101/sqd-go/internal/cli"
+	_ "github.com/franz101/sqd-go/examples/uniswap/src"
 )
 
 
