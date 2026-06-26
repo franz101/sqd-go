@@ -12,11 +12,11 @@ import (
 
 // HybridFetchConfig configures the adaptive hybrid fetching strategy
 type HybridFetchConfig struct {
-	MaxWorkers       int           // Max parallel workers (default: 4)
-	BeastModeWorkers int           // Workers for empty region beast mode (default: 6)
-	EmptyThreshold   int           // Consecutive empty fetches before beast mode (default: 6)
-	TargetWindowSec  float64       // Target window size in seconds (default: 2.0)
-	RatePerSec       float64       // Rate limit per second (default: 5.0)
+	MaxWorkers       int     // Max parallel workers (default: 4)
+	BeastModeWorkers int     // Workers for empty region beast mode (default: 6)
+	EmptyThreshold   int     // Consecutive empty fetches before beast mode (default: 6)
+	TargetWindowSec  float64 // Target window size in seconds (default: 2.0)
+	RatePerSec       float64 // Rate limit per second (default: 5.0)
 }
 
 // DefaultHybridConfig returns the optimal hybrid configuration
@@ -36,8 +36,8 @@ type HybridFetcher struct {
 	filters     []client.LogFilter
 	cfg         *HybridFetchConfig
 	client      *client.Client
-	emptyCount  int  // consecutive empty fetches
-	beastMode   bool // currently in beast mode
+	emptyCount  int     // consecutive empty fetches
+	beastMode   bool    // currently in beast mode
 	lastDensity float64 // events per block from last fetch
 }
 

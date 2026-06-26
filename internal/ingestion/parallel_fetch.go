@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"regexp"
 	"sort"
@@ -56,6 +57,12 @@ const (
 	// The estimate re-measures continuously, so the pin keeps tracking density.
 	adaptiveGapMin = 100    // floor: never pin tighter than a dense portal page (~100)
 	adaptiveGapMax = 131072 // ceiling: at/above the portal's ~106k empty-region scan cap
+
+	// beastModeThreshold is the number of consecutive "empty" chunks (portal
+	// extent-marker only, no matching events) before workers stop pinning toBlock and
+	// let the portal decide its own stride. In empty regions the portal can jump
+	// hundreds of thousands of blocks per nil-toBlock request; pinning would cap it.
+	beastModeThreshold = 5
 )
 
 // rateLimiter is a shared token bucket: every concurrent worker draws from one
@@ -184,7 +191,17 @@ type parallelPrefetcher struct {
 	// unit. All workers read and update it so density learned by one worker steers
 	// the whole pool. It is an exponential moving average kept in fixed point
 	// (block count); see updateGapSpan / currentGapSpan.
+	// Not updated in beast mode: unguided portal jumps don't reflect pin-optimal density.
 	gapSpan atomic.Uint64
+
+	// Beast mode: after beastModeThreshold consecutive empty chunks workers stop
+	// pinning toBlock (nil toBlock = portal decides stride). In truly empty regions
+	// the portal can jump millions of blocks in one request; pinned mode would cap it
+	// to adaptiveGapMax. Beast mode exits immediately on the first chunk with events,
+	// resetting gapSpan to the observed dense span so pinned mode resumes at the
+	// right window size.
+	consecutiveEmpty atomic.Int64
+	beastMode        atomic.Bool
 
 	mu            sync.Mutex
 	cond          *sync.Cond
@@ -415,8 +432,17 @@ func (p *parallelPrefetcher) fetchOne(ctx context.Context, cl *client.Client, r 
 			return false
 		}
 
-		toPin := r.to
-		resp, err := cl.FetchWithParent(ctx, r.from, &toPin, "", p.includeAllBlocks, p.filters)
+		// Snapshot beast mode for this attempt. In beast mode workers use nil toBlock
+		// so the portal decides its own stride — it can jump over millions of empty
+		// blocks in one request. In pinned mode toBlock = r.to, matching old behaviour.
+		isBeast := p.beastMode.Load()
+		var toBlockPtr *uint64
+		if !isBeast {
+			tp := r.to
+			toBlockPtr = &tp
+		}
+
+		resp, err := cl.FetchWithParent(ctx, r.from, toBlockPtr, "", p.includeAllBlocks, p.filters)
 		if err != nil {
 			if ctx.Err() != nil {
 				p.deliverChunk(&fetchChunk{seq: r.from, from: r.from, err: ctx.Err()})
@@ -432,16 +458,16 @@ func (p *parallelPrefetcher) fetchOne(ctx context.Context, cl *client.Client, r 
 			continue
 		}
 
-		// coveredTo is the scanned high-water mark. The real portal (skipEmpties)
-		// always returns a non-empty body — matching blocks plus a marker block at
-		// the scan extent — so coveredTo comes from that last block and can jump far
-		// (up to the pin), keeping empty regions as fast as a no-toBlock walk.
+		// coveredTo is the scanned high-water mark.
 		//
-		// An EMPTY (204) body carries no marker, so we cannot tell how far the portal
-		// scanned. The real portal does not do this within a finalized range, so it is
-		// defensive: bound the blind skip to one page, guaranteeing a dense band is
-		// never skipped by more than pageSize (the uncovered remainder is re-queued).
-		// The portal honors the pin, so a returned block never exceeds r.to.
+		// Pinned mode: the portal honours the toBlock pin, so coveredTo ≤ r.to. A
+		// short/empty body gets a conservative bound of one pageSize so a dense band
+		// is never skipped by more than pageSize (the uncovered remainder is re-queued).
+		//
+		// Beast mode (nil toBlock): the portal decides how far to scan; coveredTo can
+		// legitimately exceed r.to. We do NOT clamp to r.to here — the caller advances
+		// the shared cursor to coveredTo+1 to prevent other workers re-fetching the
+		// already-covered tail.
 		coveredTo := min(r.from+p.pageSize-1, r.to)
 		if len(resp.Raw) > 0 {
 			last, lerr := lastBlockNumber(resp.Raw)
@@ -453,36 +479,97 @@ func (p *parallelPrefetcher) fetchOne(ctx context.Context, cl *client.Client, r 
 			if last < r.from {
 				last = r.from
 			}
-			if last > r.to {
+			// Clamp to endBlock always; clamp to r.to only in pinned mode.
+			if last > p.endBlock {
+				last = p.endBlock
+			}
+			if !isBeast && last > r.to {
 				last = r.to
 			}
 			coveredTo = last
 		}
 
-		// Density: a short response (coveredTo < r.to) is the portal's own stopping
-		// point — its natural page for this region; contract toward it. A filled unit
-		// (coveredTo == r.to) means the portal had at least this much, so feed the full
-		// span to hold/grow the estimate back toward the portal's natural jump.
-		if coveredTo < r.to {
-			p.updateGapSpan(coveredTo - r.from + 1)
-		} else {
-			p.updateGapSpan(r.to - r.from + 1)
+		// Density estimate: update only in pinned mode. Beast-mode spans are unguided
+		// portal jumps; feeding them into gapSpan would corrupt the pin for dense regions.
+		if !isBeast {
+			if coveredTo < r.to {
+				p.updateGapSpan(coveredTo - r.from + 1)
+			} else {
+				p.updateGapSpan(r.to - r.from + 1)
+			}
 		}
 
 		rawCopy := make([]byte, len(resp.Raw))
 		copy(rawCopy, resp.Raw)
+
+		// Beast mode tracking (skip-empties mode only; includeAllBlocks never has
+		// empty-marker-only responses since every block is always returned).
+		if !p.includeAllBlocks {
+			// A response with ≤1 newline is the extent-marker block only (no matching
+			// events in the scanned range). ≥2 newlines means at least one event block
+			// was found plus the extent marker.
+			lineCount := bytes.Count(rawCopy, []byte{'\n'})
+			isEmpty := lineCount <= 1
+
+			if isEmpty {
+				if n := p.consecutiveEmpty.Add(1); n >= beastModeThreshold && !p.beastMode.Load() {
+					p.beastMode.Store(true)
+					log.Printf("[parallel] beast mode ON at block %d (%d consecutive empty ranges; nil toBlock)", r.from, n)
+				}
+			} else {
+				p.consecutiveEmpty.Store(0)
+				if isBeast {
+					// Exit beast mode immediately: events found. Set gapSpan directly to
+					// the observed dense span so pinned mode starts at the right window
+					// size without waiting for EWMA to descend from adaptiveGapMax.
+					p.beastMode.Store(false)
+					denseSpan := coveredTo - r.from + 1
+					if denseSpan < adaptiveGapMin {
+						denseSpan = adaptiveGapMin
+					}
+					if denseSpan > adaptiveGapMax {
+						denseSpan = adaptiveGapMax
+					}
+					p.gapSpan.Store(denseSpan)
+					log.Printf("[parallel] beast mode OFF at block %d (events found, span=%d; resuming pinned mode)", r.from, denseSpan)
+				}
+			}
+		}
+
+		// In beast mode the portal may jump beyond our claimed range [r.from, r.to].
+		// Advance the shared nextBlock cursor to coveredTo+1 so other workers skip
+		// the already-covered tail (best-effort; a race means a worker may still claim
+		// a now-redundant range, but it will get a small/empty response and move on).
+		if isBeast && coveredTo > r.to {
+			for {
+				old := p.nextBlock.Load()
+				if old > coveredTo+1 {
+					break // another worker already advanced past this point
+				}
+				if p.nextBlock.CompareAndSwap(old, coveredTo+1) {
+					break
+				}
+			}
+		}
+
+		var requestedToVal uint64
+		if toBlockPtr != nil {
+			requestedToVal = *toBlockPtr
+		} else {
+			requestedToVal = coveredTo // beast mode: portal decided
+		}
 		p.deliverChunk(&fetchChunk{
 			seq:         r.from,
 			from:        r.from,
 			coveredTo:   coveredTo,
-			requestedTo: toPin,
+			requestedTo: requestedToVal,
 			raw:         rawCopy,
 			head:        resp.Head,
 		})
 
-		// Short response: re-queue the uncovered remainder so other workers fill it
-		// concurrently and in order. This is the completeness guarantee for dense
-		// regions where one request cannot cover the whole unit.
+		// Re-queue the uncovered remainder. In pinned mode this is the classic dense
+		// gap-fill. In beast mode (undershoot only — overshoot was handled above by
+		// advancing the cursor), it ensures no blocks are silently skipped.
 		if coveredTo < r.to {
 			p.enqueueGaps(coveredTo+1, r.to)
 		}
