@@ -107,7 +107,7 @@ type Store struct {
 	// neg is an optional in-memory negative-lookup Bloom filter (the V3 cold-tier
 	// optimization). When set, a Get whose key is provably absent skips Pebble
 	// entirely. nil => V2 behaviour (every miss probes Pebble). See filter.go.
-	neg        *negFilter
+	neg        negFilter
 	filterHits atomic.Uint64 // Pebble Gets skipped because the filter proved the key absent
 }
 
@@ -271,7 +271,7 @@ const writeBatchFlushCount = 16384
 type WriteBatch struct {
 	db    *pebble.DB
 	b     *pebble.Batch
-	neg   *negFilter
+	neg   negFilter
 	count int
 	flat  *flatcold // when set, Put writes through immediately (no batching needed)
 }
