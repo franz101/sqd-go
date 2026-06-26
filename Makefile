@@ -47,11 +47,14 @@ dev-build:
 test:
 	go test ./... -count=1 -timeout 120s
 
+test-config-matrix:
+	scripts/test_make_matrix.sh
+
 vet:
 	go vet ./...
 
 benchmark:
-	scripts/profile_make_targets.sh dev dev-v1 dev-v2
+	$(MAKE) benchmark-fast
 
 # === Polymarket Development ===
 
@@ -164,7 +167,6 @@ uniswap-e2e: codegen-uniswap build
 
 db-reset:
 	docker exec $(CLICKHOUSE_CONTAINER) clickhouse-client --password $(CLICKHOUSE_PASSWORD) --query "DROP DATABASE IF EXISTS $(CLICKHOUSE_DATABASE) SYNC"
-	docker exec $(CLICKHOUSE_CONTAINER) clickhouse-client --password $(CLICKHOUSE_PASSWORD) --query "DROP DATABASE IF EXISTS polymarket SYNC"
 	docker exec $(CLICKHOUSE_CONTAINER) clickhouse-client --password $(CLICKHOUSE_PASSWORD) --query "DROP DATABASE IF EXISTS uniswap SYNC"
 
 stop:

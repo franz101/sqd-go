@@ -1355,15 +1355,31 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			continue
 		}
 
-		// Sparse parallel backfill (includeAllBlocks=false) leaves block-number
-		// gaps: blocks with no matching logs are absent. When the missing block is
-		// within the parallel region and at or below the scanned high-water mark
-		// (latestBlock — the portal returns a marker block at the end of every
-		// scanned response), the gap is confirmed-empty and was never fetched, so
-		// jump to the next present block instead of waiting forever for it.
+		// Sparse backfill (includeAllBlocks=false) returns only blocks with matching
+		// logs plus the portal's end-of-scan marker, leaving block-number gaps. A
+		// missing block at or below the scanned high-water mark was fetched and found
+		// empty, so jump to the next present block instead of waiting for one that
+		// will never arrive — and, once the producer is done, breaking with the
+		// accumulated batch still un-inserted (the batch is only flushed at a page's
+		// last-in-batch block, which sits past the gap).
+		//
+		// The high-water mark differs by fetch mode. The parallel prefetcher fetches
+		// pages out of order, so a gap is only confirmed-empty once parallelBound has
+		// advanced past it. The sequential producer fetches strictly in order, so
+		// LatestBlock is itself the mark: any absent block at or below it was scanned.
 		if parallelSkipEmpties {
 			c := currentConsumerBlockVal
 			if pb := parallelBound.Load(); pb != 0 && c <= pb && c <= replayBuf.LatestBlock() {
+				if next, ok := replayBuf.CeilBlock(c); ok {
+					currentConsumerBlockVal = next
+					currentConsumerBlock.Store(currentConsumerBlockVal)
+					continue
+				}
+			}
+		} else if !cursorMode {
+			// Sequential backfill fetches sparse too (includeAllBlocks=cursorMode==false).
+			c := currentConsumerBlockVal
+			if c <= replayBuf.LatestBlock() {
 				if next, ok := replayBuf.CeilBlock(c); ok {
 					currentConsumerBlockVal = next
 					currentConsumerBlock.Store(currentConsumerBlockVal)

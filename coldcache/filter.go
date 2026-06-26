@@ -40,6 +40,7 @@ type negFilter struct {
 	blocks    []negBlock
 	blockMask uint64 // len(blocks)-1; len(blocks) is a power of two
 	k         uint   // bits set per key, all within one block
+	atomicRMW bool   // atomic OR/Load on the bitset (default); see newNegFilter
 }
 
 // negBlock is one cache line (512 bits) of the filter.
@@ -71,7 +72,23 @@ func newNegFilter(bitBudget uint64) *negFilter {
 		blocks:    make([]negBlock, n),
 		blockMask: n - 1,
 		k:         8,
+		atomicRMW: filterAtomicDefault(),
 	}
+}
+
+// filterAtomicDefault reports whether the filter should use atomic bit ops. It
+// defaults to true (concurrency-safe); SQD_COLDCACHE_FILTER_ATOMIC=0 (or any
+// other false-y value) opts into the non-atomic single-writer fast path.
+func filterAtomicDefault() bool {
+	v, ok := os.LookupEnv("SQD_COLDCACHE_FILTER_ATOMIC")
+	if !ok {
+		return true
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return true
+	}
+	return b
 }
 
 // negHash hashes the key with a word-at-a-time FNV-1a pass (≈len/8 multiplies
@@ -100,6 +117,15 @@ func negHash(key []byte) (uint64, uint64) {
 func (f *negFilter) add(key []byte) {
 	h, g := negHash(key)
 	blk := &f.blocks[h&f.blockMask]
+	// Hoist the atomicRMW check out of the k-loop so the single-writer fast path
+	// pays nothing per bit.
+	if f.atomicRMW {
+		for i := uint(0); i < f.k; i++ {
+			bit := (h>>9 + uint64(i)*g) & (blockBits - 1)
+			atomic.OrUint64(&blk[bit>>6], 1<<(bit&63))
+		}
+		return
+	}
 	for i := uint(0); i < f.k; i++ {
 		bit := (h>>9 + uint64(i)*g) & (blockBits - 1)
 		atomic.OrUint64(&blk[bit>>6], 1<<(bit&63))
@@ -109,6 +135,15 @@ func (f *negFilter) add(key []byte) {
 func (f *negFilter) mayContain(key []byte) bool {
 	h, g := negHash(key)
 	blk := &f.blocks[h&f.blockMask]
+	if f.atomicRMW {
+		for i := uint(0); i < f.k; i++ {
+			bit := (h>>9 + uint64(i)*g) & (blockBits - 1)
+			if atomic.LoadUint64(&blk[bit>>6])&(1<<(bit&63)) == 0 {
+				return false
+			}
+		}
+		return true
+	}
 	for i := uint(0); i < f.k; i++ {
 		bit := (h>>9 + uint64(i)*g) & (blockBits - 1)
 		if blk[bit>>6]&(1<<(bit&63)) == 0 {
