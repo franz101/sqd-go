@@ -2,8 +2,6 @@ package coldcache
 
 import (
 	"encoding/binary"
-	"os"
-	"strconv"
 	"sync/atomic"
 )
 
@@ -33,12 +31,11 @@ import (
 // Bounded memory: the block array is a power-of-two allocated once at
 // construction, so RSS is fixed regardless of how many keys flow through.
 //
-// Concurrency: by default the bitset is updated with atomic OR/Load (atomicRMW),
-// so the filter is safe even when the cold tier is populated from more than one
-// goroutine — e.g. a parallel state-recovery rebuild. Deployments that keep all
-// cold-Store access on the single processor goroutine can set
-// SQD_COLDCACHE_FILTER_ATOMIC=0 to drop the atomics for a small speedup; that path
-// is correct ONLY under a strictly single writer and races otherwise.
+// Concurrency: during processing all access is from the one processor goroutine.
+// During recovery the filter is populated from multiple bucket goroutines in
+// parallel, so add() uses an atomic OR (bits are monotonic — set-only — so a
+// lock-free OR can never lose a key). mayContain stays a plain read: it is only
+// called during processing, which never overlaps the parallel recovery adds.
 type negFilter struct {
 	blocks    []negBlock
 	blockMask uint64 // len(blocks)-1; len(blocks) is a power of two
@@ -131,7 +128,7 @@ func (f *negFilter) add(key []byte) {
 	}
 	for i := uint(0); i < f.k; i++ {
 		bit := (h>>9 + uint64(i)*g) & (blockBits - 1)
-		blk[bit>>6] |= 1 << (bit & 63)
+		atomic.OrUint64(&blk[bit>>6], 1<<(bit&63))
 	}
 }
 
