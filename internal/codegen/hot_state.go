@@ -1416,6 +1416,7 @@ type BatchResolverMetrics struct {
 	UniqueMisses uint64
 	RoundTrips   uint64
 	ResolveNanos uint64
+	Skipped      uint64
 }
 
 func clockHashWord(seed, word uint64) uint64 {
@@ -2263,7 +2264,7 @@ func renderBatchResolver(b *bytes.Buffer, spec hotStateSpec) {
 	b.WriteString(resolverType)
 	b.WriteString(") Queue(key ")
 	b.WriteString(keyType)
-	b.WriteString(") {\n\t\t// Provably-new fast path: under an authoritative cold tier a key the\n\t\t// negative filter has never seen cannot exist in ClickHouse, so the lazy Get\n\t\t// returns zero and queuing it for a resolve would be a wasted CH round-trip.\n\tif r.hot != nil && r.hot.coldAuthoritative && !r.cache.coldMightContainKey(key) {\n\t\treturn\n\t}\n\tif _, ok := r.Lookup(key); !ok {\n")
+	b.WriteString(") {\n\t\t// Provably-new fast path: under an authoritative cold tier a key the\n\t\t// negative filter has never seen cannot exist in ClickHouse, so the lazy Get\n\t\t// returns zero and queuing it for a resolve would be a wasted CH round-trip.\n\tif r.hot != nil && r.hot.coldAuthoritative && !r.cache.coldMightContainKey(key) {\n\t\tif r.metricsEnabled {\n\t\t\tr.metrics.Skipped++\n\t\t}\n\t\treturn\n\t}\n\tif _, ok := r.Lookup(key); !ok {\n")
 	b.WriteString("\t\tif r.metricsEnabled {\n\t\t\tr.metrics.QueuedMisses++\n\t\t}\n")
 	b.WriteString("\t\tr.misses = append(r.misses, key)\n\t}\n}\n\n")
 
