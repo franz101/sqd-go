@@ -134,6 +134,17 @@ func (s *Store) FilterSkips() uint64 {
 	return s.filterHits.Load()
 }
 
+// AddKeyToFilter adds a key to the negative filter (if enabled). This is called
+// during cold recovery to populate the filter with keys that are known to exist in
+// ClickHouse above the recovery floor. Subsequent Gets for these keys will skip the
+// Pebble lookup when the filter reports "may contain=false" (authoritative miss).
+func (s *Store) AddKeyToFilter(key []byte) {
+	if s == nil || s.neg == nil {
+		return
+	}
+	s.neg.add(key)
+}
+
 // Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
 // cacheBytes/memTableBytes <= 0 fall back to the defaults.
 func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
