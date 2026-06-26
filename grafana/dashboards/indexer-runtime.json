@@ -80,16 +80,18 @@
     {
       "id": 10,
       "type": "timeseries",
+      "interval": "10s",
       "title": "Throughput",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10, "showPoints": "never", "lineWidth": 2, "axisPlacement": "left" } }, "overrides": [ { "matcher": { "id": "byName", "options": "Events/s" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" } ] } ] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, sum(blocks_per_sec) AS \"Blocks/s\", sum(events_per_sec) AS \"Events/s\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time WITH FILL STEP $__interval_s" } ]
+      "targets": [ { "refId": "A", "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" }, "editorType": "sql", "queryType": "timeseries", "format": 1, "rawSql": "SELECT $__timeInterval(ts) AS time, avg(blocks_per_sec) AS \"Blocks/s\", avg(events_per_sec) AS \"Events/s\" FROM monitoring.indexer_metrics WHERE $__timeFilter(ts) GROUP BY time ORDER BY time WITH FILL STEP $__interval_s" } ]
     },
     {
       "id": 11,
       "type": "timeseries",
+      "interval": "10s",
       "title": "Heap Memory",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
@@ -100,6 +102,7 @@
     {
       "id": 12,
       "type": "timeseries",
+      "interval": "10s",
       "title": "Allocation Rate",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
@@ -110,6 +113,7 @@
     {
       "id": 13,
       "type": "timeseries",
+      "interval": "10s",
       "title": "Garbage Collector",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
@@ -120,6 +124,7 @@
     {
       "id": 14,
       "type": "timeseries",
+      "interval": "10s",
       "title": "Goroutines & CPU",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
@@ -130,6 +135,7 @@
     {
       "id": 15,
       "type": "timeseries",
+      "interval": "10s",
       "title": "Live Heap Objects & Checkpoint Lag",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
