@@ -56,6 +56,14 @@ type ReplayBuffer struct {
 	// below it as confirmed-empty rather than not-yet-fetched.
 	latestBlock atomic.Uint64
 
+	// writes is the total number of entries ever written (monotonic). Paired with
+	// the consumer's consumed-entry counter it yields the number of buffered-but-
+	// unconsumed entries, which is the correct backpressure metric: block-number
+	// distance (pBlock-cBlock) overcounts in sparse mode, where the producer skips
+	// large empty ranges without writing any entry, and would wedge the producer
+	// before it reaches the next event block. Entry count never counts skips.
+	writes atomic.Uint64
+
 	// Seek point for replay — when set, ReadFrom returns the first block > seekBlock.
 	seekBlock uint64
 	seekSet   bool
@@ -113,6 +121,7 @@ func (rb *ReplayBuffer) Write(chainID uint64, blockNumber uint64, blockHash stri
 	}
 	rb.index[blockNumber] = idx
 	rb.latestBlock.Store(blockNumber)
+	rb.writes.Add(1)
 
 	rb.writePos++
 	if rb.count < rb.capacity {
@@ -156,6 +165,7 @@ func (rb *ReplayBuffer) WriteParsed(chainID uint64, block BatchParsedBlock, fina
 	}
 	rb.index[block.Number] = idx
 	rb.latestBlock.Store(block.Number)
+	rb.writes.Add(1)
 	rb.writePos++
 	if rb.count < rb.capacity {
 		rb.count++
@@ -388,6 +398,14 @@ func (rb *ReplayBuffer) Len() int {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	return rb.count
+}
+
+// Writes returns the total number of entries ever written to the buffer
+// (monotonic, lock-free). The producer subtracts the consumer's consumed-entry
+// count from this to get the number of buffered-but-unconsumed entries — the
+// backpressure metric that is correct under sparse (skip-empty) fetching.
+func (rb *ReplayBuffer) Writes() uint64 {
+	return rb.writes.Load()
 }
 
 func (rb *ReplayBuffer) rebuildIndexLocked() {

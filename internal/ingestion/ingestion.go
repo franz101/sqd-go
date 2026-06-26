@@ -431,6 +431,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	var currentConsumerBlock atomic.Uint64
 	currentConsumerBlock.Store(currentBlock)
 
+	// consumedEntries counts entries the consumer has drained from the replay
+	// buffer. Backpressure is gated on (replayBuf.Writes() - consumedEntries) —
+	// the count of buffered-but-unconsumed entries — rather than block-number
+	// distance, which overcounts in sparse mode (skipped empty ranges advance the
+	// producer's block cursor without writing any entry) and deadlocks the
+	// producer in a large empty gap before it reaches the next event block.
+	var consumedEntries atomic.Uint64
+
 	// Producer fetch instrumentation, read by logStats for honest reporting. A
 	// single dense /finalized-stream request is fetched+parsed whole before any
 	// block is emitted, so the consumer can sit idle for the length of one request;
@@ -526,9 +534,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				default:
 				}
 
-				// Backpressure check: wait if producer is too far ahead of consumer
-				cBlock := currentConsumerBlock.Load()
-				if pBlock >= cBlock && pBlock-cBlock >= uint64(replayBuf.capacity)-100 {
+				// Backpressure check: wait if too many unconsumed entries are
+				// buffered. Measured by entry count (writes - consumed), not block
+				// distance, so skipped empty ranges in sparse mode don't wedge the
+				// producer before it reaches the next event block.
+				if replayBuf.Writes()-consumedEntries.Load() >= uint64(replayBuf.capacity)-100 {
 					waitStart := time.Now()
 					select {
 					case <-pCtx.Done():
@@ -746,8 +756,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 							parsed.RawLine = nil
 						}
 						for {
-							consumerBlock := currentConsumerBlock.Load()
-							if parsed.Number >= consumerBlock && parsed.Number-consumerBlock >= uint64(replayBuf.capacity)-100 {
+							if replayBuf.Writes()-consumedEntries.Load() >= uint64(replayBuf.capacity)-100 {
 								waitStart := time.Now()
 								select {
 								case <-pCtx.Done():
@@ -914,10 +923,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 				batchStartBlock := pBlock
 				for idx, db := range decodedBlocks {
-					// Backpressure check: wait if producer is too far ahead of consumer
+					// Backpressure check: wait if too many unconsumed entries are
+					// buffered (entry count, not block distance — see producer-loop top).
 					for {
-						cBlock := currentConsumerBlock.Load()
-						if db.number >= cBlock && db.number-cBlock >= uint64(replayBuf.capacity)-100 {
+						if replayBuf.Writes()-consumedEntries.Load() >= uint64(replayBuf.capacity)-100 {
 							waitStart := time.Now()
 							select {
 							case <-pCtx.Done():
@@ -1355,6 +1364,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 			currentConsumerBlockVal = entry.number + 1
 			currentConsumerBlock.Store(currentConsumerBlockVal)
+			consumedEntries.Add(1)
 
 			select {
 			case <-statsTicker.C:
@@ -2060,4 +2070,3 @@ func bytesNSize(solType string) int {
 	fmt.Sscanf(strings.TrimPrefix(solType, "bytes"), "%d", &n)
 	return n
 }
-
