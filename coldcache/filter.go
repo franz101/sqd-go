@@ -2,6 +2,8 @@ package coldcache
 
 import (
 	"encoding/binary"
+	"os"
+	"strconv"
 	"sync/atomic"
 )
 
