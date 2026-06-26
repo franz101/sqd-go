@@ -1,7 +1,7 @@
 name: case_1_lbtc_event_only
 chains:
   - id: 1
-    start_block: 0
+    start_block: 20600000
     end_block: 22200000
     contracts:
       - name: LBTC
