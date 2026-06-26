@@ -400,6 +400,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	var profFetchNanos, profParseNanos, profDecodeNanos, profMarshalNanos, profInsertNanos, profCustomNanos atomic.Int64
 	var profConsumerWaitNanos, profProducerBackpressureNanos atomic.Int64
 	var profIters atomic.Int64
+	var parallelEngaged atomic.Bool
 	defer func() {
 		runtime.ReadMemStats(&memAfter)
 		printProfile(
@@ -470,6 +471,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	parallelWorkers, parallelPageSize, parallelRPS := ParallelFetchSettings()
 	parallelLimiter := newRateLimiter(parallelRPS, defaultParallelBurst)
 	parallelSkipEmpties := parallelEnabled && !storeBlocks && !cfg.ShouldStoreRawLogs()
+	sequentialSkipEmpties := !cursorMode && !storeBlocks && !cfg.ShouldStoreRawLogs()
 	parallelEndpoint := chainEndpoint(chain.ID, false)
 	var parallelBound atomic.Uint64
 	// Per-fetch latency budget for the dense adaptive path (sequential cursor mode).
@@ -549,14 +551,25 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, uint64(parallelPageSize), parallelWorkers, parallelLimiter)
 						parallelBound.Store(bound)
 						prefetch.launch(pCtx)
+						parallelEngaged.Store(true)
 						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, parallelRPS, parallelSkipEmpties)
 					case cursorMode && lastFinalized == 0:
 						// Finalized head not learned yet — the first sequential fetch
 						// will populate it. Retry on the next iteration; don't latch.
+						log.Printf("Chain %d: parallel fetch waiting for finalized head (current block %d)", chain.ID, pBlock)
 					default:
 						// Region too small, or unbounded/non-engageable: a permanent
 						// decision, so stop checking and stay sequential.
 						parallelDone = true
+						spanReason := "unknown"
+						if !ok {
+							spanReason = "no bound returned"
+						} else if bound < pBlock {
+							spanReason = "bound < current"
+						} else {
+							spanReason = fmt.Sprintf("span %d < min %d", bound-pBlock, parallelMinSpan(parallelPageSize, parallelWorkers))
+						}
+						log.Printf("Chain %d: parallel fetch declined at block %d (cursorMode=%v, ok=%v, bound=%d, reason=%s)", chain.ID, pBlock, cursorMode, ok, bound, spanReason)
 					}
 				}
 
@@ -631,7 +644,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					t0 := time.Now()
 					producerFetchFrom.Store(pBlock)
 					producerFetchSinceNanos.Store(t0.UnixNano())
-					response, err = fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
+					response, err = fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, !sequentialSkipEmpties, filters)
 					lastFetchDur = time.Since(t0)
 					producerFetchSinceNanos.Store(0)
 					profFetchNanos.Add(int64(lastFetchDur))
@@ -1355,15 +1368,16 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			continue
 		}
 
-		// Sparse parallel backfill (includeAllBlocks=false) leaves block-number
-		// gaps: blocks with no matching logs are absent. When the missing block is
-		// within the parallel region and at or below the scanned high-water mark
-		// (latestBlock — the portal returns a marker block at the end of every
-		// scanned response), the gap is confirmed-empty and was never fetched, so
-		// jump to the next present block instead of waiting forever for it.
-		if parallelSkipEmpties {
+		// Sparse fetching (includeAllBlocks=false) leaves block-number gaps:
+		// blocks with no matching logs are absent. When the missing block is
+		// at or below the scanned high-water mark (latestBlock — the portal
+		// returns a marker block at the end of every scanned response), the
+		// gap is confirmed-empty and was never fetched, so jump to the next
+		// present block instead of waiting forever for it.
+		if parallelSkipEmpties || sequentialSkipEmpties {
 			c := currentConsumerBlockVal
-			if pb := parallelBound.Load(); pb != 0 && c <= pb && c <= replayBuf.LatestBlock() {
+			pb := parallelBound.Load()
+			if (!parallelSkipEmpties || (pb != 0 && c <= pb)) && c <= replayBuf.LatestBlock() {
 				if next, ok := replayBuf.CeilBlock(c); ok {
 					currentConsumerBlockVal = next
 					currentConsumerBlock.Store(currentConsumerBlockVal)
@@ -2046,3 +2060,4 @@ func bytesNSize(solType string) int {
 	fmt.Sscanf(strings.TrimPrefix(solType, "bytes"), "%d", &n)
 	return n
 }
+
