@@ -139,6 +139,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 		var blockTimestamp uint64
 		var blockHash string
 		var blockTime time.Time // Pre-calculated once per block to avoid repeated time.Unix calls
+		blockHashDecoded := abiunpack.HashFromHex("") // pre-calculated once in header, reused per log
 		var slot *ParsedBlock
 		var protoSlot *ProtoEventBlock
 		var lineSkipped bool
@@ -169,6 +170,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 				}
 				l.Delim('}')
 				blockTime = time.Unix(int64(blockTimestamp), 0).UTC() // Calculate once per block
+				blockHashDecoded = abiunpack.HashFromHex(blockHash)   // decode once per block, not per log
 				profHeaderParse += int64(time.Since(t0))
 			case "logs":
 				t0 := time.Now()
@@ -239,7 +241,7 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 					meta := EventMeta{
 						BlockNumber:      blockNum,
 						BlockTimestamp:   blockTime,
-						BlockHash:        abiunpack.HashFromHex(blockHash),
+						BlockHash:        blockHashDecoded,
 						ContractAddress:  abiunpack.AddressFromHex(address),
 						TransactionHash:  abiunpack.HashFromHex(txHash),
 						TransactionIndex: txIndex,

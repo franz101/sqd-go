@@ -141,7 +141,7 @@ func renderParserIndexedDecode(arg eventArg, topicIdx int) string {
 	topic := fmt.Sprintf("topics[%d]", topicIdx)
 	switch {
 	case arg.SolidityType == "address":
-		return fmt.Sprintf("ev.%s = abiunpack.DecodeTopicAddress(%s)", arg.GoFieldName, topic)
+		return fmt.Sprintf("ev.%s = abiunpack.DecodeAddressFromTopic(%s)", arg.GoFieldName, topic)
 	case arg.SolidityType == "bool":
 		return fmt.Sprintf("ev.%s = abiunpack.TopicBool(%s)", arg.GoFieldName, topic)
 	case arg.SolidityType == "bytes32":
