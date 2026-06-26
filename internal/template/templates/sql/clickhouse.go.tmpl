@@ -103,3 +103,12 @@ LIMIT 1
 {{define "tableExists"}}SELECT count() AS count FROM system.tables WHERE database = {{.DatabaseString}} AND name = {{.TableString}}{{end}}
 
 {{define "systemFlushAsync"}}SYSTEM FLUSH ASYNC INSERT QUEUE{{end}}
+
+{{define "createCustomTable"}}
+CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.{{.TableIdent}} (
+{{range $i, $col := .Columns}}
+{{- if $i}},{{"\n"}}{{- end}}  {{$col.NameIdent}} {{$col.Type}}{{- if $col.Default}} DEFAULT {{$col.Default}}{{- end}}
+{{- end}}
+) ENGINE = {{.Engine}}
+PRIMARY KEY ({{.PrimaryKey}})
+ORDER BY ({{.OrderBy}}){{end}}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
@@ -162,6 +163,136 @@ func TestSequentialVsParallelBaseline_LBTC(t *testing.T) {
 	if len(dropped) == 0 && len(extra) == 0 && len(mismatched) == 0 {
 		t.Logf("OK: parallel fetch matches sequential event-for-event over the LBTC dense window")
 	}
+}
+
+// TestEmptyRegionSequentialVsParallel_LBTC is a fixed-time throughput race over
+// the empty region starting at block 0 (zero LBTC logs): each method gets a
+// 60-second budget and we measure how many blocks it covers, proving the
+// parallel path covers its prefix with NO MISSING BLOCKS.
+//
+// Early shutdown: each phase cancels at 60s and reports partial progress rather
+// than failing — the range to the finalized tip is far larger than 60s of fetch,
+// so this is a "blocks covered in 60s" record, not a run-to-completion test.
+//
+// Completeness in an empty region cannot be checked against event ground truth
+// (there are none), so instead we verify that the prefetcher's chunks tile the
+// covered prefix CONTIGUOUSLY: each chunk's `from` equals the previous chunk's
+// coveredTo+1 (no gap, no overlap). That is the strongest possible "no block was
+// silently skipped" guarantee — the portal scanned every sub-range and the
+// prefetcher accounted for all of it, right up to wherever the 60s cutoff fell.
+//
+// IMPORTANT TUNING: the prefetcher pins toBlock = min(cur+gapSpan-1, pageEnd),
+// so the empty-region jump is capped by pageSize. To let the portal's ~106k
+// natural empty scan through, the page must be large; we use a wide page here
+// and report it. (This is itself a finding: the default 10k page would cap empty
+// jumps at 10k and waste ~10x the requests through empty regions.)
+//
+// Run: SQD_LIVE_PORTAL=1 go test ./internal/ingestion/ -run TestEmptyRegionSequentialVsParallel_LBTC -v
+func TestEmptyRegionSequentialVsParallel_LBTC(t *testing.T) {
+	if os.Getenv("SQD_LIVE_PORTAL") == "" {
+		t.Skip("set SQD_LIVE_PORTAL=1 to run the live LBTC empty-region throughput record")
+	}
+
+	const start uint64 = 0        // empty for the LBTC filter from genesis
+	const end uint64 = 18_000_000 // safely below LBTC's ~20.5M launch, so the whole range has 0 logs
+	// pageSize ~= one portal empty-jump so each page is ~1 request and N workers
+	// fetch CONSECUTIVE pages concurrently. The contiguous empty stream has no gaps
+	// to distribute, so a large page serializes on the in-order head (one worker
+	// per page); a small page spreads the head across workers, letting them
+	// saturate the 5 req/s budget — the lever that beats the latency-bound single
+	// walker. Overridable via SQD_BENCH_PAGE_SIZE for sweeps.
+	pageSize := uint64(50_000)
+	if v, err := strconv.ParseUint(os.Getenv("SQD_BENCH_PAGE_SIZE"), 10, 64); err == nil && v > 0 {
+		pageSize = v
+	}
+	const budget = 60 * time.Second // early shutdown per phase: whichever of [start,end]/60s comes first
+
+	// ── Sequential dynamic walk (toBlock=nil): the baseline to beat ──
+	cl := client.New(lbtcEndpoint)
+	defer cl.Close()
+	seqCtx, seqCancel := context.WithTimeout(context.Background(), budget)
+	defer seqCancel()
+	seqReqs := 0
+	seqEvents := 0
+	t0 := time.Now()
+	cur := start
+	for cur <= end {
+		resp, err := cl.FetchWithParent(seqCtx, cur, nil /*toBlock*/, "", false /*includeAllBlocks*/, lbtcFilter)
+		if err != nil {
+			if seqCtx.Err() != nil {
+				break // 60s early shutdown — report partial progress
+			}
+			t.Fatalf("sequential fetch from %d: %v", cur, err)
+		}
+		seqReqs++
+		if len(resp.Raw) == 0 {
+			t.Fatalf("sequential fetch from %d returned no blocks (no high-water marker)", cur)
+		}
+		last, err := lastBlockNumber(resp.Raw)
+		if err != nil {
+			t.Fatalf("sequential parse last block from %d: %v", cur, err)
+		}
+		for _, c := range logCountsOf(t, resp.Raw) {
+			seqEvents += c
+		}
+		if last < cur {
+			t.Fatalf("portal did not advance: cur=%d last=%d", cur, last)
+		}
+		cur = last + 1
+	}
+	seqDur := time.Since(t0)
+	seqCovered := cur - start
+	seqBlkPerSec := float64(seqCovered) / seqDur.Seconds()
+	t.Logf("SEQUENTIAL empty walk: covered %d blocks (to %d) in %v, %d requests, %.0f blk/s (%d events — expected 0)",
+		seqCovered, cur-1, seqDur.Round(time.Millisecond), seqReqs, seqBlkPerSec, seqEvents)
+
+	// ── Parallel prefetcher (default workers, real 5 req/s limiter) ──
+	// Drain in order, asserting contiguous coverage as we go: this is the
+	// no-missing-blocks proof. The context cancels the whole prefetcher at 60s.
+	parCtx, parCancel := context.WithTimeout(context.Background(), budget)
+	defer parCancel()
+	p := newParallelPrefetcher(lbtcEndpoint, lbtcFilter, false /*includeAllBlocks*/, start, end, pageSize, defaultParallelFetchers,
+		newRateLimiter(defaultParallelRPS, defaultParallelBurst))
+	parReqs := 0
+	parEvents := 0
+	expectedFrom := start // next block the in-order stream must start at
+	t1 := time.Now()
+	p.launch(parCtx)
+	for {
+		chunk, ok := p.Next(parCtx)
+		if !ok {
+			break // either fully drained or 60s early shutdown
+		}
+		if chunk.err != nil {
+			if parCtx.Err() != nil {
+				break
+			}
+			t.Fatalf("parallel fetch error at [%d-%d]: %v", chunk.from, chunk.coveredTo, chunk.err)
+		}
+		parReqs++
+		if chunk.from != expectedFrom {
+			t.Fatalf("COVERAGE GAP/OVERLAP: chunk from=%d, expected %d (a block range would be missed)", chunk.from, expectedFrom)
+		}
+		if chunk.coveredTo < chunk.from {
+			t.Fatalf("chunk [%d-%d] covers nothing", chunk.from, chunk.coveredTo)
+		}
+		for _, c := range logCountsOf(t, chunk.raw) {
+			parEvents += c
+		}
+		expectedFrom = chunk.coveredTo + 1
+	}
+	parDur := time.Since(t1)
+	parCovered := expectedFrom - start
+	parBlkPerSec := float64(parCovered) / parDur.Seconds()
+
+	if parEvents != 0 {
+		t.Fatalf("expected 0 LBTC events in empty region [%d,%d], got %d", start, expectedFrom-1, parEvents)
+	}
+
+	t.Logf("PARALLEL empty walk:   covered %d blocks (to %d) in %v, %d chunks, %.0f blk/s (pageSize=%d, %d workers) — contiguous from %d, no missing blocks",
+		parCovered, expectedFrom-1, parDur.Round(time.Millisecond), parReqs, parBlkPerSec, pageSize, defaultParallelFetchers, start)
+	t.Logf("RECORD (blocks covered in ~60s, empty region): parallel %d vs sequential %d  =  %.2fx  [%.0f -> %.0f blk/s]",
+		parCovered, seqCovered, float64(parCovered)/float64(seqCovered), seqBlkPerSec, parBlkPerSec)
 }
 
 // TestSequentialDynamicEmptyRegionWalk_LBTC characterizes how fast the dynamic

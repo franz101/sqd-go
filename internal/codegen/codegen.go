@@ -615,7 +615,7 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 				ClickHouseType: arg.ClickHouseType,
 			})
 		}
-		
+
 		evData := eventData{
 			DatabaseIdent:          tmplData.DatabaseIdent,
 			TableIdent:             quoteSQLIdent(ev.TableName),
@@ -628,11 +628,11 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 			Columns:                cols,
 			Key:                    eventPrimaryKey(ev),
 		}
-		
+
 		b.WriteString(template.MustExecute("sql/createEventTable", evData))
 		b.WriteString(";\n")
 	}
-	
+
 	// Add positions table for hot state backwards compatibility if present
 	if hasERC20Transfer(events) {
 		b.WriteString("\n")
@@ -798,69 +798,45 @@ func generateGoCode(cfg *config.Config, events []eventSpec) ([]byte, error) {
 	return formatted, nil
 }
 
+// unpackEventTmpl is the per-event data the dispatcher template interpolates.
+type unpackEventTmpl struct {
+	Index           int      // event ordinal, names _topic<i> / _addr<i>_<j>
+	Topic0Quoted    string   // strconv.Quote'd topic0 hash
+	Addrs           []string // strconv.Quote'd contract addresses
+	AddrMatchExpr   string   // address-match guard ("true" when no addresses)
+	GoTypeName      string   // event struct/unpacker name
+	EventNameQuoted string   // strconv.Quote'd human event name
+}
+
+// renderUnpackDispatcher renders the log decode entry points (topic/addr
+// constants + UnpackLog dispatch). The per-event Unpack<T>LogWithMeta functions
+// still use their own imperative renderer (renderEventUnpackFunction), so they
+// are appended after the template output.
 func renderUnpackDispatcher(b *bytes.Buffer, events []eventSpec) {
 	if len(events) == 0 {
 		return
 	}
+
+	data := struct {
+		UsesAddress bool
+		Events      []unpackEventTmpl
+	}{UsesAddress: dispatcherUsesAddress(events)}
 	for i, ev := range events {
-		b.WriteString("var _topic")
-		b.WriteString(strconv.Itoa(i))
-		b.WriteString(" = common.HexToHash(")
-		b.WriteString(strconv.Quote(ev.Topic0))
-		b.WriteString(")\n")
-		for j, addr := range ev.ContractAddress {
-			b.WriteString("var _addr")
-			b.WriteString(strconv.Itoa(i))
-			b.WriteString("_")
-			b.WriteString(strconv.Itoa(j))
-			b.WriteString(" = common.HexToAddress(")
-			b.WriteString(strconv.Quote(addr))
-			b.WriteString(")\n")
+		et := unpackEventTmpl{
+			Index:           i,
+			Topic0Quoted:    strconv.Quote(ev.Topic0),
+			AddrMatchExpr:   addressMatchExpr(i, len(ev.ContractAddress)),
+			GoTypeName:      ev.GoTypeName,
+			EventNameQuoted: strconv.Quote(ev.EventName),
 		}
+		for _, addr := range ev.ContractAddress {
+			et.Addrs = append(et.Addrs, strconv.Quote(addr))
+		}
+		data.Events = append(data.Events, et)
 	}
-	b.WriteString(`
-type DecodedLog struct {
-	EventName string
-	Topic0   string
-	Value    any
-}
 
-func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error) {
-	return UnpackLogWithMeta(address, topics, data, EventMeta{})
-}
+	b.WriteString(template.MustExecute("code/unpackDispatcher", data))
 
-func UnpackLogWithMeta(address string, topics []string, data []byte, meta EventMeta) (*DecodedLog, error) {
-	if len(topics) == 0 {
-		return nil, nil
-	}
-`)
-	if dispatcherUsesAddress(events) {
-		b.WriteString("\tlogAddress := common.HexToAddress(address)\n")
-	} else {
-		b.WriteString("\t_ = address\n")
-	}
-	b.WriteString(`
-	topic0 := common.HexToHash(topics[0])
-`)
-	for i, ev := range events {
-		b.WriteString("\tif topic0 == _topic")
-		b.WriteString(strconv.Itoa(i))
-		b.WriteString(" && ")
-		b.WriteString(addressMatchExpr(i, len(ev.ContractAddress)))
-		b.WriteString(" {\n")
-		b.WriteString("\t\tev, err := Unpack")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString("LogWithMeta(topics, data, meta)\n")
-		b.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
-		b.WriteString("\t\tif ev == nil {\n\t\t\treturn nil, nil\n\t\t}\n")
-		b.WriteString("\t\treturn &DecodedLog{EventName: ")
-		b.WriteString(strconv.Quote(ev.EventName))
-		b.WriteString(", Topic0: ")
-		b.WriteString(strconv.Quote(ev.Topic0))
-		b.WriteString(", Value: ev}, nil\n")
-		b.WriteString("\t}\n")
-	}
-	b.WriteString("\treturn nil, nil\n}\n\n")
 	for _, ev := range events {
 		renderEventUnpackFunction(b, ev)
 	}
@@ -886,6 +862,9 @@ func addressMatchExpr(eventIdx, addrCount int) string {
 	return "(" + strings.Join(parts, " || ") + ")"
 }
 
+// renderEventUnpackFunction renders one event's Unpack<T>Log / Unpack<T>LogWithMeta
+// pair. The decode statements are highly ABI-type dependent, so they are rendered
+// by the leaf decoders into a sub-buffer and handed to the template as DecodeBody.
 func renderEventUnpackFunction(b *bytes.Buffer, ev eventSpec) {
 	decodeArgs := ev.DecodeArgs
 	if len(decodeArgs) == 0 {
@@ -897,41 +876,35 @@ func renderEventUnpackFunction(b *bytes.Buffer, ev eventSpec) {
 			requiredTopics++
 		}
 	}
-	b.WriteString("func Unpack")
-	b.WriteString(ev.GoTypeName)
-	b.WriteString("Log(topics []string, data []byte) (*")
-	b.WriteString(ev.GoTypeName)
-	b.WriteString(", error) {\n")
-	b.WriteString("\treturn Unpack")
-	b.WriteString(ev.GoTypeName)
-	b.WriteString("LogWithMeta(topics, data, EventMeta{})\n")
-	b.WriteString("}\n\n")
 
-	b.WriteString("func Unpack")
-	b.WriteString(ev.GoTypeName)
-	b.WriteString("LogWithMeta(topics []string, data []byte, meta EventMeta) (*")
-	b.WriteString(ev.GoTypeName)
-	b.WriteString(", error) {\n")
-	b.WriteString(fmt.Sprintf("\tif len(topics) < %d {\n\t\treturn nil, nil\n\t}\n", requiredTopics))
-	b.WriteString("\tvar ev ")
-	b.WriteString(ev.GoTypeName)
-	b.WriteString("\n\tev.EventMeta = meta\n\tvar ok bool\n\tvar word []byte\n\t_ = ok\n\t_ = word\n")
+	// Render the per-argument decode statements (indexed args from topics, the
+	// rest walked word-by-word through the data payload) into their own buffer.
+	var body bytes.Buffer
 	topicIdx := 1
 	dataWord := 0
 	for _, arg := range decodeArgs {
 		if arg.Indexed {
 			if !arg.Omitted {
-				renderIndexedDecode(b, arg, topicIdx)
+				renderIndexedDecode(&body, arg, topicIdx)
 			}
 			topicIdx++
 			continue
 		}
 		if !arg.Omitted {
-			renderDataDecode(b, ev.GoTypeName, arg, dataWord)
+			renderDataDecode(&body, ev.GoTypeName, arg, dataWord)
 		}
 		dataWord += abiHeadWords(arg.SolidityType)
 	}
-	b.WriteString("\treturn &ev, nil\n}\n\n")
+
+	b.WriteString(template.MustExecute("code/unpackEventFunc", struct {
+		GoTypeName     string
+		RequiredTopics int
+		DecodeBody     string
+	}{
+		GoTypeName:     ev.GoTypeName,
+		RequiredTopics: requiredTopics,
+		DecodeBody:     body.String(),
+	}))
 }
 
 func renderIndexedDecode(b *bytes.Buffer, arg eventArg, topicIdx int) {
@@ -1347,93 +1320,10 @@ func strip0x(v string) string {
 }
 
 func generateSchemaGo(events []eventSpec) ([]byte, error) {
-	var b bytes.Buffer
-	b.WriteString("// Code generated by sqd-go codegen; DO NOT EDIT.\n\n")
-	b.WriteString("package generated\n\n")
-	b.WriteString("import (\n")
-	b.WriteString("\t\"time\"\n\n")
-	b.WriteString("\t\"github.com/ClickHouse/ch-go\"\n")
-	b.WriteString(")\n\n")
-
-	b.WriteString("type Store interface {\n")
-	b.WriteString("\tConn() *ch.Client\n")
-	b.WriteString("\tDB() string\n")
-	b.WriteString("}\n\n")
-
-	tag := func(chName, jsonName string) string {
-		return "`" + fmt.Sprintf(`ch:"%s" json:"%s"`, chName, jsonName) + "`"
-	}
-
-	b.WriteString("type Block struct {\n")
-	b.WriteString("\tChainID        uint64    " + tag("chain_id", "chain_id") + "\n")
-	b.WriteString("\tBlockNumber    uint64    " + tag("block_number", "block_number") + "\n")
-	b.WriteString("\tBlockTimestamp time.Time " + tag("block_timestamp", "block_timestamp") + "\n")
-	b.WriteString("\tBlockHash      string    " + tag("block_hash", "block_hash") + "\n")
-	b.WriteString("\tInsertedAt     time.Time " + tag("inserted_at", "inserted_at") + "\n")
-	b.WriteString("}\n\n")
-
-	b.WriteString("type Log struct {\n")
-	b.WriteString("\tChainID          uint64    " + tag("chain_id", "chain_id") + "\n")
-	b.WriteString("\tBlockNumber      uint64    " + tag("block_number", "block_number") + "\n")
-	b.WriteString("\tBlockTimestamp   time.Time " + tag("block_timestamp", "block_timestamp") + "\n")
-	b.WriteString("\tBlockHash        string    " + tag("block_hash", "block_hash") + "\n")
-	b.WriteString("\tTransactionHash  string    " + tag("transaction_hash", "transaction_hash") + "\n")
-	b.WriteString("\tTransactionIndex uint64    " + tag("transaction_index", "transaction_index") + "\n")
-	b.WriteString("\tLogIndex         uint64    " + tag("log_index", "log_index") + "\n")
-	b.WriteString("\tAddress          string    " + tag("address", "address") + "\n")
-	b.WriteString("\tEventName        string    " + tag("event_name", "event_name") + "\n")
-	b.WriteString("\tTopic0           string    " + tag("topic0", "topic0") + "\n")
-	b.WriteString("\tParams           string    " + tag("params", "params") + "\n")
-	b.WriteString("\tInsertedAt       time.Time " + tag("inserted_at", "inserted_at") + "\n")
-	b.WriteString("}\n\n")
-
-	b.WriteString("type SyncState struct {\n")
-	b.WriteString("\tChainID        uint64    " + tag("chain_id", "chain_id") + "\n")
-	b.WriteString("\tLastBlock      uint64    " + tag("last_block", "last_block") + "\n")
-	b.WriteString("\tLastHash       string    " + tag("last_hash", "last_hash") + "\n")
-	b.WriteString("\tFinalizedBlock uint64    " + tag("finalized_block", "finalized_block") + "\n")
-	b.WriteString("\tFinalizedHash  string    " + tag("finalized_hash", "finalized_hash") + "\n")
-	b.WriteString("\tRollbackChain  string    " + tag("rollback_chain", "rollback_chain") + "\n")
-	b.WriteString("\tUpdatedAt      time.Time " + tag("updated_at", "updated_at") + "\n")
-	b.WriteString("}\n\n")
-
-	b.WriteString("type Entities struct {\n")
-	for _, ev := range events {
-		b.WriteString("\t")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString(" []")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString("\n")
-	}
-	b.WriteString("\tBlockNumber uint64\n")
-	b.WriteString("}\n\n")
-
-	b.WriteString("func AppendDecodedLog(entities *Entities, decoded *DecodedLog, meta EventMeta) bool {\n")
-	b.WriteString("\tif entities == nil || decoded == nil || decoded.Value == nil {\n")
-	b.WriteString("\t\treturn false\n")
-	b.WriteString("\t}\n")
-	b.WriteString("\tswitch ev := decoded.Value.(type) {\n")
-	for _, ev := range events {
-		b.WriteString("\tcase *")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString(":\n")
-		b.WriteString("\t\tev.EventMeta = meta\n")
-		b.WriteString("\t\tentities.")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString(" = append(entities.")
-		b.WriteString(ev.GoTypeName)
-		b.WriteString(", *ev)\n")
-	}
-	b.WriteString("\tdefault:\n")
-	b.WriteString("\t\treturn false\n")
-	b.WriteString("\t}\n")
-	b.WriteString("\tif meta.BlockNumber > entities.BlockNumber {\n")
-	b.WriteString("\t\tentities.BlockNumber = meta.BlockNumber\n")
-	b.WriteString("\t}\n")
-	b.WriteString("\treturn true\n")
-	b.WriteString("}\n")
-
-	return format.Source(b.Bytes())
+	src := template.MustExecute("code/schemaGo", struct {
+		Events []eventSpec
+	}{Events: events})
+	return format.Source([]byte(src))
 }
 
 func stateEventToCustomTableSpec(ev *eventSpec, state config.StateConfig) customTableSpec {

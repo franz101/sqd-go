@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/franz101/sqd-go/internal/config"
 )
 
 func TestGenerateWritesSQLViewsAndGoCode(t *testing.T) {
@@ -615,4 +617,69 @@ chains:
 	assertContains(t, inserterGo, `"block_hash"`)
 	assertNotContains(t, inserterGo, `"contract_address"`)
 	assertNotContains(t, inserterGo, `"transaction_hash"`)
+}
+
+func TestGenerateCustomSchemaSQLGolden(t *testing.T) {
+	cfg := &config.Config{Name: "test_golden"}
+	tables := []customTableSpec{
+		{
+			Name:       "positions",
+			Engine:     "ReplacingMergeTree(block_number)",
+			GoTypeName: "Position",
+			PrimaryKey: []string{"account", "token"},
+			OrderBy:    []string{"account", "token", "block_number", "transaction_index", "log_index"},
+			Columns: []customColumnSpec{
+				{Name: "account", Type: "FixedString(20)"},
+				{Name: "token", Type: "FixedString(32)"},
+				{Name: "balance", Type: "UInt256", Default: "0"},
+				{Name: "updated_at", Type: "DateTime64(3, 'UTC')", Default: "now64(3)"},
+				{Name: "block_number", Type: "UInt64"},
+				{Name: "transaction_index", Type: "UInt64"},
+				{Name: "log_index", Type: "UInt64"},
+			},
+		},
+	}
+
+	got := generateCustomSchemaSQL(cfg, tables)
+
+	// Golden output
+	want := `
+-- Custom tables generated from custom schema definitions.
+
+
+CREATE TABLE IF NOT EXISTS ` + "`test_golden`" + `.` + "`positions`" + ` (
+  ` + "`account`" + ` FixedString(20),
+  ` + "`token`" + ` FixedString(32),
+  ` + "`balance`" + ` UInt256 DEFAULT 0,
+  ` + "`updated_at`" + ` DateTime64(3, 'UTC') DEFAULT now64(3),
+  ` + "`block_number`" + ` UInt64,
+  ` + "`transaction_index`" + ` UInt64,
+  ` + "`log_index`" + ` UInt64
+) ENGINE = ReplacingMergeTree(block_number)
+PRIMARY KEY (` + "`account`" + `, ` + "`token`" + `)
+ORDER BY (` + "`account`" + `, ` + "`token`" + `, ` + "`block_number`" + `, ` + "`transaction_index`" + `, ` + "`log_index`" + `);
+`
+
+	if got != want {
+		t.Errorf("output mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+
+	// Linter: verify structural properties
+	assertContains(t, got, "CREATE TABLE IF NOT EXISTS")
+	assertContains(t, got, "ENGINE = ReplacingMergeTree")
+	assertContains(t, got, "PRIMARY KEY (")
+	assertContains(t, got, "ORDER BY (")
+	assertContains(t, got, ");")
+	// Verify balanced parentheses
+	if strings.Count(got, "(") != strings.Count(got, ")") {
+		t.Errorf("unbalanced parentheses in output: %d '(' vs %d ')'", strings.Count(got, "("), strings.Count(got, ")"))
+	}
+}
+
+func TestGenerateCustomSchemaSQLEmpty(t *testing.T) {
+	cfg := &config.Config{Name: "empty_db"}
+	got := generateCustomSchemaSQL(cfg, nil)
+	assertContains(t, got, "-- Custom tables generated from custom schema definitions.")
+	// Should only have the header comment, no CREATE TABLE
+	assertNotContains(t, got, "CREATE TABLE")
 }

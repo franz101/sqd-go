@@ -41,6 +41,21 @@ const (
 	defaultParallelBurst = 50
 
 	parallelMaxAttempts = 24
+
+	// Adaptive gap-fill sizing bounds. The portal returns blocks dynamically when
+	// no toBlock is pinned: it scans far through empty regions (a single response
+	// can cover many thousands of blocks) but returns only a short run once it hits
+	// matching/dense data. A lone sequential walker is therefore fast through empty
+	// regions but slow through dense ones. To beat that, we pin each request's
+	// toBlock to the *recently observed delivered span* so that:
+	//   - in empty regions the pin is wide (≈ adaptiveGapMax), letting one request
+	//     jump far — no pointless fan-out, matching the no-toBlock walk speed; and
+	//   - in dense regions the pin shrinks toward what the portal actually returns,
+	//     turning the remaining span into many small in-order gap units that the
+	//     worker pool fills concurrently (the shared rate limiter is the ceiling).
+	// The estimate re-measures continuously, so the pin keeps tracking density.
+	adaptiveGapMin = 100    // floor: never pin tighter than a dense portal page (~100)
+	adaptiveGapMax = 131072 // ceiling: at/above the portal's ~106k empty-region scan cap
 )
 
 // rateLimiter is a shared token bucket: every concurrent worker draws from one
@@ -122,11 +137,35 @@ type fetchChunk struct {
 	err         error       // fetch error if any
 }
 
+// blockRange is one work unit: a half-open-free inclusive [from, to] span a
+// worker fetches in a single portal request. Units are claimed at ~one-request
+// granularity (stride ≈ the portal's observed jump) so CONSECUTIVE requests go to
+// DIFFERENT workers — the in-order head is filled concurrently instead of by one
+// worker walking a whole page sequentially.
 type blockRange struct {
 	from uint64
 	to   uint64
 }
 
+// parallelPrefetcher fetches a bounded, fully-finalized block range using N
+// concurrent workers (paced by one shared rate limiter) and hands chunks
+// (individual portal responses) to a single consumer in strict ascending
+// block order. It exists because the sequential producer is bound by per-page
+// HTTP round-trip latency to the portal, not by data, so a deep backfill is
+// round-trip bound; running N cursor loops concurrently keeps the portal's
+// request budget saturated.
+//
+// The chunk-based design ensures visible progress immediately: the first
+// successful response becomes available to the consumer without waiting
+// for the entire 10,000-block page to accumulate. Chunks are reordered
+// so the in-order consumer is unaffected by out-of-order completion.
+//
+// Correctness rests on the range being at or below the finalized head: those
+// blocks are immutable, so workers skip the parent-hash fork-detection handshake
+// (parentBlockHash="") and fetch disjoint ranges out of order. The reorder
+// buffer (the ready map + nextEmit) re-serializes them so the in-order consumer
+// is unaffected. With includeAllBlocks=false the chunks are sparse and the
+// consumer skips the empty block-number gaps (see ReplayBuffer.CeilBlock).
 type parallelPrefetcher struct {
 	endpoint         string
 	filters          []client.LogFilter
@@ -138,16 +177,23 @@ type parallelPrefetcher struct {
 	maxAhead         uint64 // bounded look-ahead window, in block numbers
 	limiter          *rateLimiter
 
-	nextBlock atomic.Uint64 // next fresh block to claim
+	nextBlock atomic.Uint64 // next unclaimed block (monotonic cursor over [start,end])
+
+	// gapSpan is the shared, continuously re-measured estimate of how many blocks
+	// a single portal response delivers (covered span), used to size each work
+	// unit. All workers read and update it so density learned by one worker steers
+	// the whole pool. It is an exponential moving average kept in fixed point
+	// (block count); see updateGapSpan / currentGapSpan.
+	gapSpan atomic.Uint64
 
 	mu            sync.Mutex
 	cond          *sync.Cond
 	ready         map[uint64]*fetchChunk
-	nextEmit      uint64 // next expected sequence number (starts at startBlock)
-	stopClaim     bool   // an errored chunk was delivered; stop claiming new work
-	doneWG        bool   // all workers have exited
-	activeWorkers int    // number of workers currently fetching
-	gaps          []blockRange // high-priority gaps
+	nextEmit      uint64       // next expected sequence number (starts at startBlock)
+	gaps          []blockRange // high-priority remainders of short (dense) responses, ascending
+	activeWorkers int          // units currently being fetched (in flight)
+	stopClaim     bool         // an errored chunk was delivered; stop claiming new work
+	doneWG        bool         // all workers have exited
 }
 
 func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeAllBlocks bool, start, end, pageSize uint64, workers int, limiter *rateLimiter) *parallelPrefetcher {
@@ -173,19 +219,24 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 		ready:            make(map[uint64]*fetchChunk),
 	}
 	p.nextBlock.Store(start)
+	// Start optimistic: assume an empty region so the first units are wide and one
+	// request jumps far. The estimate contracts as soon as a short (dense, or
+	// portal-natural-cap) response is observed.
+	p.gapSpan.Store(adaptiveGapMax)
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
 
+// launch starts the worker pool plus two helper goroutines: one flips doneWG once
+// every worker exits, and one broadcasts on cancellation so workers blocked on the
+// look-ahead window and a consumer blocked in Next wake to observe ctx.Err().
 func (p *parallelPrefetcher) launch(ctx context.Context) {
+	// Initialize nextEmit to the start block (sequences are block-based)
 	p.nextEmit = p.startBlock
+
 	var wg sync.WaitGroup
 	for range p.workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			p.worker(ctx)
-		}()
+		wg.Go(func() { p.worker(ctx) })
 	}
 	go func() {
 		wg.Wait()
@@ -249,43 +300,6 @@ func (p *parallelPrefetcher) Next(ctx context.Context) (*fetchChunk, bool) {
 		p.cond.Wait()
 	}
 }
-func (p *parallelPrefetcher) getWork(ctx context.Context) (blockRange, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for {
-		if ctx.Err() != nil || p.stopClaim {
-			return blockRange{}, false
-		}
-
-		if len(p.gaps) > 0 {
-			gap := p.gaps[0]
-			if gap.from <= p.nextEmit+p.maxAhead {
-				p.gaps = p.gaps[1:]
-				p.activeWorkers++
-				return gap, true
-			}
-		}
-
-		from := p.nextBlock.Load()
-		if from <= p.endBlock {
-			if from <= p.nextEmit+p.maxAhead {
-				to := min(from+p.pageSize-1, p.endBlock)
-				p.nextBlock.Store(to + 1)
-				p.activeWorkers++
-				return blockRange{from: from, to: to}, true
-			}
-		}
-
-		if from > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
-			p.stopClaim = true
-			p.cond.Broadcast()
-			return blockRange{}, false
-		}
-
-		p.cond.Wait()
-	}
-}
 
 func (p *parallelPrefetcher) worker(ctx context.Context) {
 	cl := client.New(p.endpoint)
@@ -297,126 +311,203 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 		if !ok {
 			return
 		}
-
-		if !p.fetchAndDeliverChunks(ctx, cl, r, workerID) {
-			p.mu.Lock()
-			p.activeWorkers--
-			if p.nextBlock.Load() > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
-				p.stopClaim = true
-				p.cond.Broadcast()
-			}
-			p.mu.Unlock()
-			return
+		// One unit == one request. The worker returns to getWork immediately
+		// after, so consecutive requests are claimed by whichever worker is free —
+		// the in-order head is filled concurrently rather than by one worker
+		// cursoring a whole page.
+		if !p.fetchOne(ctx, cl, r, workerID) {
+			return // fatal error or context cancelled
 		}
-
-		p.mu.Lock()
-		p.activeWorkers--
-		if p.nextBlock.Load() > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
-			p.stopClaim = true
-			p.cond.Broadcast()
-		}
-		p.mu.Unlock()
 	}
 }
 
-func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *client.Client, r blockRange, workerID int) bool {
-	cur := r.from
-	attempt := 0
+// windowLimit is the look-ahead budget (in blocks) ahead of nextEmit that workers
+// may claim. It tracks the adaptive stride so the window always admits about
+// 2×workers units regardless of density: wide in empty regions (a few large-span
+// but tiny-payload chunks) and narrow in dense regions (many small-span chunks,
+// bounding buffered raw JSONL). Floored at the configured page window.
+func (p *parallelPrefetcher) windowLimit() uint64 {
+	w := p.currentGapSpan() * uint64(p.workers) * 2
+	if w < p.maxAhead {
+		w = p.maxAhead
+	}
+	return w
+}
 
-	for cur <= r.to {
+// getWork claims the next unit: a pending gap (short-response remainder, highest
+// priority since it is the lowest unemitted block) or a fresh stride off the
+// cursor. It blocks until a unit is claimable within the look-ahead window, or
+// returns ok=false when the range is exhausted, an error latched stopClaim, or
+// ctx is cancelled. activeWorkers is incremented for every unit returned and must
+// be balanced by finishUnit.
+func (p *parallelPrefetcher) getWork(ctx context.Context) (blockRange, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for {
+		if ctx.Err() != nil || p.stopClaim {
+			return blockRange{}, false
+		}
+		window := p.nextEmit + p.windowLimit()
+
+		// Gaps first: they are below the cursor and gate nextEmit progress.
+		if len(p.gaps) > 0 && p.gaps[0].from <= window {
+			g := p.gaps[0]
+			p.gaps = p.gaps[1:]
+			p.activeWorkers++
+			return g, true
+		}
+
+		// Fresh stride off the cursor. Probe slightly above the current estimate
+		// so the stride can grow back toward the portal's natural jump after a
+		// dense stretch; an overshoot just yields a (re-queued) gap, never a miss.
+		from := p.nextBlock.Load()
+		if from <= p.endBlock && from <= window {
+			stride := p.currentGapSpan()
+			stride += stride / 4
+			if stride > adaptiveGapMax {
+				stride = adaptiveGapMax
+			}
+			to := min(from+stride-1, p.endBlock)
+			p.nextBlock.Store(to + 1)
+			p.activeWorkers++
+			return blockRange{from: from, to: to}, true
+		}
+
+		// Termination: cursor exhausted, no gaps, nothing in flight that could
+		// enqueue a new gap. Latch stopClaim so peers and Next() unblock.
+		if from > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
+			p.stopClaim = true
+			p.cond.Broadcast()
+			return blockRange{}, false
+		}
+
+		p.cond.Wait()
+	}
+}
+
+// finishUnit balances the activeWorkers increment from getWork and wakes peers so
+// a worker blocked in getWork re-evaluates termination or a freshly enqueued gap.
+func (p *parallelPrefetcher) finishUnit() {
+	p.mu.Lock()
+	p.activeWorkers--
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
+
+// fetchOne issues exactly one portal request for the unit [r.from, r.to] (pinning
+// toBlock=r.to so the response never escapes the unit), delivers the chunk, folds
+// the observed span into the density estimate, and — if the response fell short of
+// r.to (a dense region, where the portal returns fewer blocks than pinned) —
+// re-queues the uncovered remainder [coveredTo+1, r.to] as gap units. Completeness:
+// every block of the unit is covered by this chunk OR by a re-queued gap, and units
+// themselves tile [start,end] via the cursor, so no block is ever skipped.
+// Returns false on a fatal/cancelled fetch (an error chunk is delivered first).
+func (p *parallelPrefetcher) fetchOne(ctx context.Context, cl *client.Client, r blockRange, workerID int) bool {
+	defer p.finishUnit()
+
+	attempt := 0
+	for {
 		if ctx.Err() != nil {
 			return false
 		}
-
 		if err := p.limiter.wait(ctx); err != nil {
-			p.deliverChunk(&fetchChunk{seq: cur, from: cur, err: err})
+			p.deliverChunk(&fetchChunk{seq: r.from, from: r.from, err: err})
 			return false
 		}
 
 		toPin := r.to
-		resp, err := cl.FetchWithParent(ctx, cur, &toPin, "", p.includeAllBlocks, p.filters)
+		resp, err := cl.FetchWithParent(ctx, r.from, &toPin, "", p.includeAllBlocks, p.filters)
 		if err != nil {
 			if ctx.Err() != nil {
-				p.deliverChunk(&fetchChunk{seq: cur, from: cur, err: ctx.Err()})
+				p.deliverChunk(&fetchChunk{seq: r.from, from: r.from, err: ctx.Err()})
 				return false
 			}
 			attempt++
 			if attempt > parallelMaxAttempts {
-				p.deliverChunk(&fetchChunk{
-					seq:  cur,
-					from: cur,
-					err:  fmt.Errorf("worker %d: parallel fetch gave up after %d attempts: %w", workerID, attempt, err),
-				})
+				p.deliverChunk(&fetchChunk{seq: r.from, from: r.from,
+					err: fmt.Errorf("worker %d: parallel fetch gave up after %d attempts: %w", workerID, attempt, err)})
 				return false
 			}
 			p.backoff(ctx, attempt)
 			continue
 		}
 
-		attempt = 0
-		seq := cur
-
-		coveredTo := cur
+		// coveredTo is the scanned high-water mark. The real portal (skipEmpties)
+		// always returns a non-empty body — matching blocks plus a marker block at
+		// the scan extent — so coveredTo comes from that last block and can jump far
+		// (up to the pin), keeping empty regions as fast as a no-toBlock walk.
+		//
+		// An EMPTY (204) body carries no marker, so we cannot tell how far the portal
+		// scanned. The real portal does not do this within a finalized range, so it is
+		// defensive: bound the blind skip to one page, guaranteeing a dense band is
+		// never skipped by more than pageSize (the uncovered remainder is re-queued).
+		// The portal honors the pin, so a returned block never exceeds r.to.
+		coveredTo := min(r.from+p.pageSize-1, r.to)
 		if len(resp.Raw) > 0 {
 			last, lerr := lastBlockNumber(resp.Raw)
 			if lerr != nil {
-				p.deliverChunk(&fetchChunk{seq: seq, from: cur, err: fmt.Errorf("worker %d: parse last block: %w", workerID, lerr)})
+				p.deliverChunk(&fetchChunk{seq: r.from, from: r.from,
+					err: fmt.Errorf("worker %d: parse last block: %w", workerID, lerr)})
 				return false
 			}
-			if last >= cur {
-				coveredTo = last
+			if last < r.from {
+				last = r.from
 			}
+			if last > r.to {
+				last = r.to
+			}
+			coveredTo = last
+		}
+
+		// Density: a short response (coveredTo < r.to) is the portal's own stopping
+		// point — its natural page for this region; contract toward it. A filled unit
+		// (coveredTo == r.to) means the portal had at least this much, so feed the full
+		// span to hold/grow the estimate back toward the portal's natural jump.
+		if coveredTo < r.to {
+			p.updateGapSpan(coveredTo - r.from + 1)
+		} else {
+			p.updateGapSpan(r.to - r.from + 1)
 		}
 
 		rawCopy := make([]byte, len(resp.Raw))
 		copy(rawCopy, resp.Raw)
-
 		p.deliverChunk(&fetchChunk{
-			seq:         seq,
-			from:        cur,
+			seq:         r.from,
+			from:        r.from,
 			coveredTo:   coveredTo,
 			requestedTo: toPin,
 			raw:         rawCopy,
 			head:        resp.Head,
 		})
 
-		p.mu.Lock()
-		stop := p.stopClaim
-		p.mu.Unlock()
-		if stop {
-			return false
+		// Short response: re-queue the uncovered remainder so other workers fill it
+		// concurrently and in order. This is the completeness guarantee for dense
+		// regions where one request cannot cover the whole unit.
+		if coveredTo < r.to {
+			p.enqueueGaps(coveredTo+1, r.to)
 		}
-
-		if coveredTo >= r.to {
-			return true
-		}
-
-		remainingSpan := r.to - coveredTo
-		batchSize := p.pageSize / 10
-		if batchSize < 100 {
-			batchSize = 100
-		}
-
-		if remainingSpan > batchSize {
-			p.mu.Lock()
-			nextStart := coveredTo + 1
-			for nextStart <= r.to {
-				nextEnd := min(nextStart+batchSize-1, r.to)
-				p.gaps = append(p.gaps, blockRange{from: nextStart, to: nextEnd})
-				nextStart = nextEnd + 1
-			}
-			sort.Slice(p.gaps, func(i, j int) bool {
-				return p.gaps[i].from < p.gaps[j].from
-			})
-			p.cond.Broadcast()
-			p.mu.Unlock()
-			return true
-		}
-
-		cur = coveredTo + 1
+		return true
 	}
+}
 
-	return true
+// enqueueGaps splits [from,to] into estimate-sized units and inserts them into the
+// priority gap queue (kept ascending so the lowest unemitted block is fetched
+// first). Sized to the current — now contracted — estimate so a dense remainder
+// becomes several concurrent units rather than one serial cursor.
+func (p *parallelPrefetcher) enqueueGaps(from, to uint64) {
+	span := p.currentGapSpan()
+	if span < 1 {
+		span = 1
+	}
+	p.mu.Lock()
+	for cur := from; cur <= to; {
+		end := min(cur+span-1, to)
+		p.gaps = append(p.gaps, blockRange{from: cur, to: end})
+		cur = end + 1
+	}
+	sort.Slice(p.gaps, func(i, j int) bool { return p.gaps[i].from < p.gaps[j].from })
+	p.cond.Broadcast()
+	p.mu.Unlock()
 }
 
 // deliverChunk adds a chunk to the ready map and broadcasts to wake the consumer.
@@ -429,6 +520,47 @@ func (p *parallelPrefetcher) deliverChunk(chunk *fetchChunk) {
 		p.stopClaim = true
 	}
 	p.cond.Broadcast()
+}
+
+// currentGapSpan returns the adaptive per-request batch size: how many blocks the
+// next request should pin its toBlock to span, clamped to [adaptiveGapMin,
+// adaptiveGapMax]. This is the gap-fill unit fanned out across workers.
+func (p *parallelPrefetcher) currentGapSpan() uint64 {
+	s := p.gapSpan.Load()
+	if s < adaptiveGapMin {
+		return adaptiveGapMin
+	}
+	if s > adaptiveGapMax {
+		return adaptiveGapMax
+	}
+	return s
+}
+
+// updateGapSpan folds a freshly observed delivered span into the shared estimate
+// with an exponential moving average (1/4 weight on the new sample). The smoothing
+// makes the pin react quickly when responses shrink (density rising) or grow (back
+// to empty) without thrashing on a single outlier. A delivered span only counts as
+// "the portal's natural page" when the request was NOT artificially capped by the
+// page/range boundary; a boundary-capped response says nothing about density, so
+// callers pass observed=0 to skip the update in that case.
+func (p *parallelPrefetcher) updateGapSpan(observed uint64) {
+	if observed == 0 {
+		return
+	}
+	for {
+		old := p.gapSpan.Load()
+		// EWMA: new = old*3/4 + observed*1/4.
+		next := old - old/4 + observed/4
+		if next < adaptiveGapMin {
+			next = adaptiveGapMin
+		}
+		if next > adaptiveGapMax {
+			next = adaptiveGapMax
+		}
+		if p.gapSpan.CompareAndSwap(old, next) {
+			return
+		}
+	}
 }
 
 func (p *parallelPrefetcher) backoff(ctx context.Context, attempt int) {
@@ -505,11 +637,10 @@ func parallelFinalizedBound(cursorMode bool, from, lastFinalized uint64, end *ui
 // parallelMinSpan returns the minimum span (in blocks) that justifies engaging
 // parallel fetch, accounting for page size and worker coordination overhead.
 func parallelMinSpan(pageSize, workers int) uint64 {
-	// Reduced from 2 pages per worker to 1 page per worker for earlier engagement
-	// With 6 workers and 10K page size: 60K blocks (down from 120K)
-	minPages := workers
-	if minPages < 2 {
-		minPages = 2
+	// At least two full pages per worker so coordination overhead is amortized
+	minPages := 2
+	if workers*2 > minPages {
+		minPages = workers * 2
 	}
 	return uint64(minPages) * uint64(pageSize)
 }

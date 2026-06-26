@@ -121,9 +121,10 @@ func TestParallelPrefetcherInOrderComplete(t *testing.T) {
 }
 
 func TestParallelPrefetcherErrorSurfacedInOrder(t *testing.T) {
-	// pageSize 500 over [1000,5000]: page 0 = [1000,1499] (valid), page 1 =
-	// [1500,1999] (garbage). The error must surface at from 1500, after all
-	// valid chunks from page 0.
+	// Requests whose fromBlock lands in [1500,1999] return garbage. The error must
+	// surface in order: after every valid chunk below the garbage region, at the
+	// first unit whose from falls inside it. The exact from depends on the unit
+	// stride, so we only require it to be within the garbage region.
 	srv := fakeParallelPortal(137, 1500, 1999, 0)
 	defer srv.Close()
 
@@ -135,22 +136,22 @@ func TestParallelPrefetcherErrorSurfacedInOrder(t *testing.T) {
 	for {
 		pg, ok := p.Next(context.Background())
 		if !ok {
-			t.Fatalf("parallel fetch stopped before reaching error at from=1500")
+			t.Fatalf("parallel fetch stopped before reaching the garbage region")
 		}
 		if pg.err != nil {
-			// Error chunk found - should be at from=1500
-			if pg.from != 1500 {
-				t.Fatalf("error chunk at from=%d, want 1500 (err=%v)", pg.from, pg.err)
+			// Error chunk found - must surface inside the garbage region [1500,1999].
+			if pg.from < 1500 || pg.from > 1999 {
+				t.Fatalf("error chunk at from=%d, want within [1500,1999] (err=%v)", pg.from, pg.err)
 			}
 			return // success
 		}
-		// Valid chunks should be from page 0 (1000-1499 range)
+		// Valid chunks must all start below the garbage region (in order).
 		if pg.from < 1000 || pg.from >= 1500 {
 			t.Fatalf("valid chunk at from=%d outside expected range [1000,1499]", pg.from)
 		}
 		validChunks++
 		if validChunks > 100 {
-			t.Fatalf("too many valid chunks (%d) without hitting error at from=1500", validChunks)
+			t.Fatalf("too many valid chunks (%d) without hitting the garbage region", validChunks)
 		}
 	}
 }
@@ -484,17 +485,16 @@ func TestParallelPrefetcherRegression_SparseEmptyResponse(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&q)
 		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
-		if q.FromBlock%1000 != 0 {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte{})
-			return
-		}
-		last := q.FromBlock + 99
-		if q.ToBlock != nil && last > *q.ToBlock {
-			last = *q.ToBlock
+		// Forward-scanning skipEmpties portal: a request [from, pin] returns every
+		// matching block (multiples of 1000) in that range — the portal does not
+		// require the request to start exactly on a data block. An empty 200 is
+		// returned only when the pinned range genuinely contains no data.
+		pin := uint64(1) << 62
+		if q.ToBlock != nil {
+			pin = *q.ToBlock
 		}
 		var b strings.Builder
-		for n := q.FromBlock; n <= last; n += 1000 {
+		for n := ((q.FromBlock + 999) / 1000) * 1000; n <= pin; n += 1000 {
 			fmt.Fprintf(&b, "{\"header\":{\"number\":%d,\"hash\":\"0x%064x\",\"timestamp\":%d}}\n", n, n, 1700000000+n)
 		}
 		w.WriteHeader(http.StatusOK)
@@ -867,6 +867,214 @@ func TestParallelPrefetcherRegression_CancelDuringBackoff(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("workers did not exit after cancel")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Adaptive density-driven gap-fill tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+// densityPortal emulates the portal's dynamic no-toBlock walk: it scans forward
+// from fromBlock and returns blocks for the dense region [denseFrom, denseTo],
+// skipping empty regions in a single wide jump. With includeAllBlocks=false an
+// empty scan returns an empty 200 body whose effective coverage is the pinned
+// toBlock (the high-water mark the portal scanned to). It records every requested
+// [from,to] range and the peak number of in-flight requests so a test can assert
+// both the gap sizing and the fan-out.
+type densityPortal struct {
+	srv       *httptest.Server
+	denseFrom uint64
+	denseTo   uint64
+	denseCap  uint64 // max blocks returned per response inside the dense region
+
+	mu       sync.Mutex
+	ranges   [][2]uint64 // recorded [from, pinnedTo]
+	inflight int
+	peak     int
+}
+
+func newDensityPortal(denseFrom, denseTo, denseCap uint64, delay time.Duration) *densityPortal {
+	dp := &densityPortal{denseFrom: denseFrom, denseTo: denseTo, denseCap: denseCap}
+	dp.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			FromBlock uint64  `json:"fromBlock"`
+			ToBlock   *uint64 `json:"toBlock"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		w.Header().Set("X-Sqd-Finalized-Head-Number", "99999999")
+
+		// toBlock is always pinned by the prefetcher; default huge if absent.
+		pinnedTo := uint64(1) << 62
+		if q.ToBlock != nil {
+			pinnedTo = *q.ToBlock
+		}
+
+		dp.mu.Lock()
+		dp.ranges = append(dp.ranges, [2]uint64{q.FromBlock, pinnedTo})
+		dp.inflight++
+		if dp.inflight > dp.peak {
+			dp.peak = dp.inflight
+		}
+		dp.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		defer func() {
+			dp.mu.Lock()
+			dp.inflight--
+			dp.mu.Unlock()
+		}()
+
+		// Dense region: return up to denseCap contiguous blocks (a short "page").
+		if q.FromBlock >= dp.denseFrom && q.FromBlock <= dp.denseTo && pinnedTo >= dp.denseFrom {
+			last := q.FromBlock + dp.denseCap - 1
+			if last > dp.denseTo {
+				last = dp.denseTo
+			}
+			if last > pinnedTo {
+				last = pinnedTo
+			}
+			var b strings.Builder
+			for n := q.FromBlock; n <= last; n++ {
+				fmt.Fprintf(&b, `{"header":{"number":%d,"hash":"0x%064x","timestamp":%d}}`+"\n", n, n, 1700000000+n)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(b.String()))
+			return
+		}
+
+		// Empty region: portal scanned [from, pinnedTo] and found no matching data.
+		// Mirrors includeAllBlocks=false behavior — an empty 200 body.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{})
+	}))
+	return dp
+}
+
+func (dp *densityPortal) close() { dp.srv.Close() }
+
+func (dp *densityPortal) snapshot() (ranges [][2]uint64, peak int) {
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+	cp := make([][2]uint64, len(dp.ranges))
+	copy(cp, dp.ranges)
+	return cp, dp.peak
+}
+
+// drain consumes the prefetcher to completion, returning the matched block numbers.
+func drain(t *testing.T, p *parallelPrefetcher) []uint64 {
+	t.Helper()
+	var got []uint64
+	for {
+		pg, ok := p.Next(context.Background())
+		if !ok {
+			break
+		}
+		if pg.err != nil {
+			t.Fatalf("unexpected err at from=%d: %v", pg.from, pg.err)
+		}
+		got = append(got, blockNumbersOf(t, pg.raw)...)
+	}
+	return got
+}
+
+// TestParallelPrefetcherAdaptiveCompletenessMixed proves the adaptive gap-fill
+// stays complete and in-order across a mixed empty+dense range with
+// includeAllBlocks=false: a large empty prefix, a dense band, then an empty
+// suffix. Every dense block must appear exactly once, ascending.
+func TestParallelPrefetcherAdaptiveCompletenessMixed(t *testing.T) {
+	const start, end uint64 = 0, 60000
+	const denseFrom, denseTo, denseCap uint64 = 30000, 32000, 100
+	dp := newDensityPortal(denseFrom, denseTo, denseCap, 0)
+	defer dp.close()
+
+	p := newParallelPrefetcher(dp.srv.URL, nil, false /*includeAllBlocks*/, start, end, defaultParallelPageSize, 6, noRateLimit())
+	p.launch(context.Background())
+	got := drain(t, p)
+
+	wantN := denseTo - denseFrom + 1
+	if uint64(len(got)) != wantN {
+		t.Fatalf("got %d dense blocks, want %d", len(got), wantN)
+	}
+	for i, n := range got {
+		if want := denseFrom + uint64(i); n != want {
+			t.Fatalf("block[%d]=%d, want %d (gap/overlap/dup)", i, n, want)
+		}
+	}
+}
+
+// TestParallelPrefetcherAdaptiveDenseGapSizing proves that in a dense region the
+// prefetcher contracts its toBlock pin toward the observed delivery size and fans
+// the resulting small gap units across multiple workers concurrently.
+func TestParallelPrefetcherAdaptiveDenseGapSizing(t *testing.T) {
+	// Entirely dense range so every response is a short denseCap page. The pin must
+	// converge near denseCap and many requests must overlap in flight.
+	const start, end uint64 = 0, 20000
+	const denseCap uint64 = 100
+	dp := newDensityPortal(start, end, denseCap, 5*time.Millisecond)
+	defer dp.close()
+
+	p := newParallelPrefetcher(dp.srv.URL, nil, true /*includeAllBlocks*/, start, end, defaultParallelPageSize, 6, noRateLimit())
+	p.launch(context.Background())
+	got := drain(t, p)
+
+	if uint64(len(got)) != end-start+1 {
+		t.Fatalf("got %d blocks, want %d", len(got), end-start+1)
+	}
+
+	ranges, peak := dp.snapshot()
+	if peak < 2 {
+		t.Fatalf("dense region did not fan out: peak in-flight requests = %d, want >= 2", peak)
+	}
+
+	// After warm-up the pinned spans must contract toward the observed denseCap,
+	// not stay at the wide initial estimate. Inspect the back half of the requests
+	// (the estimate has converged by then) and require the median pinned span to be
+	// within a small multiple of denseCap.
+	var spans []uint64
+	for _, rg := range ranges[len(ranges)/2:] {
+		spans = append(spans, rg[1]-rg[0]+1)
+	}
+	if len(spans) == 0 {
+		t.Fatal("no requests recorded")
+	}
+	var sum uint64
+	for _, s := range spans {
+		sum += s
+	}
+	avg := sum / uint64(len(spans))
+	if avg > denseCap*4 {
+		t.Fatalf("pinned span did not contract to density: avg=%d, want <= %d (denseCap=%d)", avg, denseCap*4, denseCap)
+	}
+	if avg < adaptiveGapMin {
+		t.Fatalf("pinned span contracted below floor: avg=%d, floor=%d", avg, adaptiveGapMin)
+	}
+}
+
+// TestParallelPrefetcherAdaptiveEmptyMinimalRequests proves a fully-empty range
+// completes with very few requests — each empty response lets the pin jump a wide
+// span, so the prefetcher does NOT pointlessly fan out one request per small page.
+func TestParallelPrefetcherAdaptiveEmptyMinimalRequests(t *testing.T) {
+	const start, end uint64 = 0, 200000
+	// denseFrom > denseTo => no dense region at all: every response is empty.
+	dp := newDensityPortal(1, 0, 100, 0)
+	defer dp.close()
+
+	p := newParallelPrefetcher(dp.srv.URL, nil, false /*includeAllBlocks*/, start, end, defaultParallelPageSize, 6, noRateLimit())
+	p.launch(context.Background())
+	got := drain(t, p)
+	if len(got) != 0 {
+		t.Fatalf("got %d blocks over an empty range, want 0", len(got))
+	}
+
+	ranges, _ := dp.snapshot()
+	// With a wide adaptiveGapMax pin, the span is covered in jumps of ~adaptiveGapMax.
+	// A naive fixed-small-page walk would need orders of magnitude more requests.
+	// Allow generous slack for grid partitioning but require it stays bounded.
+	span := end - start + 1
+	maxExpected := int(span/adaptiveGapMax) + p.workers*4 + 8
+	if len(ranges) > maxExpected {
+		t.Fatalf("empty range fanned out pointlessly: %d requests, want <= %d", len(ranges), maxExpected)
 	}
 }
 

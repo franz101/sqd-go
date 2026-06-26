@@ -1054,25 +1054,6 @@ func renderGenericPrefetchBlocksState(b *bytes.Buffer, cfg *config.Config, event
 		if block == nil {
 			continue
 		}
-		// Custom prefetch for Position on OrderFilled events
-		for _, ev := range block.ExchangeOrderFilleds {
-			var tokenID common.Hash
-			if ev.MakerAssetID.IsZero() {
-				ev.TakerAssetID.WriteToSlice(tokenID[:])
-			} else {
-				ev.MakerAssetID.WriteToSlice(tokenID[:])
-			}
-			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker, TokenID: tokenID})
-		}
-		for _, ev := range block.NegRiskExchangeOrderFilleds {
-			var tokenID common.Hash
-			if ev.MakerAssetID.IsZero() {
-				ev.TakerAssetID.WriteToSlice(tokenID[:])
-			} else {
-				ev.MakerAssetID.WriteToSlice(tokenID[:])
-			}
-			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker, TokenID: tokenID})
-		}
 `)
 	for _, plan := range plans {
 		for _, source := range plan.sources {
@@ -1096,10 +1077,6 @@ func renderGenericPrefetchBlocksState(b *bytes.Buffer, cfg *config.Config, event
 		}
 	}
 	b.WriteString("\t}\n\n")
-
-	// Resolve custom prefetch for Position
-	b.WriteString("\tif err := hot.UserPositionsResolver.Resolve(ctx, store.Conn(), store.DB()); err != nil {\n")
-	b.WriteString("\t\treturn fmt.Errorf(\"prefetch Position: %w\", err)\n\t}\n")
 
 	for _, plan := range plans {
 		b.WriteString("\tif err := hot.")
@@ -1138,28 +1115,6 @@ func renderGenericPrefetchProtoBlocksState(b *bytes.Buffer, cfg *config.Config, 
 		if block == nil {
 			continue
 		}
-		block.QueryExchangeOrderFilled().Map(func(ev ExchangeOrderFilledProtoView) {
-			var tokenID common.Hash
-			makerAssetID := ev.MakerAssetID()
-			takerAssetID := ev.TakerAssetID()
-			if makerAssetID.IsZero() {
-				takerAssetID.WriteToSlice(tokenID[:])
-			} else {
-				makerAssetID.WriteToSlice(tokenID[:])
-			}
-			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker(), TokenID: tokenID})
-		})
-		block.QueryNegRiskExchangeOrderFilled().Map(func(ev NegRiskExchangeOrderFilledProtoView) {
-			var tokenID common.Hash
-			makerAssetID := ev.MakerAssetID()
-			takerAssetID := ev.TakerAssetID()
-			if makerAssetID.IsZero() {
-				takerAssetID.WriteToSlice(tokenID[:])
-			} else {
-				makerAssetID.WriteToSlice(tokenID[:])
-			}
-			hot.UserPositionsResolver.Queue(UserPositionsClockKey{User: ev.Maker(), TokenID: tokenID})
-		})
 `)
 	for _, plan := range plans {
 		for _, source := range plan.sources {
@@ -1186,9 +1141,6 @@ func renderGenericPrefetchProtoBlocksState(b *bytes.Buffer, cfg *config.Config, 
 		}
 	}
 	b.WriteString("\t}\n\n")
-
-	b.WriteString("\tif err := hot.UserPositionsResolver.Resolve(ctx, store.Conn(), store.DB()); err != nil {\n")
-	b.WriteString("\t\treturn fmt.Errorf(\"prefetch Position: %w\", err)\n\t}\n")
 
 	for _, plan := range plans {
 		b.WriteString("\tif err := hot.")

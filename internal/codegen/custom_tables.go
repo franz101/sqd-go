@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/franz101/sqd-go/internal/config"
+	"github.com/franz101/sqd-go/internal/template"
 )
 
 type customTableSpec struct {
@@ -212,6 +213,29 @@ func parseCustomFields(fileSet *token.FileSet, field *ast.Field) ([]customFieldS
 	return fields, nil
 }
 
+type customTableTmplData struct {
+	DatabaseIdent string
+	TableIdent    string
+	Engine        string
+	Columns       []customColumnTmplData
+	PrimaryKey    string
+	OrderBy       string
+}
+
+type customColumnTmplData struct {
+	NameIdent string
+	Type      string
+	Default   string
+}
+
+func quoteEach(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = quoteSQLIdent(n)
+	}
+	return out
+}
+
 func generateCustomSchemaSQL(cfg *config.Config, tables []customTableSpec) string {
 	var b strings.Builder
 	db := quoteSQLIdent(cfg.Name)
@@ -219,38 +243,22 @@ func generateCustomSchemaSQL(cfg *config.Config, tables []customTableSpec) strin
 	b.WriteString("-- Custom tables generated from custom schema definitions.\n")
 	for _, table := range tables {
 		b.WriteString("\n")
-		b.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s (\n", db, quoteSQLIdent(table.Name)))
-		for i, column := range table.Columns {
-			if i > 0 {
-				b.WriteString(",\n")
-			}
-			b.WriteString("  ")
-			b.WriteString(quoteSQLIdent(column.Name))
-			b.WriteString(" ")
-			b.WriteString(column.Type)
-			if column.Default != "" {
-				b.WriteString(" DEFAULT ")
-				b.WriteString(column.Default)
-			}
+		tmpl := customTableTmplData{
+			DatabaseIdent: db,
+			TableIdent:    quoteSQLIdent(table.Name),
+			Engine:        table.Engine,
+			PrimaryKey:    strings.Join(quoteEach(table.PrimaryKey), ", "),
+			OrderBy:       strings.Join(quoteEach(table.OrderBy), ", "),
 		}
-		b.WriteString("\n) ENGINE = ")
-		b.WriteString(table.Engine)
-		b.WriteString("\nPRIMARY KEY (")
-		for i, column := range table.PrimaryKey {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(quoteSQLIdent(column))
+		for _, col := range table.Columns {
+			tmpl.Columns = append(tmpl.Columns, customColumnTmplData{
+				NameIdent: quoteSQLIdent(col.Name),
+				Type:      col.Type,
+				Default:   col.Default,
+			})
 		}
-		b.WriteString(")")
-		b.WriteString("\nORDER BY (")
-		for i, column := range table.OrderBy {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(quoteSQLIdent(column))
-		}
-		b.WriteString(");\n")
+		b.WriteString(template.MustExecute("sql/createCustomTable", tmpl))
+		b.WriteString(";\n")
 	}
 	return b.String()
 }

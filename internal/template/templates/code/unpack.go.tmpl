@@ -1,0 +1,78 @@
+{{define "unpackDispatcher" -}}
+{{- /*
+  unpackDispatcher renders the log decode entry points: package-level topic/addr
+  constants, the DecodedLog type, and UnpackLog/UnpackLogWithMeta which route a
+  log to the right per-event unpacker by topic0 (+ optional address match).
+
+  Data (see renderUnpackDispatcher):
+    .UsesAddress         - true if any event filters by contract address
+    .Events[]            - .Index .Topic0Quoted .Addrs[] .AddrMatchExpr
+                           .GoTypeName .EventNameQuoted
+
+  The per-event Unpack<T>LogWithMeta functions are appended after this template
+  by renderUnpackDispatcher (they keep their own imperative renderer).
+*/ -}}
+{{range .Events}}{{$ev := .}}var _topic{{$ev.Index}} = common.HexToHash({{$ev.Topic0Quoted}})
+{{range $j, $a := $ev.Addrs}}var _addr{{$ev.Index}}_{{$j}} = common.HexToAddress({{$a}})
+{{end}}{{end}}
+type DecodedLog struct {
+	EventName string
+	Topic0   string
+	Value    any
+}
+
+func UnpackLog(address string, topics []string, data []byte) (*DecodedLog, error) {
+	return UnpackLogWithMeta(address, topics, data, EventMeta{})
+}
+
+func UnpackLogWithMeta(address string, topics []string, data []byte, meta EventMeta) (*DecodedLog, error) {
+	if len(topics) == 0 {
+		return nil, nil
+	}
+{{if .UsesAddress}}	logAddress := common.HexToAddress(address)
+{{else}}	_ = address
+{{end}}
+	topic0 := common.HexToHash(topics[0])
+{{range .Events}}	if topic0 == _topic{{.Index}} && {{.AddrMatchExpr}} {
+		ev, err := Unpack{{.GoTypeName}}LogWithMeta(topics, data, meta)
+		if err != nil {
+			return nil, err
+		}
+		if ev == nil {
+			return nil, nil
+		}
+		return &DecodedLog{EventName: {{.EventNameQuoted}}, Topic0: {{.Topic0Quoted}}, Value: ev}, nil
+	}
+{{end}}	return nil, nil
+}
+
+{{end}}
+
+
+{{define "unpackEventFunc" -}}
+{{- /*
+  unpackEventFunc renders one event's decoders: Unpack<T>Log (delegates with an
+  empty EventMeta) and Unpack<T>LogWithMeta (the real decode). The per-argument
+  decode statements vary a lot by ABI type, so they are rendered by the existing
+  leaf renderers (renderIndexedDecode/renderDataDecode/...) into .DecodeBody and
+  injected verbatim here.
+    .GoTypeName .RequiredTopics .DecodeBody
+*/ -}}
+func Unpack{{.GoTypeName}}Log(topics []string, data []byte) (*{{.GoTypeName}}, error) {
+	return Unpack{{.GoTypeName}}LogWithMeta(topics, data, EventMeta{})
+}
+
+func Unpack{{.GoTypeName}}LogWithMeta(topics []string, data []byte, meta EventMeta) (*{{.GoTypeName}}, error) {
+	if len(topics) < {{.RequiredTopics}} {
+		return nil, nil
+	}
+	var ev {{.GoTypeName}}
+	ev.EventMeta = meta
+	var ok bool
+	var word []byte
+	_ = ok
+	_ = word
+{{.DecodeBody}}	return &ev, nil
+}
+
+{{end}}
