@@ -1,13 +1,14 @@
 # sqd-go Makefile
 # Top-level targets for development, testing, and deployment.
-# Polymarket-example targets (codegen-polymarket, dev-v2, tmux, e2e, pnl, …) live
-# on the polymarket-example branch.
+# The codegen is example-agnostic (template engine, internal/template/*.tmpl);
+# all polymarket specifics live in examples/polymarket/{config.yaml,custom_*.go}.
 
 BUILD_DIR := tmp
 
 .PHONY: build dev-build test vet benchmark benchmark-fast \
 	test-config-matrix benchmark-live-matrix \
 	codegen-uniswap start-uniswap dev-uniswap restart-uniswap uniswap-e2e uniswap-fast \
+	codegen-polymarket dev-polymarket-live polymarket-fast-tmux polymarket-stop \
 	db-reset stop
 
 # Load .env file if it exists (for local ClickHouse credentials)
@@ -86,6 +87,49 @@ restart-uniswap:
 uniswap-e2e: codegen-uniswap build
 	go test ./$(UNISWAP_DIR)/generated/ -run 'TestCustom.*E2E|TestAppendDecodedLog' -v -count=1
 	$(BUILD_DIR)/sqd-go start $(UNISWAP_DIR) --restart
+
+# === Polymarket Development (examples/polymarket; Polygon, chain 137) ===
+# Custom-processor project: --state is mandatory (regenerates, blank-imports the
+# project so init() registers the processor, builds, re-execs). The fast path is
+# default now: SQD_PARSE_DECODE_V2 is on unless NO_*=1, the state-prune is the
+# bounded windowed prune, and the cold tier is Pebble v2 (MinLZ). No polymarket
+# specifics live in the codegen — only in examples/polymarket.
+
+POLYMARKET_DIR := examples/polymarket
+POLYMARKET_DATABASE ?= polymarket
+POLYMARKET_START_BLOCK ?= 25000000
+POLYMARKET_PRUNE_INTERVAL ?= 1000000
+POLYMARKET_TMUX_SESSION ?= sqd-polymarket-live
+POLYMARKET_TMUX_LOG ?= tmp/polymarket-fast.log
+POLYMARKET_ARGS ?=
+
+codegen-polymarket:
+	go run . codegen $(POLYMARKET_DIR)
+
+# Live backfill from POLYMARKET_START_BLOCK, following the chain head (--end-block 0).
+# Resumes by default (no --restart, which would DROP the DB); pass extra flags via
+# POLYMARKET_ARGS, e.g. POLYMARKET_ARGS=--reindex-from <block>.
+dev-polymarket-live: codegen-polymarket build
+	CLICKHOUSE_DATABASE=$(POLYMARKET_DATABASE) CLICKHOUSE_PRUNE_INTERVAL=$(POLYMARKET_PRUNE_INTERVAL) \
+		$(BUILD_DIR)/sqd-go start $(POLYMARKET_DIR) --blockchain polygon \
+		--start-block $(POLYMARKET_START_BLOCK) --end-block 0 $(POLYMARKET_ARGS)
+
+# Fast detached backfill: parallel fetch + read-set prefetch in a tmux session.
+# RPS=20 is the measured fetch sweet spot (sweep: 5->20 RPS ~+25%, plateaus ~20;
+# no portal throttling observed up to 60). Attach: tmux attach -t $(POLYMARKET_TMUX_SESSION).
+polymarket-fast-tmux: codegen-polymarket build
+	@if tmux has-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null; then \
+		echo "tmux session already running: $(POLYMARKET_TMUX_SESSION) (attach: tmux attach -t $(POLYMARKET_TMUX_SESSION))"; \
+	else \
+		mkdir -p $(dir $(POLYMARKET_TMUX_LOG)); \
+		tmux new-session -d -s "$(POLYMARKET_TMUX_SESSION)" \
+			"cd $(CURDIR) && SQD_PARALLEL_RPS=20 SQD_PARALLEL_FETCHERS=16 SQD_METRICS_CH=1 SQD_STATS_INTERVAL=300 \
+			$(MAKE) dev-polymarket-live POLYMARKET_ARGS=\"--state --parallel-fetch --prefetch $(POLYMARKET_ARGS)\" 2>&1 | tee -a $(CURDIR)/$(POLYMARKET_TMUX_LOG)"; \
+		echo "started fast backfill: $(POLYMARKET_TMUX_SESSION) (attach: tmux attach -t $(POLYMARKET_TMUX_SESSION); log: $(POLYMARKET_TMUX_LOG))"; \
+	fi
+
+polymarket-stop:
+	-tmux kill-session -t "$(POLYMARKET_TMUX_SESSION)" 2>/dev/null
 
 # === Database Operations ===
 
