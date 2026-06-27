@@ -310,6 +310,12 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 {{- end}}
 								profEventDecode += _psince(abiStart)
 {{- end}}
+{{- if .HasNonIndexed}}
+							// Drop the event when the non-indexed data is shorter than the ABI head:
+							// the V1 decoder errors on insufficient data and skips the event, so V2
+							// must too (else a malformed log would store a phantom zero-valued row).
+							if len(dataBytes) >= {{.HeadWords}}*32 {
+{{- end}}
 								appendStart := _pnow()
 
 							eventCount++
@@ -324,6 +330,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 								profBatchAppend += _psince(appendStart)
 								protoSlot.Append{{.GoTypeName}}(meta, &ev)
 							}
+{{- if .HasNonIndexed}}
+							}
+{{- end}}
 						}
 {{- end}}
 {{- end}}
@@ -359,6 +368,11 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 {{- end}}
 {{- end}}
 
+{{- if .HasNonIndexed}}
+									// Drop the event when non-indexed data is shorter than the ABI head
+									// (match V1, which errors on insufficient data and skips the event).
+									if len(dataBytes) >= {{.HeadWords}}*32 {
+{{- end}}
 									eventCount++
 									if batches != nil {
 										batches.{{.GoTypeName}}.Append(meta, &ev)
@@ -370,6 +384,9 @@ func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBu
 									if protoSlot != nil {
 										protoSlot.Append{{.GoTypeName}}(meta, &ev)
 									}
+{{- if .HasNonIndexed}}
+									}
+{{- end}}
 								}
 {{- end}}
 {{- end}}

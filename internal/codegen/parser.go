@@ -47,6 +47,11 @@ type parserEventGroup struct {
 	HasNonIndexed     bool
 	IndexedDecodes    []string
 	NonIndexedDecodes []string
+	// HeadWords is the number of 32-byte ABI head words the non-indexed data must
+	// contain. The event is dropped if dataBytes is shorter than HeadWords*32, so a
+	// truncated/malformed log is skipped exactly like the V1 decoder (which errors on
+	// insufficient data) instead of storing a phantom zero-valued row.
+	HeadWords int
 }
 
 func generateParserGo(events []eventSpec) ([]byte, error) {
@@ -112,6 +117,9 @@ func generateParserGo(events []eventSpec) ([]byte, error) {
 						wordIdx += abiHeadWords(arg.SolidityType)
 					}
 				}
+				// Total ABI head words across ALL non-indexed args (omitted or not):
+				// the minimum data length the V1 decoder requires before it errors.
+				evGroup.HeadWords = wordIdx
 			}
 
 			group.Events = append(group.Events, evGroup)

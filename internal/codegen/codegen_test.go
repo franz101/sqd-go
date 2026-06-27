@@ -89,6 +89,10 @@ chains:
 
 	parserGo := readText(t, filepath.Join(root, "generated", "parser.go"))
 	assertContains(t, parserGo, "func ParseJSONLProtoStream(data []byte, batches *InsertBatches, ring *ProtoRingBuffer")
+	// Head-length guard: events whose non-indexed data is shorter than the ABI head
+	// are dropped, matching the legacy decoder (so SQD_PARSE_DECODE_V2 on/off store
+	// identical data). LBTCTransfer has one non-indexed word (uint256 value).
+	assertContains(t, parserGo, "if len(dataBytes) >= 1*32 {")
 
 	processor := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
 	assertNotContains(t, processor, "type Entities struct")
