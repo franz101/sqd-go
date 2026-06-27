@@ -11,10 +11,10 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	bn256 "github.com/ethereum/go-ethereum/crypto/bn256/cloudflare"
-	"github.com/franz101/sqd-go/protomath"
 	generated "github.com/franz101/sqd-go/examples/polymarket/generated"
 	"github.com/franz101/sqd-go/internal/cli"
 	"github.com/franz101/sqd-go/internal/ingestion"
+	"github.com/franz101/sqd-go/protomath"
 	"github.com/holiman/uint256"
 	"github.com/shopspring/decimal"
 )
@@ -288,6 +288,88 @@ func ensureFPMMMarketsLoaded(state *generated.State, fpmmAddrs []common.Address)
 	}
 }
 
+// positionResolveNanos / positionResolveRoundTrips are diagnostic counters
+// (single-goroutine processor).
+var positionResolveNanos int64
+var positionResolveRoundTrips int64
+
+// ensurePositionsLoaded batches every position key the block's handlers will read
+// into ONE resolver round-trip, exactly like ensureConditionsLoaded does for
+// conditions. Without it, each position hot-miss falls through to the inline
+// synchronous resolve in generated State.GetValue (generated/state.go:95) — the
+// ~20ms-per-key ClickHouse round-trip that dominates the CUSTOM stage on a
+// populated, non-authoritative (resume) run. Measured: lookup latency is
+// per-query, not per-key (a 1000-key WHERE IN ~= a 1-key query), so collapsing a
+// block's misses into one query is the dominant lever (experiments/REPORTING/
+// LOOKUP_LATENCY_MEASURED.md).
+//
+// SAFETY: a prefetch is only a cache warm. A missing or wrong key here is NOT a
+// correctness bug — the handler simply does the inline resolve as before, and a
+// genuinely-absent key is tombstoned identically. So this covers the dominant
+// OrderFilled family (the block-84M hot path; all four variants reduce to the
+// maker's position in the outcome tokenID, per handleOrderFilledValues /
+// handleOrderFilledV2Values); the array-bearing split/merge/converted/redemption
+// and FPMM position keys fall back to the inline path until their derivations are
+// added here too.
+func ensurePositionsLoaded(state *generated.State, block *generated.ProtoEventBlock) {
+	canResolve := state.Store != nil && state.Store.Conn() != nil
+	// From-genesis (authoritative cold tier): a hot miss proves a DB miss, so the
+	// resolver could never find anything — skip it entirely (mirrors
+	// ensureConditionsLoaded).
+	if canResolve && state.HotState.ColdAuthoritative() {
+		canResolve = false
+	}
+	if !canResolve {
+		return
+	}
+
+	queued := 0
+	queue := func(user common.Address, tokenID uint256.Int) {
+		key := generated.UserPositionsClockKey{User: user, TokenID: tokenIDHash(tokenID)}
+		if _, ok := state.HotState.UserPositions.Get(key); ok {
+			return // present or tombstoned — already resolved
+		}
+		state.HotState.UserPositionsResolver.Queue(key)
+		queued++
+	}
+
+	// V1 OrderFilled: position tokenID is takerAssetID on BUY (makerAssetID==0),
+	// else makerAssetID (handleOrderFilledValues).
+	v1 := func(maker common.Address, makerAssetID, takerAssetID uint256.Int) {
+		if makerAssetID.IsZero() {
+			queue(maker, takerAssetID)
+		} else {
+			queue(maker, makerAssetID)
+		}
+	}
+	block.QueryExchangeOrderFilled().Map(func(ev generated.ExchangeOrderFilledProtoView) {
+		v1(ev.Maker(), ev.MakerAssetID(), ev.TakerAssetID())
+	})
+	block.QueryNegRiskExchangeOrderFilled().Map(func(ev generated.NegRiskExchangeOrderFilledProtoView) {
+		v1(ev.Maker(), ev.MakerAssetID(), ev.TakerAssetID())
+	})
+	// V2 OrderFilled: position tokenID is ev.TokenID() regardless of side; an
+	// out-of-range side is a no-op in the handler (skip, matches
+	// handleOrderFilledV2Values' side.BitLen() > 1 guard).
+	block.QueryExchangeV2OrderFilledV2().Map(func(ev generated.ExchangeV2OrderFilledV2ProtoView) {
+		if side := ev.Side(); side.BitLen() <= 1 {
+			queue(ev.Maker(), ev.TokenID())
+		}
+	})
+	block.QueryNegRiskExchangeV2OrderFilledV2().Map(func(ev generated.NegRiskExchangeV2OrderFilledV2ProtoView) {
+		if side := ev.Side(); side.BitLen() <= 1 {
+			queue(ev.Maker(), ev.TokenID())
+		}
+	})
+
+	if queued > 0 {
+		t0 := time.Now()
+		positionResolveRoundTrips++
+		_ = state.HotState.UserPositionsResolver.Resolve(context.Background(), state.Store.Conn(), state.Store.DB())
+		positionResolveNanos += time.Since(t0).Nanoseconds()
+	}
+}
+
 // Process is the single entry point for custom business logic in Parsed (V1) Mode.
 func Process(state *generated.State, block *generated.ParsedBlock) error {
 	var conditionIDs []common.Hash
@@ -414,6 +496,11 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 		fpmmAddrs = append(fpmmAddrs, ev.Meta().ContractAddress)
 	})
 	ensureFPMMMarketsLoaded(state, fpmmAddrs)
+
+	// Batch the block's position reads into one resolver round-trip (OrderFilled
+	// family — the dominant block-84M event). Runs after the condition/FPMM
+	// prefetch so any reference data a position key needs is already hot.
+	ensurePositionsLoaded(state, block)
 
 	var conditionPreparationIdx int
 	var conditionResolutionIdx int
