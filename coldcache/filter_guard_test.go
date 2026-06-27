@@ -1,7 +1,9 @@
 package coldcache
 
 import (
+	"encoding/binary"
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -47,6 +49,52 @@ func TestNegFilterNoFalseNegatives(t *testing.T) {
 			t.Fatalf("FALSE NEGATIVE at key %d: the filter forgot a key it added — "+
 				"authoritative mode would reset this position", i)
 		}
+	}
+}
+
+// TestSplitBloomConcurrentAddNoFalseNegatives pins the parallel-recovery safety of
+// the PRODUCTION filter (SplitBloom). The cold filter is populated from ~8 goroutines
+// during recovery (recoverColdParallel / recoverFilterKeysParallel). If add() does a
+// non-atomic read-modify-write on the shared 64-bit block words, two keys touching the
+// same word race (torn RMW) and one bit-set is lost -> a FALSE NEGATIVE -> the
+// authoritative gate resets a real position to zero (silent ClickHouse corruption).
+// Exercise atomicOps=false (the non-atomic READ mode) under concurrent adds: the WRITE
+// must still be atomic, so zero false negatives AND clean under `go test -race`.
+func TestSplitBloomConcurrentAddNoFalseNegatives(t *testing.T) {
+	f := newSplitBloom(1<<24, false) // atomicOps=false: relaxed reads, but writes stay atomic
+	const (
+		workers   = 8
+		perWorker = 200_000
+		total     = workers * perWorker
+	)
+	key := func(i int) []byte {
+		b := make([]byte, 32)
+		binary.BigEndian.PutUint64(b[0:], uint64(i)*0x9E3779B97F4A7C15)
+		binary.BigEndian.PutUint64(b[8:], uint64(i)*0xC2B2AE3D27D4EB4F)
+		binary.BigEndian.PutUint64(b[16:], uint64(i)*0x165667B19E3779F9)
+		binary.BigEndian.PutUint64(b[24:], uint64(i)*0xD6E8FEB86659FD93)
+		return b
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := w; i < total; i += workers { // interleave so words collide across workers
+				f.add(key(i))
+			}
+		}(w)
+	}
+	wg.Wait()
+	falseNeg := 0
+	for i := 0; i < total; i++ {
+		if !f.mayContain(key(i)) {
+			falseNeg++
+		}
+	}
+	if falseNeg != 0 {
+		t.Fatalf("FALSE NEGATIVES after concurrent add: %d of %d — non-atomic add() lost bits "+
+			"under parallel recovery; authoritative gate would reset real positions to zero", falseNeg, total)
 	}
 }
 

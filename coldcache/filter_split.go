@@ -26,7 +26,8 @@ import "sync/atomic"
 type SplitBloom struct {
 	blocks    []negBlock
 	blockMask uint64
-	atomicOps bool
+	atomicOps bool   // atomic LOAD on the mayContain READ path; writes are ALWAYS atomic
+	anyAdd    uint32 // 0 until the first add; an empty filter provably contains nothing
 }
 
 // splitSalts are 8 distinct odd 64-bit mixing constants (well-known
@@ -53,20 +54,31 @@ func splitBlockCount(bitBudget uint64) uint64 {
 }
 
 func (f *SplitBloom) add(key []byte) {
+	if atomic.LoadUint32(&f.anyAdd) == 0 {
+		atomic.StoreUint32(&f.anyAdd, 1)
+	}
 	h, _ := negHash(key)
 	blk := &f.blocks[h&f.blockMask]
-	if f.atomicOps {
-		for j := 0; j < blockWords; j++ {
-			atomic.OrUint64(&blk[j], 1<<((h*splitSalts[j])>>58))
-		}
-		return
-	}
+	// The WRITE is ALWAYS atomic, regardless of atomicOps. The filter is populated
+	// from ~8 parallel goroutines during cold recovery (recoverColdParallel /
+	// recoverFilterKeysParallel), so a plain read-modify-write would lose a bit when
+	// two keys touch the same word (torn RMW) -> a false negative -> the authoritative
+	// gate would treat a real evicted position as new and reset it to 0, corrupting
+	// ClickHouse history. atomicOps only relaxes the single-threaded mayContain read
+	// path, which never overlaps the parallel recovery adds.
 	for j := 0; j < blockWords; j++ {
-		blk[j] |= 1 << ((h * splitSalts[j]) >> 58)
+		atomic.OrUint64(&blk[j], 1<<((h*splitSalts[j])>>58))
 	}
 }
 
 func (f *SplitBloom) mayContain(key []byte) bool {
+	// An empty filter (nothing ever added) provably contains nothing — skip the hash
+	// + 8 word probes entirely. On a from-genesis run where the hot ring holds the
+	// whole working set the cold filter never gets an add, so every new-position check
+	// (one per distinct position) takes this O(1) path instead of the split-block probe.
+	if atomic.LoadUint32(&f.anyAdd) == 0 {
+		return false
+	}
 	h, _ := negHash(key)
 	blk := &f.blocks[h&f.blockMask]
 	var miss uint64
