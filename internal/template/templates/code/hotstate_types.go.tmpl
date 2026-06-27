@@ -318,33 +318,68 @@ func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db s
 	s.dirty{{.BaseName}}[New{{.KeyType}}(value)] = struct{}{}
 }
 
-{{end}}{{end}}func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error {
+{{end}}{{end}}// commitBatches holds the column batches snapshotted from the dirty sets, ready to
+// INSERT. It is self-contained (value copies only) and references NO hot-ring state,
+// so insert() can run in a background goroutine concurrently with the fold without
+// racing the ring (the async-commit path; see State.StartCommit).
+type commitBatches struct {
+{{- range .Specs}}{{if not .IsEvent}}
+	{{.BaseName}} *{{.BatchType}}
+{{- end}}{{end}}
+}
+
+// snapshotDirty builds the insert batches from the dirty sets + hot ring and clears
+// the dirty sets, under s.mu and with NO network I/O. It MUST be called from the
+// single processor (consumer) goroutine: Get may promote a cold entry into the ring
+// (a ring mutation), which is only safe when no other goroutine touches the ring. The
+// returned batches hold value copies only, so the subsequent Insert is ring-free.
+func (s *HotState) snapshotDirty() *commitBatches {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if conn == nil {
-{{- range .Specs}}{{if not .IsEvent}}
-		clear(s.dirty{{.BaseName}})
-{{- end}}{{end}}
-		return nil
-	}
+	cb := &commitBatches{}
 {{- range .Specs}}{{if not .IsEvent}}
 	if len(s.dirty{{.BaseName}}) > 0 {
-		batch := New{{.BatchType}}()
+		cb.{{.BaseName}} = New{{.BatchType}}()
 		for key := range s.dirty{{.BaseName}} {
 			if val, ok := s.{{.BaseName}}.Get(key); ok {
-				batch.Append(val)
+				cb.{{.BaseName}}.Append(val)
 			}
 		}
-		if err := batch.Insert(ctx, conn, db); err != nil {
+		clear(s.dirty{{.BaseName}})
+	}
+{{- end}}{{end}}
+	return cb
+}
+
+// insert writes the snapshotted batches to ClickHouse. It touches NO hot-ring state,
+// so it is safe to run in a background goroutine concurrently with the fold.
+func (cb *commitBatches) insert(ctx context.Context, conn *ch.Client, db string) error {
+{{- range .Specs}}{{if not .IsEvent}}
+	if cb.{{.BaseName}} != nil {
+		if err := cb.{{.BaseName}}.Insert(ctx, conn, db); err != nil {
 			return err
 		}
-		clear(s.dirty{{.BaseName}})
 	}
 {{- end}}{{end}}
 	if err := flushAsyncInserts(ctx, conn); err != nil {
 		return err
 	}
 	return nil
+}
+
+// Commit synchronously snapshots the dirty sets and inserts them. The async path is
+// State.StartCommit, which snapshots in the consumer thread and runs only insert() in
+// a goroutine, so the network insert never holds s.mu or touches the ring.
+func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error {
+	if conn == nil {
+		s.mu.Lock()
+{{- range .Specs}}{{if not .IsEvent}}
+		clear(s.dirty{{.BaseName}})
+{{- end}}{{end}}
+		s.mu.Unlock()
+		return nil
+	}
+	return s.snapshotDirty().insert(ctx, conn, db)
 }
 {{range .Specs}}{{if not .IsEvent}}func (s *HotState) Restore{{.GoTypeName}}(key {{.KeyType}}, value {{.GoTypeName}}, had bool) {
 	s.mu.Lock()

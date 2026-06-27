@@ -129,13 +129,31 @@ func (s *State) Commit(ctx context.Context, store Store) error {
 }
 
 func (s *State) StartCommit(ctx context.Context, store Store, blockNumber uint64) bool {
-	if s == nil || s.commitDone != nil {
+	if s == nil || s.HotState == nil || store == nil || s.commitDone != nil {
 		return false
 	}
+	conn := store.Conn()
+	if commitStore, ok := store.(interface{ CommitConn() *ch.Client }); ok && commitStore.CommitConn() != nil {
+		conn = commitStore.CommitConn()
+	}
+	// Snapshot the dirty set + values SYNCHRONOUSLY in the caller (the single
+	// consumer/fold goroutine), clearing dirty under s.mu. Only the network Insert
+	// runs in the background goroutine, and it touches ONLY the snapshot batches —
+	// never the hot ring — so it cannot race the consumer's lock-free reads and no
+	// longer holds s.mu during the insert (the fold is not stalled). Previously the
+	// goroutine ran ring-read + Insert inside HotState.Commit under s.mu, which both
+	// stalled the fold for the whole network insert AND raced the lock-free read path
+	// on a cold-promotion under spill.
+	if conn == nil {
+		s.HotState.snapshotDirty() // clears dirty; nothing to insert into
+		return false
+	}
+	cb := s.HotState.snapshotDirty()
+	db := store.DB()
 	done := make(chan stateCommitResult, 1)
 	s.commitDone = done
 	go func() {
-		done <- stateCommitResult{block: blockNumber, err: s.Commit(ctx, store)}
+		done <- stateCommitResult{block: blockNumber, err: cb.insert(ctx, conn, db)}
 	}()
 	return true
 }
