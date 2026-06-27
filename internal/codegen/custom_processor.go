@@ -536,7 +536,9 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 		pruneInterval = parsed
 	}
 	if state.LastSyncBlock >= state.LastPruneBlock+pruneInterval {
-		if err := CompactionPruneState(ctx, store, state.LastSyncBlock); err != nil {
+		// Pass the previous prune block as the lower bound so the prune only
+		// re-aggregates primary keys touched since then (bounded memory).
+		if err := CompactionPruneState(ctx, store, state.LastPruneBlock, state.LastSyncBlock); err != nil {
 			return fmt.Errorf("prune ClickHouse state at block %d: %w", state.LastSyncBlock, err)
 		}
 		state.LastPruneBlock = state.LastSyncBlock

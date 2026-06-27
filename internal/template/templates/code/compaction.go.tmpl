@@ -17,7 +17,7 @@ import (
 // rolling threshold (blockNumber - 1000) and that are not the latest version of
 // their primary-key group. This keeps ClickHouse tables bounded during long
 // backfill runs while preserving the most recent state for each entity.
-func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) error {
+func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) error {
 	if store == nil || store.Conn() == nil {
 		return nil
 	}
@@ -27,12 +27,21 @@ func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) 
 		return nil
 	}
 	pruneThreshold := blockNumber - 1000
+	// Only re-aggregate primary keys touched since the last prune (block_number >
+	// activeLower). The GROUP BY's memory scales with the number of groups, so
+	// bounding it to the active window keeps the prune memory-bounded instead of
+	// aggregating every key in the table each run (which OOMs at scale). Older
+	// versions of those active keys are still deleted (the DELETE range is
+	// block_number < threshold, not just the window), so nothing leaks; keys NOT
+	// touched since the last prune were already reduced to their latest by an
+	// earlier prune. activeLower=0 (first prune) degrades to the full-table prune.
+	activeLower := lowerBlock
 
 	queries := []string{
 {{- range .Tables}}
 {{- if gt (len .PrimaryKey) 0}}
 		// {{.Name}} (pk: {{join .PrimaryKey ", "}})
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number < %[2]d AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60{{.Name}}\x60 GROUP BY {{join .PrimaryKey ", "}}) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold),
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number < %[2]d AND ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d GROUP BY {{join .PrimaryKey ", "}}) AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d GROUP BY {{join .PrimaryKey ", "}}) GROUP BY {{join .PrimaryKey ", "}}) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower),
 		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60{{.Name}}\x60 FINAL", db),
 {{- end}}
 {{- end}}
@@ -50,7 +59,7 @@ func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) 
 {{else}}
 import "context"
 
-func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) error {
+func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) error {
 	return nil
 }
 {{end}}
