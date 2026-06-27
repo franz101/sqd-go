@@ -41,29 +41,16 @@ type AtomicBloom struct {
 	k         uint
 }
 
-// newNegFilter builds a blocked Bloom filter with at least bitBudget bits, rounded
-// up so the block count is a power of two (minimum 64 blocks). k=8 keeps the
-// false-positive rate low while the live key count stays under ~10 per block.
+// newNegFilter builds the production negative filter: a SplitBloom (split-block /
+// register-blocked Bloom, filter_split.go) sized to at least bitBudget bits,
+// rounded up to a power-of-two block count (minimum 64 blocks). SplitBloom has a
+// 30-200x lower false-positive rate than the legacy double-hash BloomFilter /
+// AtomicBloom at the same memory, and a faster add — see filter_improve_test.go.
+// SQD_COLDCACHE_FILTER_ATOMIC selects atomic bit ops (default true; the ~8
+// parallel cold-recovery writers need it). The legacy BloomFilter / AtomicBloom
+// remain as the measured baseline.
 func newNegFilter(bitBudget uint64) negFilter {
-	nb := bitBudget / blockBits
-	const minBlocks = 64
-	n := uint64(minBlocks)
-	for n < nb {
-		n <<= 1
-	}
-
-	if filterAtomicDefault() {
-		return &AtomicBloom{
-			blocks:    make([]negBlock, n),
-			blockMask: n - 1,
-			k:         8,
-		}
-	}
-	return &BloomFilter{
-		blocks:    make([]negBlock, n),
-		blockMask: n - 1,
-		k:         8,
-	}
+	return newSplitBloom(bitBudget, filterAtomicDefault())
 }
 
 // filterAtomicDefault reports whether the filter should use atomic bit ops. It
