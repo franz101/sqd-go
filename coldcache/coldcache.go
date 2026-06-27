@@ -29,8 +29,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
@@ -206,25 +206,30 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 			log.Printf("cold tier: optimization profile 'largemem' (64MB memtables)")
 		case "nocomp", "write":
 			// No compression: +5% writes, +7% reads, +13% batch writes
-			// Set up levels with no compression
-			opts.Levels = make([]pebble.LevelOptions, 7)
 			for i := range opts.Levels {
-				opts.Levels[i].Compression = sstable.NoCompression
+				opts.Levels[i].Compression = compFn(sstable.NoCompression)
 			}
 			log.Printf("cold tier: optimization profile 'nocomp' (no compression)")
 		case "fast", "read":
 			// Optimized for reads
-			opts.Levels = make([]pebble.LevelOptions, 7)
 			for i := range opts.Levels {
-				opts.Levels[i].Compression = sstable.NoCompression
+				opts.Levels[i].Compression = compFn(sstable.NoCompression)
 			}
 			log.Printf("cold tier: optimization profile 'fastreads' (no compression)")
 		case "aggressive":
 			// Aggressive compaction
 			opts.L0CompactionThreshold = 2
 			opts.L0CompactionFileThreshold = 4
-			opts.MaxConcurrentCompactions = func() int { return 2 }
+			opts.CompactionConcurrencyRange = func() (int, int) { return 1, 2 }
 			log.Printf("cold tier: optimization profile 'aggressive'")
+		case "minlz":
+			// MinLZ block compression (faster decode than Snappy). Requires the v6+
+			// table format; the cold tier is ephemeral so the newest format is free.
+			opts.FormatMajorVersion = pebble.FormatNewest
+			for i := range opts.Levels {
+				opts.Levels[i].Compression = compFn(sstable.MinLZCompression)
+			}
+			log.Printf("cold tier: optimization profile 'minlz' (fast-decode codec)")
 		default:
 			log.Printf("cold tier: unknown optimization profile '%s', using baseline", optim)
 		}

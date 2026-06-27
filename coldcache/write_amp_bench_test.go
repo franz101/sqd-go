@@ -21,14 +21,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // writeAmpStats tracks write operation metrics
 type writeAmpStats struct {
 	logicalBytes int64 // bytes intended to write
-	writeCount    int64 // number of write operations
-	flushCount    int64 // number of batch flushes
+	writeCount   int64 // number of write operations
+	flushCount   int64 // number of batch flushes
 }
 
 // writeAmpBenchmark runs the write benchmark for a given batch size
@@ -38,12 +38,12 @@ func writeAmpBenchmark(b *testing.B, flushCount int, totalWrites int) *writeAmpS
 
 	// Open Pebble store with minimal settings (no WAL for this benchmark)
 	opts := &pebble.Options{
-		DisableWAL:                 true,
-		MaxManifestFileSize:        1 << 20, // 1MB
-		MemTableSize:               4 << 20, // 4MB
+		DisableWAL:                  true,
+		MaxManifestFileSize:         1 << 20, // 1MB
+		MemTableSize:                4 << 20, // 4MB
 		MemTableStopWritesThreshold: 2,
-		LBaseMaxBytes:              8 << 20, // 8MB per level
-		Levels: []pebble.LevelOptions{
+		LBaseMaxBytes:               8 << 20, // 8MB per level
+		Levels: [7]pebble.LevelOptions{
 			{BlockSize: 4 << 10}, // 4KB blocks
 			{BlockSize: 4 << 10},
 			{BlockSize: 4 << 10},
@@ -154,9 +154,9 @@ func BenchmarkWriteBatchThroughput(b *testing.B) {
 // BenchmarkWriteBatchScale measures performance at scale with different batch sizes
 func BenchmarkWriteBatchScale(b *testing.B) {
 	scales := []struct {
-		name       string
-		batchSize  int
-		numWrites  int
+		name      string
+		batchSize int
+		numWrites int
 	}{
 		{"direct_1w", 1, 10000},
 		{"batch10_10w", 10, 100000},
@@ -206,4 +206,3 @@ func BenchmarkWriteBatchMemory(b *testing.B) {
 		})
 	}
 }
-
