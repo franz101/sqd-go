@@ -32,7 +32,7 @@ func CompactionPruneState(ctx context.Context, store Store, blockNumber uint64) 
 {{- range .Tables}}
 {{- if gt (len .PrimaryKey) 0}}
 		// {{.Name}} (pk: {{join .PrimaryKey ", "}})
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number < %[2]d AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60{{.Name}}\x60 GROUP BY {{join .PrimaryKey ", "}}) SETTINGS lightweight_deletes_sync = 1", db, pruneThreshold),
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number < %[2]d AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60{{.Name}}\x60 GROUP BY {{join .PrimaryKey ", "}}) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold),
 		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60{{.Name}}\x60 FINAL", db),
 {{- end}}
 {{- end}}
