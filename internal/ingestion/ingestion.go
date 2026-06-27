@@ -387,17 +387,17 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
 	useParseDecodeV2 := envconfig.ParseDecodeV2Enabled() && fastJSONLOK
 	if envconfig.ParseDecodeV2Enabled() && !fastJSONLOK {
-		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 requested, but processor does not implement FastJSONLProcessor; using default processor path", chain.ID)
+		log.Printf("Chain %d: fast parse/decode default-on, but processor does not implement FastJSONLProcessor; using legacy decode path", chain.ID)
 	}
 	if useParseDecodeV2 {
-		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 enabled for custom processor", chain.ID)
+		log.Printf("Chain %d: fast parse/decode enabled (opt out with SQD_NO_PARSE_DECODE_V2=1)", chain.ID)
 	}
 	fastInsertProc, fastInsertOK := proc.(FastJSONLInsertProcessor)
 	singleParse := useParseDecodeV2 && fastInsertOK && !storeBlocks && !cfg.ShouldStoreRawLogs() &&
-		os.Getenv("SQD_SINGLE_PARSE") != "0"
+		!envconfig.GetenvBool("SQD_NO_SINGLE_PARSE", false)
 	batchProc, batchProcOK := proc.(FastBatchParseProcessor)
 	batchParse := singleParse && batchProcOK && batchProc.SupportsBatchParse() &&
-		os.Getenv("SQD_PRODUCER_PARSE") != "0"
+		!envconfig.GetenvBool("SQD_NO_PRODUCER_PARSE", false)
 	if batchParse {
 		log.Printf("Chain %d: producer-parse pipeline enabled (one generated parse; consumer runs state math)", chain.ID)
 	} else if singleParse {

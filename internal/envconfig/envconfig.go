@@ -119,13 +119,12 @@ func PruneIntervalBlocks() uint64 {
 // ============================================================================
 
 const (
-	// SQD_PARSE_DECODE_V2 selects the fast JSONL parser + optimized ABI decoder
-	// (and, transitively, SQD_SINGLE_PARSE / SQD_PRODUCER_PARSE).
-	// Default: ENABLED. Set SQD_PARSE_DECODE_V2=0 (or false) to fall back to the
-	// legacy consumer decode path. The two paths produce identical stored data
-	// (verified by the uniswap V1-vs-V2 ingestion differential); the generated
-	// parser drops truncated/malformed-data events to match the legacy decoder.
-	ParseDecodeV2 = "SQD_PARSE_DECODE_V2"
+	// The fast JSONL parser + optimized ABI decoder is the DEFAULT. Opt out with
+	// SQD_NO_PARSE_DECODE_V2=1 to fall back to the legacy consumer decode path. The
+	// two paths produce identical stored data (verified by the uniswap V1-vs-V2
+	// ingestion differential); the generated parser drops truncated/malformed-data
+	// events to match the legacy decoder.
+	NoParseDecodeV2 = "SQD_NO_PARSE_DECODE_V2"
 
 	// SQD_TARGET_FETCH_SECONDS is the target latency for fetch operations in seconds.
 	// The adaptive page size controller adjusts page size to hit this target.
@@ -162,9 +161,9 @@ const (
 )
 
 // ParseDecodeV2Enabled returns true if the fast JSONL parser is enabled. It is the
-// default; only an explicit SQD_PARSE_DECODE_V2=0 (or false) selects the legacy path.
+// default; only an explicit SQD_NO_PARSE_DECODE_V2=1 selects the legacy path.
 func ParseDecodeV2Enabled() bool {
-	return GetenvBool(ParseDecodeV2, true)
+	return !GetenvBool(NoParseDecodeV2, false)
 }
 
 // TargetFetchDuration returns the target fetch latency as duration.
