@@ -536,9 +536,19 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 		pruneInterval = parsed
 	}
 	if state.LastSyncBlock >= state.LastPruneBlock+pruneInterval {
-		// Pass the previous prune block as the lower bound so the prune only
-		// re-aggregates primary keys touched since then (bounded memory).
-		if err := CompactionPruneState(ctx, store, state.LastPruneBlock, state.LastSyncBlock); err != nil {
+		// Lower bound for the prune window: only keys touched since the last prune get
+		// re-collapsed. LastPruneBlock can still be 0 here when a resume path brings the
+		// process up without restoring it (notably cold-tier-authoritative cursor mode,
+		// which never calls LoadFromDatabase). Pruning from 0 would aggregate every key
+		// in the historical table in a single mutation and OOM ClickHouse — the prune's
+		// spill SETTINGS do not take effect inside a mutation. Cap the lookback to one
+		// interval; keys older than that were already collapsed by the prior run's
+		// prunes, so nothing leaks.
+		activeLower := state.LastPruneBlock
+		if state.LastSyncBlock > activeLower+pruneInterval {
+			activeLower = state.LastSyncBlock - pruneInterval
+		}
+		if err := CompactionPruneState(ctx, store, activeLower, state.LastSyncBlock); err != nil {
 			return fmt.Errorf("prune ClickHouse state at block %d: %w", state.LastSyncBlock, err)
 		}
 		state.LastPruneBlock = state.LastSyncBlock

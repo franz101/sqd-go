@@ -27,21 +27,40 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 		return nil
 	}
 	pruneThreshold := blockNumber - 1000
-	// Only re-aggregate primary keys touched since the last prune (block_number >
-	// activeLower). The GROUP BY's memory scales with the number of groups, so
-	// bounding it to the active window keeps the prune memory-bounded instead of
-	// aggregating every key in the table each run (which OOMs at scale). Older
-	// versions of those active keys are still deleted (the DELETE range is
-	// block_number < threshold, not just the window), so nothing leaks; keys NOT
-	// touched since the last prune were already reduced to their latest by an
-	// earlier prune. activeLower=0 (first prune) degrades to the full-table prune.
+	// Only re-collapse primary keys touched since the last prune (block_number >
+	// activeLower). BOTH subqueries — the active-key set "(pk) IN (...)" and the
+	// keep-set "(pk,version) NOT IN (...)" — use "ORDER BY pk [,version DESC] LIMIT 1
+	// BY pk", which streams one row per key in primary-key order (the table is sorted
+	// by (pk..., block_number, ...)), so memory is O(active keys), not O(all keys).
+	// CRITICAL: the active-key set must NOT use "GROUP BY pk". GROUP BY builds an
+	// AggregatingTransform hash table over the whole window in one shot, and mutations
+	// (lightweight DELETE = UPDATE _row_exists) IGNORE max_bytes_before_external_group_by,
+	// so it cannot spill — a 1M-block window of memory_user_positions OOM'd ClickHouse
+	// at 70+ GiB (Code 241, AggregatingTransform) and crash-looped the prune. LIMIT 1 BY
+	// over the PK-sorted read stream gives the same distinct keys with O(1) per-group
+	// memory and no aggregation. The sources are bounded on
+	// BOTH ends: block_number > activeLower (the caller clamps this to blockNumber -
+	// pruneInterval, so the lower bound is a recent window) AND block_number <=
+	// blockNumber. The upper bound is essential: without it, a run whose current
+	// block is far below the table's max block (e.g. a --reindex-from re-applied over
+	// a table that still holds higher-block rows from a prior run) would aggregate
+	// every key from activeLower up to the table's true max in one mutation — 100M+
+	// keys — and OOM ClickHouse (mutations ignore the spill SETTINGS). Bounding the
+	// keep-set to [activeLower, blockNumber] is safe: the DELETE only removes rows
+	// with block_number < threshold (< blockNumber), so any row above blockNumber is
+	// never a deletion candidate and never needs protecting by the keep-set; within
+	// the window, block numbers are monotonic per key, so LIMIT 1 BY still picks each
+	// active key's latest in-window version. Older versions of active keys are still
+	// deleted (the DELETE range is block_number < threshold, not just the window);
+	// keys NOT touched since the last prune were already reduced to their latest by an
+	// earlier prune, so nothing leaks.
 	activeLower := lowerBlock
 
 	queries := []string{
 {{- range .Tables}}
 {{- if gt (len .PrimaryKey) 0}}
 		// {{.Name}} (pk: {{join .PrimaryKey ", "}})
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number < %[2]d AND ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d GROUP BY {{join .PrimaryKey ", "}}) AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, argMax(block_number, (block_number, transaction_index, log_index)), argMax(transaction_index, (block_number, transaction_index, log_index)), argMax(log_index, (block_number, transaction_index, log_index)) FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d GROUP BY {{join .PrimaryKey ", "}}) GROUP BY {{join .PrimaryKey ", "}}) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower),
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number < %[2]d AND ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}} LIMIT 1 BY {{join .PrimaryKey ", "}}) AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}}, block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY {{join .PrimaryKey ", "}}) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber),
 		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60{{.Name}}\x60 FINAL", db),
 {{- end}}
 {{- end}}
