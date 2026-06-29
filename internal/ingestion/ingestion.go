@@ -223,6 +223,19 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			return fmt.Errorf("reindex rollback: %w", err)
 		}
 		log.Printf("[REINDEX] Lightweight DELETE completed for blocks > %d", reindexFrom)
+		// Persist a provisional checkpoint at the reindex floor BEFORE re-indexing.
+		// rollbackAfterBlock just deleted the sync_state cursor for blocks >
+		// reindexFrom; without this write, a crash before the first commit (e.g. an
+		// OOM during the first prune) would leave sync_state empty, and the next
+		// launch would silently fall back to --start-block and replay from there
+		// (wrong data + an unbounded prune). Writing the floor now makes
+		// --reindex-from crash-safe and idempotent: a restart resumes via the normal
+		// cursor-recovery path, which restores hot state from ClickHouse at
+		// reindexFrom and continues forward instead of rebuilding from genesis.
+		if err := store.SaveSyncState(ctx, chain.ID, database.SyncState{Current: database.SyncCursor{Number: reindexFrom}}); err != nil {
+			return fmt.Errorf("reindex: persist provisional checkpoint at %d: %w", reindexFrom, err)
+		}
+		log.Printf("[REINDEX] Provisional checkpoint written at block %d (crash-safe resume)", reindexFrom)
 	}
 	currentBlock := chain.StartBlock
 	if flagStartBlock > 0 {
