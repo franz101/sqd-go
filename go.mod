@@ -1,6 +1,6 @@
 module github.com/franz101/sqd-go
 
-go 1.25.7
+go 1.26.4
 
 require (
 	github.com/ClickHouse/ch-go v0.73.0
