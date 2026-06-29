@@ -203,7 +203,15 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 			// 64MB memtables with aggressive flush: +13% on mixed workloads
 			opts.MemTableSize = 64 << 20
 			opts.MemTableStopWritesThreshold = 2
-			log.Printf("cold tier: optimization profile 'largemem' (64MB memtables)")
+			// MinLZ block compression (faster decode than Snappy) on top of largemem.
+			// Also shrinks the ephemeral cold tier on disk, which matters a lot when
+			// its dir is RAM-backed tmpfs. Needs the v6+ table format; the cold tier is
+			// ephemeral (wiped on open) so adopting the newest format is free.
+			opts.FormatMajorVersion = pebble.FormatNewest
+			for i := range opts.Levels {
+				opts.Levels[i].Compression = compFn(sstable.MinLZCompression)
+			}
+			log.Printf("cold tier: optimization profile 'largemem' (64MB memtables, MinLZ compression)")
 		case "nocomp", "write":
 			// No compression: +5% writes, +7% reads, +13% batch writes
 			for i := range opts.Levels {
