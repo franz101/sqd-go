@@ -95,12 +95,14 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Integration test (15s indexing)
+      - name: Integration test (live-portal indexing)
         env:
           CLICKHOUSE_HOST: 127.0.0.1
           CLICKHOUSE_NATIVE_PORT: "9000"
           CLICKHOUSE_HTTP_PORT: "8123"
           CLICKHOUSE_USER: default
           CLICKHOUSE_PASSWORD: sqd-clickhouse
+        # 120s go-test timeout comfortably covers the test's 45s indexing budget
+        # plus ClickHouse setup/verify, with headroom for a slow portal fetch.
         run: |
-          go test -v -run TestIntegrationIndexSmallRange -count=1 -timeout 60s ./internal/ingestion/
+          go test -v -run TestIntegrationIndexSmallRange -count=1 -timeout 120s ./internal/ingestion/
