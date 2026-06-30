@@ -6,17 +6,19 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/franz101/sqd-go/internal/config"
 )
 
 func TestGenerateWritesSQLViewsAndGoCode(t *testing.T) {
 	root := t.TempDir()
-	configYAML := []byte(`name: case_1_lbtc_event_only
+	configYAML := []byte(`name: erc20_project
 store_raw_logs: true
 chains:
   - id: 1
-    start_block: 0
+    start_block: 20600000
     contracts:
-      - name: LBTC
+      - name: Token
         address: "0x8236a87084f8B84306f72007F36F2618A5634494"
         events:
           - event: Transfer(address indexed from, address indexed to, uint256 value)
@@ -35,32 +37,30 @@ chains:
 
 	var manifest Manifest
 	readJSON(t, manifestPath, &manifest)
-	if manifest.Name != "case_1_lbtc_event_only" {
+	if manifest.Name != "erc20_project" {
 		t.Fatalf("manifest name = %q", manifest.Name)
 	}
 
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
-	assertNotContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.blocks")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.logs")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.sync_state")
+	assertNotContains(t, schema, "CREATE TABLE IF NOT EXISTS `erc20_project`.blocks")
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `erc20_project`.logs")
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `erc20_project`.sync_state")
 	assertContains(t, schema, "last_hash String")
 	assertContains(t, schema, "rollback_chain String")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.`lbtc_transfer_events`")
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `erc20_project`.`token_transfer_events`")
 	assertContains(t, schema, "`from` FixedString(20)")
 	assertContains(t, schema, "`value` UInt256")
 	assertContains(t, schema, "PRIMARY KEY (`from`, `to`, block_number, transaction_index, log_index)")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.erc20_address_positions")
-	assertContains(t, schema, "realized_pnl_raw String")
 
 	views := readText(t, filepath.Join(root, ".sqd", "generated", "views.sql"))
-	assertContains(t, views, "CREATE VIEW `case_1_lbtc_event_only`.`lbtc_transfer` AS")
+	assertContains(t, views, "CREATE VIEW `erc20_project`.`token_transfer` AS")
 	assertContains(t, views, "JSONExtractString(params, 'from') AS `from`")
 	assertContains(t, views, "JSONExtractString(params, 'value') AS `value`")
 	assertContains(t, views, "topic0 = unhex('ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef')")
 
 	goCode := readText(t, filepath.Join(root, "generated", "events.go"))
 	assertContains(t, goCode, "package generated")
-	assertContains(t, goCode, "const LBTCTransferTopic0 = \"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"")
+	assertContains(t, goCode, "const TokenTransferTopic0 = \"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"")
 	assertContains(t, goCode, "From")
 	assertContains(t, goCode, "common.Address")
 	assertContains(t, goCode, "`json:\"from\"`")
@@ -71,28 +71,31 @@ chains:
 	assertContains(t, goCode, "var _addr0_0 = common.HexToAddress(\"0x8236a87084f8B84306f72007F36F2618A5634494\")")
 	assertContains(t, goCode, "logAddress := common.HexToAddress(address)")
 	assertContains(t, goCode, "topic0 == _topic0 && (logAddress == _addr0_0)")
-	assertContains(t, goCode, "func UnpackLBTCTransferLog(topics []string, data []byte) (*LBTCTransfer, error)")
+	assertContains(t, goCode, "func UnpackTokenTransferLog(topics []string, data []byte) (*TokenTransfer, error)")
 
 	inserter := readText(t, filepath.Join(root, "generated", "inserter.go"))
-	assertContains(t, inserter, "type LBTCTransferBatch struct")
-	assertContains(t, inserter, "func (b *LBTCTransferBatch) TableName() string { return \"lbtc_transfer_events\" }")
+	assertContains(t, inserter, "type TokenTransferBatch struct")
+	assertContains(t, inserter, "func (b *TokenTransferBatch) TableName() string { return \"token_transfer_events\" }")
 	assertContains(t, inserter, "colValue proto.ColUInt256")
 
 	schemaGo := readText(t, filepath.Join(root, "generated", "schema.go"))
 	assertContains(t, schemaGo, "type Entities struct")
-	assertContains(t, schemaGo, "LBTCTransfer []LBTCTransfer")
+	assertContains(t, schemaGo, "TokenTransfer []TokenTransfer")
 	assertContains(t, schemaGo, "type Block struct")
 	assertContains(t, schemaGo, "type Log struct")
 	assertContains(t, schemaGo, "type SyncState struct")
 
 	parserGo := readText(t, filepath.Join(root, "generated", "parser.go"))
 	assertContains(t, parserGo, "func ParseJSONLProtoStream(data []byte, batches *InsertBatches, ring *ProtoRingBuffer")
+	// Head-length guard: events whose non-indexed data is shorter than the ABI head
+	// are dropped, matching the legacy decoder (so SQD_PARSE_DECODE_V2 on/off store
+	// identical data). TokenTransfer has one non-indexed word (uint256 value).
+	assertContains(t, parserGo, "if len(dataBytes) >= 1*32 {")
 
 	processor := readText(t, filepath.Join(root, "generated", "custom_processor.go"))
 	assertNotContains(t, processor, "type Entities struct")
-	assertContains(t, processor, "type AddressPosition struct")
 	assertContains(t, processor, "func CustomProcessing(ctx context.Context, store Store, entities *Entities) error")
-	assertContains(t, processor, "func (s *MemoryState) SyncToClickHouse")
+	assertNotContains(t, processor, "erc20_address_positions")
 }
 
 func TestGenerateStoreBlocksOptionIncludesBlocksTable(t *testing.T) {
@@ -615,4 +618,69 @@ chains:
 	assertContains(t, inserterGo, `"block_hash"`)
 	assertNotContains(t, inserterGo, `"contract_address"`)
 	assertNotContains(t, inserterGo, `"transaction_hash"`)
+}
+
+func TestGenerateCustomSchemaSQLGolden(t *testing.T) {
+	cfg := &config.Config{Name: "test_golden"}
+	tables := []customTableSpec{
+		{
+			Name:       "positions",
+			Engine:     "ReplacingMergeTree(block_number)",
+			GoTypeName: "Position",
+			PrimaryKey: []string{"account", "token"},
+			OrderBy:    []string{"account", "token", "block_number", "transaction_index", "log_index"},
+			Columns: []customColumnSpec{
+				{Name: "account", Type: "FixedString(20)"},
+				{Name: "token", Type: "FixedString(32)"},
+				{Name: "balance", Type: "UInt256", Default: "0"},
+				{Name: "updated_at", Type: "DateTime64(3, 'UTC')", Default: "now64(3)"},
+				{Name: "block_number", Type: "UInt64"},
+				{Name: "transaction_index", Type: "UInt64"},
+				{Name: "log_index", Type: "UInt64"},
+			},
+		},
+	}
+
+	got := generateCustomSchemaSQL(cfg, tables)
+
+	// Golden output
+	want := `
+-- Custom tables generated from custom schema definitions.
+
+
+CREATE TABLE IF NOT EXISTS ` + "`test_golden`" + `.` + "`positions`" + ` (
+  ` + "`account`" + ` FixedString(20),
+  ` + "`token`" + ` FixedString(32),
+  ` + "`balance`" + ` UInt256 DEFAULT 0,
+  ` + "`updated_at`" + ` DateTime64(3, 'UTC') DEFAULT now64(3),
+  ` + "`block_number`" + ` UInt64,
+  ` + "`transaction_index`" + ` UInt64,
+  ` + "`log_index`" + ` UInt64
+) ENGINE = ReplacingMergeTree(block_number)
+PRIMARY KEY (` + "`account`" + `, ` + "`token`" + `)
+ORDER BY (` + "`account`" + `, ` + "`token`" + `, ` + "`block_number`" + `, ` + "`transaction_index`" + `, ` + "`log_index`" + `);
+`
+
+	if got != want {
+		t.Errorf("output mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+
+	// Linter: verify structural properties
+	assertContains(t, got, "CREATE TABLE IF NOT EXISTS")
+	assertContains(t, got, "ENGINE = ReplacingMergeTree")
+	assertContains(t, got, "PRIMARY KEY (")
+	assertContains(t, got, "ORDER BY (")
+	assertContains(t, got, ");")
+	// Verify balanced parentheses
+	if strings.Count(got, "(") != strings.Count(got, ")") {
+		t.Errorf("unbalanced parentheses in output: %d '(' vs %d ')'", strings.Count(got, "("), strings.Count(got, ")"))
+	}
+}
+
+func TestGenerateCustomSchemaSQLEmpty(t *testing.T) {
+	cfg := &config.Config{Name: "empty_db"}
+	got := generateCustomSchemaSQL(cfg, nil)
+	assertContains(t, got, "-- Custom tables generated from custom schema definitions.")
+	// Should only have the header comment, no CREATE TABLE
+	assertNotContains(t, got, "CREATE TABLE")
 }

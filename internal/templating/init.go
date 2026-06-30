@@ -191,7 +191,7 @@ func eventsFromABIFile(path string) ([]config.EventConfig, error) {
 }
 
 func chainIDFromName(name string) (uint64, error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	switch strings.ToLower(name) {
 	case "", "ethereum", "ethereum-mainnet", "mainnet", "1":
 		return 1, nil
 	case "polygon", "polygon-mainnet", "matic", "137":

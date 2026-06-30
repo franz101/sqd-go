@@ -538,8 +538,6 @@ func (b *ProtoEventBlock) EventsIter() chan DecodedLog {
 	fmt.Fprint(buf, "\t\t\t}\n\t\t}\n\t}()\n\treturn ch\n}\n")
 }
 
-
-
 // protoColType maps Go type to proto column type
 func protoColType(goType string) string {
 	switch goType {
@@ -635,7 +633,7 @@ func protoAppendExpr(arg eventArg) string {
 	case "[]bool":
 		return "protoBoolArray(ev." + arg.GoFieldName + ")"
 	default:
-		return appendExpr(arg)
+		return arg.AppendExpr()
 	}
 }
 

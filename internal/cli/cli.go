@@ -19,6 +19,7 @@ type parsedArgs struct {
 	noColdCache   bool
 	parallelFetch bool
 	prefetch      bool
+	noReplay      bool
 	state         bool
 	protoMode     bool
 	// reindexFrom holds the --reindex-from value: a block number above which all
@@ -44,6 +45,17 @@ func parseArgs(args []string) (*parsedArgs, error) {
 
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		// Handle --flag=value syntax
+		if strings.Contains(a, "=") {
+			parts := strings.SplitN(a, "=", 2)
+			if len(parts) == 2 {
+				a = parts[0]
+				args = append(args[:i], append([]string{a, parts[1]}, args[i+1:]...)...)
+				// Re-process the flag with its value as a separate arg
+				i--
+				continue
+			}
+		}
 		switch a {
 		case "-r", "--restart":
 			p.restart = true
@@ -95,6 +107,8 @@ func parseArgs(args []string) (*parsedArgs, error) {
 			p.protoMode = false
 		case "--no-cold-cache":
 			p.noColdCache = true
+		case "--no-replay":
+			p.noReplay = true
 		case "--parallel-fetch":
 			p.parallelFetch = true
 		case "--prefetch":
@@ -116,6 +130,9 @@ func parseArgs(args []string) (*parsedArgs, error) {
 		default:
 			if !strings.HasPrefix(a, "-") {
 				positional = append(positional, a)
+			} else {
+				// Error on unknown dash tokens instead of silently dropping them
+				return nil, fmt.Errorf("unknown flag: %s", a)
 			}
 		}
 	}
@@ -189,14 +206,14 @@ func Run(args []string) int {
 		if p.state && os.Getenv(stateChildEnv) == "" {
 			return runStateRebuild(args, p.project)
 		}
-		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 
 	case "stop":
 		return runStop()
@@ -215,7 +232,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 	}
 }
 
@@ -257,8 +274,10 @@ func envOrDefault(key, defaultVal string) string {
 
 func envOrDefaultInt(key string, defaultVal int) int {
 	if v := os.Getenv(key); v != "" {
-		var n int
-		fmt.Sscanf(v, "%d", &n)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return defaultVal
+		}
 		return n
 	}
 	return defaultVal
@@ -266,7 +285,14 @@ func envOrDefaultInt(key string, defaultVal int) int {
 
 func envOrDefaultBool(key string, defaultVal bool) bool {
 	if v := strings.TrimSpace(strings.ToLower(os.Getenv(key))); v != "" {
-		return v == "1" || v == "true" || v == "yes" || v == "on"
+		switch v {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		default:
+			return defaultVal
+		}
 	}
 	return defaultVal
 }
@@ -338,6 +364,9 @@ Flags:
   --no-proto            (start/dev) Use V1 legacy parsed mode instead of proto (struct-based event
                        processing with JSON decode; useful for debugging or unvalidated contracts)
   --no-cold-cache       (start/dev) Disable the Pebble cold tier (on by default)
+  --no-replay           (start/dev) Disable fork recovery. The replay buffer is reduced to a small
+                       smoothing pipe; fork errors are fatal. Use for backfill-only or benchmarking
+                       runs where reorgs cannot occur or do not matter.
   --state               (start) Regenerate the project and re-exec a binary with the project's
                        processor compiled in, so custom state + the PK-keyed cold tier actually run
                        in one command (no manual rebuild). Needs the Go toolchain; the project must

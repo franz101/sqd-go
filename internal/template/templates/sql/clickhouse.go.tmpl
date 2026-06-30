@@ -1,0 +1,127 @@
+{{define "createBlocksTable"}}
+CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.blocks (
+    chain_id UInt64, block_number UInt64,
+    block_timestamp DateTime64(3, 'UTC'), block_hash String,
+    {{if .Collapsing}}sign Int8 DEFAULT 1,{{end}}
+    inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
+) ENGINE = {{.Engine}} ORDER BY (chain_id, block_number)
+{{end}}
+
+{{define "createLogsTable"}}
+CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.logs (
+    chain_id UInt64, block_number UInt64,
+    block_timestamp DateTime64(3, 'UTC'), block_hash String,
+    transaction_hash FixedString(32), transaction_index UInt64, log_index UInt64,
+    address FixedString(20), event_name LowCardinality(String),
+    topic0 FixedString(32), params String,
+    {{if .Collapsing}}sign Int8 DEFAULT 1,{{end}}
+    inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
+) ENGINE = {{.Engine}} ORDER BY (chain_id, block_number, transaction_index, log_index)
+{{end}}
+
+{{define "createSyncStateTable"}}
+CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.sync_state (
+    chain_id UInt64, last_block UInt64, last_hash String,
+    finalized_block UInt64, finalized_hash String,
+    rollback_chain String,
+    updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
+) ENGINE = MergeTree() ORDER BY (chain_id, updated_at)
+{{end}}
+
+{{define "createEventTable"}}
+CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.{{.TableIdent}} (
+    {{if .IncludeChainID}}chain_id UInt64,{{end}}
+    block_number UInt64, block_timestamp DateTime64(3, 'UTC'),
+    {{if .IncludeBlockHash}}block_hash FixedString(32),{{end}}
+    {{if .IncludeContractAddress}}contract_address FixedString(20),{{end}}
+    {{if .IncludeTransactionHash}}transaction_hash FixedString(32),{{end}}
+    transaction_index UInt64, log_index UInt64
+    {{- range .Columns}}, {{.ColumnIdent}} {{.ClickHouseType}}{{end}}
+    {{if .Collapsing}}, sign Int8 DEFAULT 1{{end}}
+) ENGINE = {{.Engine}}
+ORDER BY ({{.Key}})
+PRIMARY KEY ({{.Key}})
+{{end}}
+
+{{define "createERC20AddressPositionsTable"}}CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.erc20_address_positions (
+  address FixedString(20),
+  balance_raw String,
+  total_in_raw String,
+  total_out_raw String,
+  net_flow_raw String,
+  realized_pnl_raw String,
+  transfer_count UInt64,
+  updated_at_block UInt64,
+  updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
+) ENGINE = ReplacingMergeTree(updated_at_block)
+ORDER BY address{{end}}
+
+{{define "insertBlocks"}}INSERT INTO {{.DatabaseIdent}}.blocks (chain_id, block_number, block_timestamp, block_hash) VALUES{{end}}
+
+{{define "insertLogs"}}INSERT INTO {{.DatabaseIdent}}.logs (chain_id, block_number, block_timestamp, block_hash, transaction_hash, transaction_index, log_index, address, event_name, topic0, params) VALUES{{end}}
+
+{{define "insertSyncState"}}INSERT INTO {{.DatabaseIdent}}.sync_state (chain_id, last_block, last_hash, finalized_block, finalized_hash, rollback_chain) VALUES{{end}}
+
+{{define "deleteTruncateSyncState"}}DELETE FROM {{.DatabaseIdent}}.sync_state WHERE chain_id = {{.ChainID}} AND last_block < {{.LastBlock}} SETTINGS lightweight_deletes_sync = 1{{end}}
+
+{{define "deleteWhereChain"}}DELETE FROM {{.DatabaseIdent}}.{{.TableName}} WHERE chain_id = {{.ChainID}} AND block_number > {{.LastBlock}} SETTINGS lightweight_deletes_sync = 1{{end}}
+
+{{define "deleteWhereNoChain"}}DELETE FROM {{.DatabaseIdent}}.{{.TableName}} WHERE block_number > {{.LastBlock}} SETTINGS lightweight_deletes_sync = 1{{end}}
+
+{{define "deleteSyncStateAfterBlock"}}DELETE FROM {{.DatabaseIdent}}.sync_state WHERE chain_id = {{.ChainID}} AND last_block > {{.LastBlock}} SETTINGS lightweight_deletes_sync = 1{{end}}
+
+{{define "optimizeTable"}}OPTIMIZE TABLE {{.DatabaseIdent}}.{{.TableName}} FINAL{{end}}
+
+{{define "optimizeSyncState"}}OPTIMIZE TABLE {{.DatabaseIdent}}.sync_state FINAL{{end}}
+
+{{define "insertSelectFinal"}}INSERT INTO {{.DatabaseIdent}}.{{.TableName}} ({{.ColumnList}}) SELECT {{.SelectExprs}} FROM {{.DatabaseIdent}}.{{.TableName}} FINAL WHERE {{.WhereClause}}{{end}}
+
+{{define "tablesWithBlockNumber"}}
+SELECT
+    c.table AS table,
+    countIf(c.name = 'chain_id') AS has_chain,
+    countIf(c.name = 'sign') AS has_sign
+FROM system.columns c
+INNER JOIN system.tables t
+    ON c.database = t.database AND c.table = t.name
+WHERE c.database = {{.DatabaseString}}
+    AND c.name IN ('block_number', 'chain_id', 'sign')
+    AND t.engine NOT LIKE '%View'
+GROUP BY c.table
+HAVING countIf(c.name = 'block_number') > 0
+ORDER BY c.table
+{{end}}
+
+{{define "tableColumns"}}
+SELECT name
+FROM system.columns
+WHERE database = {{.DatabaseString}} AND table = {{.TableString}}
+ORDER BY position
+{{end}}
+
+{{define "maxBlockNumber"}}SELECT coalesce(max(block_number), 0) AS m, count() AS c FROM {{.DatabaseIdent}}.{{.TableName}}{{if .WhereClause}} WHERE {{.WhereClause}}{{end}}{{end}}
+
+{{define "lastSyncState"}}
+SELECT last_block, last_hash, finalized_block, finalized_hash, rollback_chain
+FROM {{.DatabaseIdent}}.sync_state
+WHERE chain_id = {{.ChainID}}
+ORDER BY updated_at DESC
+LIMIT 1
+{{end}}
+
+{{define "lastBlockFromSyncState"}}SELECT coalesce(max(last_block), 0) AS last, count() AS count FROM {{.DatabaseIdent}}.sync_state WHERE chain_id = {{.ChainID}}{{end}}
+
+{{define "lastBlockFromBlocks"}}SELECT coalesce(max(block_number), 0) AS last, count() AS count FROM {{.DatabaseIdent}}.blocks WHERE chain_id = {{.ChainID}}{{end}}
+
+{{define "tableExists"}}SELECT count() AS count FROM system.tables WHERE database = {{.DatabaseString}} AND name = {{.TableString}}{{end}}
+
+{{define "systemFlushAsync"}}SYSTEM FLUSH ASYNC INSERT QUEUE{{end}}
+
+{{define "createCustomTable"}}
+CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.{{.TableIdent}} (
+{{range $i, $col := .Columns}}
+{{- if $i}},{{"\n"}}{{- end}}  {{$col.NameIdent}} {{$col.Type}}{{- if $col.Default}} DEFAULT {{$col.Default}}{{- end}}
+{{- end}}
+) ENGINE = {{.Engine}}
+PRIMARY KEY ({{.PrimaryKey}})
+ORDER BY ({{.OrderBy}}){{end}}

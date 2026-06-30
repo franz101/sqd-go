@@ -208,12 +208,15 @@ func TestCoverageReflectsSkippedEmptyGaps(t *testing.T) {
 // blocks is a small fraction. This is the prefetcher-level view of the same artifact:
 // the chain is covered fast, but few blocks are "present". ALWAYS RUNS (no ClickHouse).
 func TestParallelPrefetcherSparseCoverageVsNonEmpty(t *testing.T) {
-	const start, end uint64 = 0, 100000
+	// Keep the range above adaptiveGapMax so the initial nil-toBlock probe is
+	// exercised before this fake endpoint reports zero forward progress and the
+	// prefetcher falls back to pinned requests.
+	const start, end uint64 = 0, 200000
 	const pageSize uint64 = 10000
 	const workers = 4
 
 	// Present (non-empty) blocks: one every 10000 across the range, plus the marker
-	// blocks the portal emits at each page's scanned high-water mark. With ~11
+	// blocks the portal emits at each page's scanned high-water mark. With ~21
 	// "real" present numbers the non-empty fraction is tiny relative to the range.
 	var present []uint64
 	for n := start; n <= end; n += 10000 {
@@ -272,7 +275,7 @@ func TestParallelPrefetcherSparseCoverageVsNonEmpty(t *testing.T) {
 		t.Fatalf("max present block %d does not span the range (end %d)", coverage, end)
 	}
 	// ...while the present (non-empty) count is a small fraction of that span. We
-	// inserted ~21 present/marker numbers across 100001 block-numbers, so non-empty
+	// inserted ~41 present/marker numbers across 200001 block-numbers, so non-empty
 	// should be well under 1% of coverage.
 	if nonEmpty == 0 {
 		t.Fatal("no present blocks parsed from sparse pages")

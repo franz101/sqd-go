@@ -59,3 +59,56 @@ func TestFastJSONLParserScansHeadersWithoutParsingLogs(t *testing.T) {
 		t.Fatalf("lines = %#v, want two retained lines", lines)
 	}
 }
+
+// TestScanHeadersBoundedToHeaderObject ensures the hand-rolled header scanner
+// reads block identity only from the header object: a decoy "number"/"hash"
+// inside the logs array must not be misread, genesis block 0 is valid, and a
+// line with no header object is a hard error.
+func TestScanHeadersBoundedToHeaderObject(t *testing.T) {
+	// Line 1: a log payload contains the bytes "number":999 and "hash":"0xdead"
+	//         before the (out-of-order) real header is even closed — none of
+	//         those decoys may win because the scan is bounded to the header.
+	// Line 2: genesis block 0 with a real hash.
+	data := []byte(`{"header":{"timestamp":100,"hash":"0xreal","number":7},"logs":[{"data":"0x\"number\":999,\"hash\":\"0xdead\"","topics":["0xaa"]}]}
+{"header":{"number":0,"hash":"0xgenesis","timestamp":50},"logs":[]}
+`)
+	parser := NewFastJSONLParser(0)
+	var numbers, timestamps []uint64
+	var hashes []string
+	err := parser.ScanHeadersWithLine(data, func(number, timestamp uint64, hash string, _ []byte) error {
+		numbers = append(numbers, number)
+		timestamps = append(timestamps, timestamp)
+		hashes = append(hashes, hash)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(numbers) != 2 || numbers[0] != 7 || numbers[1] != 0 {
+		t.Fatalf("numbers = %#v, want [7 0]", numbers)
+	}
+	if len(timestamps) != 2 || timestamps[0] != 100 || timestamps[1] != 50 {
+		t.Fatalf("timestamps = %#v, want [100 50]", timestamps)
+	}
+	if len(hashes) != 2 || hashes[0] != "0xreal" || hashes[1] != "0xgenesis" {
+		t.Fatalf("hashes = %#v, want [0xreal 0xgenesis]", hashes)
+	}
+}
+
+// TestScanHeadersMissingHeaderIsError fails closed rather than silently emitting
+// a zero block when a line has no header object.
+func TestScanHeadersMissingHeaderIsError(t *testing.T) {
+	data := []byte(`{"logs":[{"topics":["0xaa"]}]}` + "\n")
+	parser := NewFastJSONLParser(0)
+	called := false
+	err := parser.ScanHeadersWithLine(data, func(uint64, uint64, string, []byte) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected error for missing header, got nil")
+	}
+	if called {
+		t.Fatal("callback must not fire for a malformed header line")
+	}
+}

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	bitcask "go.mills.io/bitcask/v2"
 )
 
@@ -536,12 +536,12 @@ func BenchmarkBitcaskAllocs(b *testing.B) {
 }
 
 // Sub-benchmark: Different sizes
-func BenchmarkPebble1GBWrite(b *testing.B) { benchmarkPebbleWriteSize(b, 1) }
-func BenchmarkPebble4GBWrite(b *testing.B) { benchmarkPebbleWriteSize(b, 4) }
+func BenchmarkPebble1GBWrite(b *testing.B)  { benchmarkPebbleWriteSize(b, 1) }
+func BenchmarkPebble4GBWrite(b *testing.B)  { benchmarkPebbleWriteSize(b, 4) }
 func BenchmarkPebble12GBWrite(b *testing.B) { benchmarkPebbleWriteSize(b, 12) }
 
-func BenchmarkBitcask1GBWrite(b *testing.B) { benchmarkBitcaskWriteSize(b, 1) }
-func BenchmarkBitcask4GBWrite(b *testing.B) { benchmarkBitcaskWriteSize(b, 4) }
+func BenchmarkBitcask1GBWrite(b *testing.B)  { benchmarkBitcaskWriteSize(b, 1) }
+func BenchmarkBitcask4GBWrite(b *testing.B)  { benchmarkBitcaskWriteSize(b, 4) }
 func BenchmarkBitcask12GBWrite(b *testing.B) { benchmarkBitcaskWriteSize(b, 12) }
 
 func benchmarkPebbleWriteSize(b *testing.B, gb int) {

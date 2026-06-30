@@ -63,7 +63,7 @@ func TestIntegrationIndexSmallRange(t *testing.T) {
 	host, port, password := chEnv()
 	dbName := fmt.Sprintf("integration_test_%d", time.Now().UnixNano())
 
-	endBlock := uint64(22000100)
+	endBlock := uint64(22000500)
 	cfg := &config.Config{
 		Name: dbName,
 		Chains: []config.Chain{{
@@ -110,8 +110,14 @@ func TestIntegrationIndexSmallRange(t *testing.T) {
 	}
 	store.Close()
 
-	// Run the ingestion pipeline with a 15-second timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Run the ingestion pipeline. The budget is generous (45s) on purpose: the
+	// pipeline fetches a real range from the live SQD portal, whose tail latency is
+	// occasionally several seconds. The producer's first request is sequential (it
+	// learns the finalized head before parallel fetch can engage), so a single slow
+	// portal read used to consume a tight 15s window and the test ingested 0 rows
+	// ("read body: context deadline exceeded"). 45s lets a slow fetch — and the
+	// ingestion loop's own retry — complete; a healthy run still finishes in seconds.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	opts := Options{
@@ -121,8 +127,9 @@ func TestIntegrationIndexSmallRange(t *testing.T) {
 		ClickHousePassword: password,
 		ClickHouseDatabase: dbName,
 		Restart:            false,
-		CursorMode:         false,
+		CursorMode:         true,
 		PageSize:           0,
+		ParallelFetch:      true,
 	}
 
 	err = Run(ctx, cfg, opts)

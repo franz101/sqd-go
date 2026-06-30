@@ -58,6 +58,12 @@ type Options struct {
 	// off; most useful in resume/cursor mode against a populated ClickHouse.
 	Prefetch bool
 
+	// NoReplay disables fork recovery. The replay buffer is reduced to a small
+	// smoothing pipe; fork errors are treated as fatal instead of triggering
+	// rollback-and-replay. Use for backfill-only or benchmarking runs where forks
+	// cannot occur or do not matter.
+	NoReplay bool
+
 	// ParallelFetch fetches the finalized backfill range with concurrent range
 	// workers (cursor mode only). The immutable finalized region is fetched out
 	// of order and re-serialized for the in-order consumer; see parallel_fetch.go.
@@ -188,7 +194,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 		coldDir = filepath.Join(os.TempDir(), "sqd-coldcache", cfg.Name)
 	}
 	for _, chain := range cfg.Chains {
-		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom, opts.Prefetch); err != nil {
+		if err := processChain(ctx, store, cfg, &chain, opts.PageSize, opts.StartBlock, opts.BlockCount, opts.CursorMode, forkMode, opts.Restart, proc, opts.ColdCache, coldDir, opts.ParallelFetch, opts.ReindexFrom, opts.Prefetch, opts.NoReplay); err != nil {
 			log.Printf("chain %d error: %v", chain.ID, err)
 		}
 	}
@@ -196,7 +202,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	return nil
 }
 
-func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64, prefetch bool) error {
+func processChain(ctx context.Context, store *database.Store, cfg *config.Config, chain *config.Chain, pageSize, flagStartBlock, blockCountLimit uint64, cursorMode bool, forkMode config.ForkMode, restart bool, proc Processor, coldCache bool, coldDir string, parallelFetch bool, reindexFrom uint64, prefetch bool, noReplay bool) error {
 	if len(chain.Contracts) == 0 {
 		return fmt.Errorf("no contracts defined for chain %d", chain.ID)
 	}
@@ -217,6 +223,19 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			return fmt.Errorf("reindex rollback: %w", err)
 		}
 		log.Printf("[REINDEX] Lightweight DELETE completed for blocks > %d", reindexFrom)
+		// Persist a provisional checkpoint at the reindex floor BEFORE re-indexing.
+		// rollbackAfterBlock just deleted the sync_state cursor for blocks >
+		// reindexFrom; without this write, a crash before the first commit (e.g. an
+		// OOM during the first prune) would leave sync_state empty, and the next
+		// launch would silently fall back to --start-block and replay from there
+		// (wrong data + an unbounded prune). Writing the floor now makes
+		// --reindex-from crash-safe and idempotent: a restart resumes via the normal
+		// cursor-recovery path, which restores hot state from ClickHouse at
+		// reindexFrom and continues forward instead of rebuilding from genesis.
+		if err := store.SaveSyncState(ctx, chain.ID, database.SyncState{Current: database.SyncCursor{Number: reindexFrom}}); err != nil {
+			return fmt.Errorf("reindex: persist provisional checkpoint at %d: %w", reindexFrom, err)
+		}
+		log.Printf("[REINDEX] Provisional checkpoint written at block %d (crash-safe resume)", reindexFrom)
 	}
 	currentBlock := chain.StartBlock
 	if flagStartBlock > 0 {
@@ -342,7 +361,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		defer sqdFinalized.Close()
 	}
 	jsonl := parser.NewFastJSONLParser(1024)
-	replayBuf := NewReplayBuffer(8192) // ~8K blocks of replay capacity
+	replayBufCap := 65536 // ~64K blocks of replay capacity
+	if noReplay {
+		replayBufCap = 1024 // small smoothing pipe; no fork recovery needed
+	}
+	replayBuf := NewReplayBuffer(replayBufCap)
 	// No-data-loss (Invariant 0): if the processor reports a durable commit
 	// horizon, the persisted checkpoint is gated so it never leads that horizon.
 	// On crash the run resumes from durable state and re-fetches the cheap gap.
@@ -358,9 +381,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// and dynamically enable once the consumer approaches the finalized head.
 	var snapshotController SnapshotController
 	var snapshotsActive bool
-	if sc, ok := proc.(SnapshotController); ok {
-		snapshotController = sc
-		sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
+	if !noReplay {
+		if sc, ok := proc.(SnapshotController); ok {
+			snapshotController = sc
+			sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
+		}
 	}
 	backfillGC := cursorMode && !snapshotsActive
 	var previousGOGC int
@@ -375,17 +400,17 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	fastJSONLProc, fastJSONLOK := proc.(FastJSONLProcessor)
 	useParseDecodeV2 := envconfig.ParseDecodeV2Enabled() && fastJSONLOK
 	if envconfig.ParseDecodeV2Enabled() && !fastJSONLOK {
-		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 requested, but processor does not implement FastJSONLProcessor; using default processor path", chain.ID)
+		log.Printf("Chain %d: fast parse/decode default-on, but processor does not implement FastJSONLProcessor; using legacy decode path", chain.ID)
 	}
 	if useParseDecodeV2 {
-		log.Printf("Chain %d: SQD_PARSE_DECODE_V2 enabled for custom processor", chain.ID)
+		log.Printf("Chain %d: fast parse/decode enabled (opt out with SQD_NO_PARSE_DECODE_V2=1)", chain.ID)
 	}
 	fastInsertProc, fastInsertOK := proc.(FastJSONLInsertProcessor)
 	singleParse := useParseDecodeV2 && fastInsertOK && !storeBlocks && !cfg.ShouldStoreRawLogs() &&
-		os.Getenv("SQD_SINGLE_PARSE") != "0"
+		!envconfig.GetenvBool("SQD_NO_SINGLE_PARSE", false)
 	batchProc, batchProcOK := proc.(FastBatchParseProcessor)
 	batchParse := singleParse && batchProcOK && batchProc.SupportsBatchParse() &&
-		os.Getenv("SQD_PRODUCER_PARSE") != "0"
+		!envconfig.GetenvBool("SQD_NO_PRODUCER_PARSE", false)
 	if batchParse {
 		log.Printf("Chain %d: producer-parse pipeline enabled (one generated parse; consumer runs state math)", chain.ID)
 	} else if singleParse {
@@ -400,6 +425,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	var profFetchNanos, profParseNanos, profDecodeNanos, profMarshalNanos, profInsertNanos, profCustomNanos atomic.Int64
 	var profConsumerWaitNanos, profProducerBackpressureNanos atomic.Int64
 	var profIters atomic.Int64
+	var parallelEngaged atomic.Bool
 	defer func() {
 		runtime.ReadMemStats(&memAfter)
 		printProfile(
@@ -429,6 +455,14 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 	var currentConsumerBlock atomic.Uint64
 	currentConsumerBlock.Store(currentBlock)
+
+	// consumedEntries counts entries the consumer has drained from the replay
+	// buffer. Backpressure is gated on (replayBuf.Writes() - consumedEntries) —
+	// the count of buffered-but-unconsumed entries — rather than block-number
+	// distance, which overcounts in sparse mode (skipped empty ranges advance the
+	// producer's block cursor without writing any entry) and deadlocks the
+	// producer in a large empty gap before it reaches the next event block.
+	var consumedEntries atomic.Uint64
 
 	// Producer fetch instrumentation, read by logStats for honest reporting. A
 	// single dense /finalized-stream request is fetched+parsed whole before any
@@ -470,6 +504,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	parallelWorkers, parallelPageSize, parallelRPS := ParallelFetchSettings()
 	parallelLimiter := newRateLimiter(parallelRPS, defaultParallelBurst)
 	parallelSkipEmpties := parallelEnabled && !storeBlocks && !cfg.ShouldStoreRawLogs()
+	sequentialSkipEmpties := !cursorMode && !storeBlocks && !cfg.ShouldStoreRawLogs()
 	parallelEndpoint := chainEndpoint(chain.ID, false)
 	var parallelBound atomic.Uint64
 	// Per-fetch latency budget for the dense adaptive path (sequential cursor mode).
@@ -524,9 +559,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				default:
 				}
 
-				// Backpressure check: wait if producer is too far ahead of consumer
-				cBlock := currentConsumerBlock.Load()
-				if pBlock >= cBlock && pBlock-cBlock >= uint64(replayBuf.capacity)-100 {
+				// Backpressure check: wait if too many unconsumed entries are
+				// buffered. Measured by entry count (writes - consumed), not block
+				// distance, so skipped empty ranges in sparse mode don't wedge the
+				// producer before it reaches the next event block.
+				if replayBuf.Writes()-consumedEntries.Load() >= uint64(replayBuf.capacity)-100 {
 					waitStart := time.Now()
 					select {
 					case <-pCtx.Done():
@@ -549,14 +586,25 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						prefetch = newParallelPrefetcher(parallelEndpoint, filters, !parallelSkipEmpties, pBlock, bound, uint64(parallelPageSize), parallelWorkers, parallelLimiter)
 						parallelBound.Store(bound)
 						prefetch.launch(pCtx)
+						parallelEngaged.Store(true)
 						log.Printf("Chain %d: parallel fetch engaged for finalized backfill [%d-%d] (%d workers, ~%.0f req/s, skipEmpties=%v)", chain.ID, pBlock, bound, parallelWorkers, parallelRPS, parallelSkipEmpties)
 					case cursorMode && lastFinalized == 0:
 						// Finalized head not learned yet — the first sequential fetch
 						// will populate it. Retry on the next iteration; don't latch.
+						log.Printf("Chain %d: parallel fetch waiting for finalized head (current block %d)", chain.ID, pBlock)
 					default:
 						// Region too small, or unbounded/non-engageable: a permanent
 						// decision, so stop checking and stay sequential.
 						parallelDone = true
+						spanReason := "unknown"
+						if !ok {
+							spanReason = "no bound returned"
+						} else if bound < pBlock {
+							spanReason = "bound < current"
+						} else {
+							spanReason = fmt.Sprintf("span %d < min %d", bound-pBlock, parallelMinSpan(parallelPageSize, parallelWorkers))
+						}
+						log.Printf("Chain %d: parallel fetch declined at block %d (cursorMode=%v, ok=%v, bound=%d, reason=%s)", chain.ID, pBlock, cursorMode, ok, bound, spanReason)
 					}
 				}
 
@@ -568,7 +616,13 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 				var err error
 				var lastFetchDur time.Duration
 				if prefetch != nil {
+					// Attribute the consumer's wait for the prefetcher to deliver the next
+					// page to fetch time: ~0 when prefetch keeps up (fetch not limiting), >0
+					// when it stalls. Previously invisible (fetch=0s) since background prefetch
+					// work never touched profFetchNanos.
+					fetchT0 := time.Now()
 					page, ok := prefetch.Next(pCtx)
+					profFetchNanos.Add(int64(time.Since(fetchT0)))
 					if !ok {
 						// Region fully emitted (or cancelled/stalled): resume sequential
 						// from the current cursor, which the last consumed page advanced.
@@ -625,7 +679,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 					t0 := time.Now()
 					producerFetchFrom.Store(pBlock)
 					producerFetchSinceNanos.Store(t0.UnixNano())
-					response, err = fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, cursorMode, filters)
+					response, err = fetchClient.FetchWithParent(pCtx, pBlock, toBlockPtr, pHash, !sequentialSkipEmpties, filters)
 					lastFetchDur = time.Since(t0)
 					producerFetchSinceNanos.Store(0)
 					profFetchNanos.Add(int64(lastFetchDur))
@@ -727,8 +781,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 							parsed.RawLine = nil
 						}
 						for {
-							consumerBlock := currentConsumerBlock.Load()
-							if parsed.Number >= consumerBlock && parsed.Number-consumerBlock >= uint64(replayBuf.capacity)-100 {
+							if replayBuf.Writes()-consumedEntries.Load() >= uint64(replayBuf.capacity)-100 {
 								waitStart := time.Now()
 								select {
 								case <-pCtx.Done():
@@ -895,10 +948,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 				batchStartBlock := pBlock
 				for idx, db := range decodedBlocks {
-					// Backpressure check: wait if producer is too far ahead of consumer
+					// Backpressure check: wait if too many unconsumed entries are
+					// buffered (entry count, not block distance — see producer-loop top).
 					for {
-						cBlock := currentConsumerBlock.Load()
-						if db.number >= cBlock && db.number-cBlock >= uint64(replayBuf.capacity)-100 {
+						if replayBuf.Writes()-consumedEntries.Load() >= uint64(replayBuf.capacity)-100 {
 							waitStart := time.Now()
 							select {
 							case <-pCtx.Done():
@@ -1336,6 +1389,7 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 
 			currentConsumerBlockVal = entry.number + 1
 			currentConsumerBlock.Store(currentConsumerBlockVal)
+			consumedEntries.Add(1)
 
 			select {
 			case <-statsTicker.C:
@@ -1349,31 +1403,16 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			continue
 		}
 
-		// Sparse backfill (includeAllBlocks=false) returns only blocks with matching
-		// logs plus the portal's end-of-scan marker, leaving block-number gaps. A
-		// missing block at or below the scanned high-water mark was fetched and found
-		// empty, so jump to the next present block instead of waiting for one that
-		// will never arrive — and, once the producer is done, breaking with the
-		// accumulated batch still un-inserted (the batch is only flushed at a page's
-		// last-in-batch block, which sits past the gap).
-		//
-		// The high-water mark differs by fetch mode. The parallel prefetcher fetches
-		// pages out of order, so a gap is only confirmed-empty once parallelBound has
-		// advanced past it. The sequential producer fetches strictly in order, so
-		// LatestBlock is itself the mark: any absent block at or below it was scanned.
-		if parallelSkipEmpties {
+		// Sparse fetching (includeAllBlocks=false) leaves block-number gaps:
+		// blocks with no matching logs are absent. When the missing block is
+		// at or below the scanned high-water mark (latestBlock — the portal
+		// returns a marker block at the end of every scanned response), the
+		// gap is confirmed-empty and was never fetched, so jump to the next
+		// present block instead of waiting forever for it.
+		if parallelSkipEmpties || sequentialSkipEmpties {
 			c := currentConsumerBlockVal
-			if pb := parallelBound.Load(); pb != 0 && c <= pb && c <= replayBuf.LatestBlock() {
-				if next, ok := replayBuf.CeilBlock(c); ok {
-					currentConsumerBlockVal = next
-					currentConsumerBlock.Store(currentConsumerBlockVal)
-					continue
-				}
-			}
-		} else if !cursorMode {
-			// Sequential backfill fetches sparse too (includeAllBlocks=cursorMode==false).
-			c := currentConsumerBlockVal
-			if c <= replayBuf.LatestBlock() {
+			pb := parallelBound.Load()
+			if (!parallelSkipEmpties || (pb != 0 && c <= pb)) && c <= replayBuf.LatestBlock() {
 				if next, ok := replayBuf.CeilBlock(c); ok {
 					currentConsumerBlockVal = next
 					currentConsumerBlock.Store(currentConsumerBlockVal)
@@ -1401,6 +1440,9 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		case sig := <-errChan:
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			if sig.forkErr != nil {
+				if noReplay {
+					return fmt.Errorf("fork detected at block %d (replay disabled — restart to recover)", currentConsumerBlockVal)
+				}
 				if err := drainPendingInsert(); err != nil {
 					return fmt.Errorf("drain producer-parse event insert before fork rollback: %w", err)
 				}
@@ -1509,6 +1551,12 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		case <-statsTicker.C:
 			profConsumerWaitNanos.Add(int64(time.Since(waitStart)))
 			logStats("periodic")
+		}
+	}
+
+	if store != nil {
+		if err := store.FlushAsyncInserts(ctx); err != nil {
+			log.Printf("Chain %d: error flushing async inserts on exit: %v", chain.ID, err)
 		}
 	}
 

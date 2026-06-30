@@ -1,0 +1,36 @@
+{{define "clockFilterKeysGo"}}// Negative-filter completeness pass: keys whose latest update is below the
+// recovery floor are excluded from the value load above and would otherwise be
+// absent from the filter, making the authoritative skip-CH gate reset a real
+// pre-existing position to zero. Add their keys only (values not needed).
+if preClause, active := recoveryPreFloorClause(); active {
+if err := recoverFilterKeysParallel(ctx, conn, recoveryBucketCount, c.cold, func(ctx context.Context, conn *ch.Client, bucket int, emit func({{.KeyType}})) error {
+var (
+{{- range .PKFields}}
+{{.ColVar}} {{.ColType}}
+{{- end}}
+)
+{{- range .PKFields}}
+{{- range .InitLines}}
+{{.}}
+{{- end}}
+{{- end}}
+results := proto.Results{
+{{- range .PKFields}}
+{Name: "{{.ColumnName}}", Data: {{.ResultData}}},
+{{- end}}
+}
+return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("{{.SQL}}", quoteIdent(db), quoteIdent("{{.TableName}}"), {{.WhereExpr}}+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+for i := 0; i < block.Rows; i++ {
+emit({{.KeyType}}{
+{{- range .PKFields}}
+{{.FieldName}}: {{.ValueExpr}},
+{{- end}}
+})
+}
+return nil
+}})
+}); err != nil {
+return err
+}
+}
+{{end}}

@@ -29,8 +29,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/franz101/sqd-go/internal/envconfig"
 )
 
@@ -107,7 +107,7 @@ type Store struct {
 	// neg is an optional in-memory negative-lookup Bloom filter (the V3 cold-tier
 	// optimization). When set, a Get whose key is provably absent skips Pebble
 	// entirely. nil => V2 behaviour (every miss probes Pebble). See filter.go.
-	neg        *negFilter
+	neg        negFilter
 	filterHits atomic.Uint64 // Pebble Gets skipped because the filter proved the key absent
 }
 
@@ -132,6 +132,17 @@ func (s *Store) FilterSkips() uint64 {
 		return 0
 	}
 	return s.filterHits.Load()
+}
+
+// AddKeyToFilter adds a key to the negative filter (if enabled). This is called
+// during cold recovery to populate the filter with keys that are known to exist in
+// ClickHouse above the recovery floor. Subsequent Gets for these keys will skip the
+// Pebble lookup when the filter reports "may contain=false" (authoritative miss).
+func (s *Store) AddKeyToFilter(key []byte) {
+	if s == nil || s.neg == nil {
+		return
+	}
+	s.neg.add(key)
 }
 
 // Open creates a fresh (wiped) Pebble store at dir with capped off-heap memory.
@@ -192,28 +203,41 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 			// 64MB memtables with aggressive flush: +13% on mixed workloads
 			opts.MemTableSize = 64 << 20
 			opts.MemTableStopWritesThreshold = 2
-			log.Printf("cold tier: optimization profile 'largemem' (64MB memtables)")
+			// MinLZ block compression (faster decode than Snappy) on top of largemem.
+			// Also shrinks the ephemeral cold tier on disk, which matters a lot when
+			// its dir is RAM-backed tmpfs. Needs the v6+ table format; the cold tier is
+			// ephemeral (wiped on open) so adopting the newest format is free.
+			opts.FormatMajorVersion = pebble.FormatNewest
+			for i := range opts.Levels {
+				opts.Levels[i].Compression = compFn(sstable.MinLZCompression)
+			}
+			log.Printf("cold tier: optimization profile 'largemem' (64MB memtables, MinLZ compression)")
 		case "nocomp", "write":
 			// No compression: +5% writes, +7% reads, +13% batch writes
-			// Set up levels with no compression
-			opts.Levels = make([]pebble.LevelOptions, 7)
 			for i := range opts.Levels {
-				opts.Levels[i].Compression = sstable.NoCompression
+				opts.Levels[i].Compression = compFn(sstable.NoCompression)
 			}
 			log.Printf("cold tier: optimization profile 'nocomp' (no compression)")
 		case "fast", "read":
 			// Optimized for reads
-			opts.Levels = make([]pebble.LevelOptions, 7)
 			for i := range opts.Levels {
-				opts.Levels[i].Compression = sstable.NoCompression
+				opts.Levels[i].Compression = compFn(sstable.NoCompression)
 			}
 			log.Printf("cold tier: optimization profile 'fastreads' (no compression)")
 		case "aggressive":
 			// Aggressive compaction
 			opts.L0CompactionThreshold = 2
 			opts.L0CompactionFileThreshold = 4
-			opts.MaxConcurrentCompactions = func() int { return 2 }
+			opts.CompactionConcurrencyRange = func() (int, int) { return 1, 2 }
 			log.Printf("cold tier: optimization profile 'aggressive'")
+		case "minlz":
+			// MinLZ block compression (faster decode than Snappy). Requires the v6+
+			// table format; the cold tier is ephemeral so the newest format is free.
+			opts.FormatMajorVersion = pebble.FormatNewest
+			for i := range opts.Levels {
+				opts.Levels[i].Compression = compFn(sstable.MinLZCompression)
+			}
+			log.Printf("cold tier: optimization profile 'minlz' (fast-decode codec)")
 		default:
 			log.Printf("cold tier: unknown optimization profile '%s', using baseline", optim)
 		}
@@ -260,7 +284,7 @@ const writeBatchFlushCount = 16384
 type WriteBatch struct {
 	db    *pebble.DB
 	b     *pebble.Batch
-	neg   *negFilter
+	neg   negFilter
 	count int
 	flat  *flatcold // when set, Put writes through immediately (no batching needed)
 }

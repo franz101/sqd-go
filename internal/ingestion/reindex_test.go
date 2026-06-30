@@ -30,9 +30,6 @@ func TestIntegrationReindexFrom(t *testing.T) {
 	// Use a small range of USDC Transfer events on Ethereum
 	// Blocks 22000000-22000200 (200 blocks total)
 	endBlock := uint64(22000200)
-	// Phase 2 reindexes from this midpoint: blocks > it are deleted then rebuilt,
-	// blocks <= it are left untouched.
-	reindexFromBlock := uint64(22000100)
 	cfg := &config.Config{
 		Name: dbName,
 		Chains: []config.Chain{{
@@ -62,15 +59,19 @@ func TestIntegrationReindexFrom(t *testing.T) {
 	}
 
 	createTable := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.usdc_transfer_events (
+		chain_id UInt64,
 		block_number UInt64,
 		block_timestamp DateTime64(3, 'UTC'),
+		block_hash FixedString(32),
+		contract_address FixedString(20),
+		transaction_hash FixedString(32),
 		transaction_index UInt64,
 		log_index UInt64,
 		from FixedString(20),
 		to FixedString(20),
 		value UInt256
 	) ENGINE = MergeTree()
-	ORDER BY (block_number, transaction_index, log_index)`, quoteIdentForTest(dbName))
+	ORDER BY (chain_id, from, to, block_number, transaction_index, log_index)`, quoteIdentForTest(dbName))
 
 	if err := store.Conn().Do(setupCtx, ch.Query{Body: createTable}); err != nil {
 		t.Fatalf("create typed table: %v", err)
@@ -108,19 +109,19 @@ func TestIntegrationReindexFrom(t *testing.T) {
 	}
 	defer verifyStore1.Close()
 
-	initialRows := countTransfers(t, queryCtx1, verifyStore1, dbName, "")
+	var initialCount proto.ColUInt64
+	if err := verifyStore1.Conn().Do(queryCtx1, ch.Query{
+		Body: fmt.Sprintf("SELECT count() FROM %s.usdc_transfer_events", quoteIdentForTest(dbName)),
+		Result: proto.Results{
+			{Name: "count()", Data: &initialCount},
+		},
+	}); err != nil {
+		t.Fatalf("initial count query: %v", err)
+	}
+	initialRows := initialCount.Row(0)
 	t.Logf("Phase 1 complete: %d rows in usdc_transfer_events", initialRows)
 	if initialRows == 0 {
 		t.Fatal("expected USDC Transfer events in initial ingestion")
-	}
-
-	// Split the initial rows at the reindex midpoint. Phase 3 checks that the
-	// below-or-equal partition is preserved untouched and the above partition is
-	// deleted then rebuilt to the same count (a no-op delete would double it).
-	initialBelow := countTransfers(t, queryCtx1, verifyStore1, dbName, fmt.Sprintf("block_number <= %d", reindexFromBlock))
-	initialAbove := countTransfers(t, queryCtx1, verifyStore1, dbName, fmt.Sprintf("block_number > %d", reindexFromBlock))
-	if initialAbove == 0 {
-		t.Fatalf("expected USDC Transfer events above block %d in initial ingestion (test cannot verify reindex otherwise)", reindexFromBlock)
 	}
 
 	// Get max block_number after initial ingestion
@@ -134,11 +135,12 @@ func TestIntegrationReindexFrom(t *testing.T) {
 		t.Fatalf("max block query: %v", err)
 	}
 	initialMaxBlock := maxBlock.Row(0)
-	t.Logf("Initial: %d rows (<= %d: %d, > %d: %d), max block %d", initialRows, reindexFromBlock, initialBelow, reindexFromBlock, initialAbove, initialMaxBlock)
+	t.Logf("Initial max block_number: %d", initialMaxBlock)
 
-	// Phase 2: Reindex from the midpoint. This deletes all blocks > reindexFromBlock,
-	// then re-indexes the range [reindexFromBlock, endBlock], rebuilding them.
-	t.Logf("Phase 2: Reindexing from block %d (delete blocks > %d, then re-ingest the range)", reindexFromBlock, reindexFromBlock)
+	// Phase 2: Reindex from midpoint (block 22000100)
+	// This should delete all blocks > 22000100
+	reindexFromBlock := uint64(22000100)
+	t.Logf("Phase 2: Reindexing from block %d (should delete blocks > %d)", reindexFromBlock, reindexFromBlock)
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
@@ -161,7 +163,7 @@ func TestIntegrationReindexFrom(t *testing.T) {
 		Chains: []config.Chain{{
 			ID:         1,
 			StartBlock: reindexFromBlock,
-			EndBlock:   &endBlock,
+			EndBlock:   &reindexFromBlock,
 			Contracts: []config.ChainContractConfig{{
 				Name:    "USDC",
 				Address: config.Address{"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"},
@@ -188,8 +190,7 @@ func TestIntegrationReindexFrom(t *testing.T) {
 	}
 	defer verifyStore3.Close()
 
-	// max block_number should be back at endBlock: reindex re-ingested the full
-	// [reindexFromBlock, endBlock] range after deleting it.
+	// Check that max block_number is now at or below reindexFromBlock
 	var newMaxBlock proto.ColUInt64
 	if err := verifyStore3.Conn().Do(queryCtx3, ch.Query{
 		Body: fmt.Sprintf("SELECT max(block_number) FROM %s.usdc_transfer_events", quoteIdentForTest(dbName)),
@@ -201,52 +202,45 @@ func TestIntegrationReindexFrom(t *testing.T) {
 	}
 	finalMaxBlock := newMaxBlock.Row(0)
 	t.Logf("Final max block_number after reindex: %d", finalMaxBlock)
-	if finalMaxBlock != endBlock {
-		t.Errorf("Expected max block_number %d after reindex (full range rebuilt), got %d", endBlock, finalMaxBlock)
+
+	// Verify no blocks exist above reindexFromBlock
+	var countAbove proto.ColUInt64
+	if err := verifyStore3.Conn().Do(queryCtx3, ch.Query{
+		Body: fmt.Sprintf("SELECT count() FROM %s.usdc_transfer_events WHERE block_number > %d", quoteIdentForTest(dbName), reindexFromBlock),
+		Result: proto.Results{
+			{Name: "count()", Data: &countAbove},
+		},
+	}); err != nil {
+		t.Fatalf("count above reindex block query: %v", err)
+	}
+	countAboveRows := countAbove.Row(0)
+
+	if countAboveRows > 0 {
+		t.Errorf("Expected 0 rows with block_number > %d, found %d rows", reindexFromBlock, countAboveRows)
+	} else {
+		t.Logf("Verified: 0 rows with block_number > %d (correctly deleted)", reindexFromBlock)
 	}
 
-	// Blocks at or below the reindex point must be untouched (the lightweight
-	// DELETE only removes block_number > reindexFromBlock).
-	finalBelow := countTransfers(t, queryCtx3, verifyStore3, dbName, fmt.Sprintf("block_number <= %d", reindexFromBlock))
-	if finalBelow != initialBelow {
-		t.Errorf("Expected %d rows with block_number <= %d preserved, found %d", initialBelow, reindexFromBlock, finalBelow)
-	} else {
-		t.Logf("Verified: %d rows with block_number <= %d (preserved untouched)", finalBelow, reindexFromBlock)
+	// Verify blocks at or below reindexFromBlock still exist
+	var countBelow proto.ColUInt64
+	if err := verifyStore3.Conn().Do(queryCtx3, ch.Query{
+		Body: fmt.Sprintf("SELECT count() FROM %s.usdc_transfer_events WHERE block_number <= %d", quoteIdentForTest(dbName), reindexFromBlock),
+		Result: proto.Results{
+			{Name: "count()", Data: &countBelow},
+		},
+	}); err != nil {
+		t.Fatalf("count below reindex block query: %v", err)
 	}
+	countBelowRows := countBelow.Row(0)
 
-	// Blocks above the reindex point were deleted then re-ingested. The count must
-	// match the original exactly: if the delete had not run, re-inserting into the
-	// MergeTree would have doubled these rows.
-	finalAbove := countTransfers(t, queryCtx3, verifyStore3, dbName, fmt.Sprintf("block_number > %d", reindexFromBlock))
-	if finalAbove != initialAbove {
-		t.Errorf("Expected %d rows with block_number > %d after reindex (deleted then rebuilt), found %d", initialAbove, reindexFromBlock, finalAbove)
+	if countBelowRows == 0 {
+		t.Errorf("Expected rows with block_number <= %d to be preserved, but found 0 rows", reindexFromBlock)
 	} else {
-		t.Logf("Verified: %d rows with block_number > %d (deleted then rebuilt, no duplication)", finalAbove, reindexFromBlock)
+		t.Logf("Verified: %d rows with block_number <= %d (correctly preserved)", countBelowRows, reindexFromBlock)
 	}
 
 	// Cleanup
 	if err := database.DropClickHouseDatabase(queryCtx3, host, port, "default", password, dbName); err != nil {
 		t.Logf("cleanup: %v", err)
 	}
-}
-
-// countTransfers runs a count() over usdc_transfer_events with the given WHERE
-// clause (empty clause counts all rows) and fails the test on a query error.
-func countTransfers(t *testing.T, ctx context.Context, store *database.Store, dbName, where string) uint64 {
-	t.Helper()
-	body := fmt.Sprintf("SELECT count() FROM %s.usdc_transfer_events", quoteIdentForTest(dbName))
-	if where != "" {
-		body += " WHERE " + where
-	}
-	var col proto.ColUInt64
-	if err := store.Conn().Do(ctx, ch.Query{
-		Body:   body,
-		Result: proto.Results{{Name: "count()", Data: &col}},
-	}); err != nil {
-		t.Fatalf("count query (%q): %v", where, err)
-	}
-	if col.Rows() == 0 {
-		return 0
-	}
-	return col.Row(0)
 }

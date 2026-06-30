@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -40,6 +42,27 @@ const (
 	defaultParallelBurst = 50
 
 	parallelMaxAttempts = 24
+
+	// Adaptive gap-fill sizing bounds. The portal returns blocks dynamically when
+	// no toBlock is pinned: it scans far through empty regions (a single response
+	// can cover many thousands of blocks) but returns only a short run once it hits
+	// matching/dense data. A lone sequential walker is therefore fast through empty
+	// regions but slow through dense ones. To beat that, we pin each request's
+	// toBlock to the *recently observed delivered span* so that:
+	//   - in empty regions the pin is wide (≈ adaptiveGapMax), letting one request
+	//     jump far — no pointless fan-out, matching the no-toBlock walk speed; and
+	//   - in dense regions the pin shrinks toward what the portal actually returns,
+	//     turning the remaining span into many small in-order gap units that the
+	//     worker pool fills concurrently (the shared rate limiter is the ceiling).
+	// The estimate re-measures continuously, so the pin keeps tracking density.
+	adaptiveGapMin = 100    // floor: never pin tighter than a dense portal page (~100)
+	adaptiveGapMax = 131072 // ceiling: at/above the portal's ~106k empty-region scan cap
+
+	// beastModeThreshold is the number of consecutive "empty" chunks (portal
+	// extent-marker only, no matching events) before workers stop pinning toBlock and
+	// let the portal decide its own stride. In empty regions the portal can jump
+	// hundreds of thousands of blocks per nil-toBlock request; pinning would cap it.
+	beastModeThreshold = 5
 )
 
 // rateLimiter is a shared token bucket: every concurrent worker draws from one
@@ -121,6 +144,16 @@ type fetchChunk struct {
 	err         error       // fetch error if any
 }
 
+// blockRange is one work unit: a half-open-free inclusive [from, to] span a
+// worker fetches in a single portal request. Units are claimed at ~one-request
+// granularity (stride ≈ the portal's observed jump) so CONSECUTIVE requests go to
+// DIFFERENT workers — the in-order head is filled concurrently instead of by one
+// worker walking a whole page sequentially.
+type blockRange struct {
+	from uint64
+	to   uint64
+}
+
 // parallelPrefetcher fetches a bounded, fully-finalized block range using N
 // concurrent workers (paced by one shared rate limiter) and hands chunks
 // (individual portal responses) to a single consumer in strict ascending
@@ -151,14 +184,33 @@ type parallelPrefetcher struct {
 	maxAhead         uint64 // bounded look-ahead window, in block numbers
 	limiter          *rateLimiter
 
-	nextClaim atomic.Uint64 // next work range index to claim
+	nextBlock atomic.Uint64 // next unclaimed block (monotonic cursor over [start,end])
 
-	mu        sync.Mutex
-	cond      *sync.Cond
-	ready     map[uint64]*fetchChunk
-	nextEmit  uint64 // next expected sequence number (starts at startBlock)
-	stopClaim bool   // an errored chunk was delivered; stop claiming new work
-	doneWG    bool   // all workers have exited
+	// gapSpan is the shared, continuously re-measured estimate of how many blocks
+	// a single portal response delivers (covered span), used to size each work
+	// unit. All workers read and update it so density learned by one worker steers
+	// the whole pool. It is an exponential moving average kept in fixed point
+	// (block count); see updateGapSpan / currentGapSpan.
+	// Not updated in beast mode: unguided portal jumps don't reflect pin-optimal density.
+	gapSpan atomic.Uint64
+
+	// Beast mode: after beastModeThreshold consecutive empty chunks workers stop
+	// pinning toBlock (nil toBlock = portal decides stride). In truly empty regions
+	// the portal can jump millions of blocks in one request; pinned mode would cap it
+	// to adaptiveGapMax. Beast mode exits immediately on the first chunk with events,
+	// resetting gapSpan to the observed dense span so pinned mode resumes at the
+	// right window size.
+	consecutiveEmpty atomic.Int64
+	beastMode        atomic.Bool
+
+	mu            sync.Mutex
+	cond          *sync.Cond
+	ready         map[uint64]*fetchChunk
+	nextEmit      uint64       // next expected sequence number (starts at startBlock)
+	gaps          []blockRange // high-priority remainders of short (dense) responses, ascending
+	activeWorkers int          // units currently being fetched (in flight)
+	stopClaim     bool         // an errored chunk was delivered; stop claiming new work
+	doneWG        bool         // all workers have exited
 }
 
 func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeAllBlocks bool, start, end, pageSize uint64, workers int, limiter *rateLimiter) *parallelPrefetcher {
@@ -183,6 +235,26 @@ func newParallelPrefetcher(endpoint string, filters []client.LogFilter, includeA
 		limiter:          limiter,
 		ready:            make(map[uint64]*fetchChunk),
 	}
+	p.nextBlock.Store(start)
+	// Start in beast mode (toBlock pinned to endBlock). The first request(s) probe:
+	//   - Empty region:  portal jumps far; beast mode stays on and skips empties fast.
+	//   - Dense region:  portal returns ~N blocks with events; beast mode exits and
+	//                    gapSpan is snapped directly to N (not EWMA from 131072).
+	//                    Workers then claim N-block units in parallel, matching what
+	//                    sequential would do but overlapping the requests.
+	//
+	// Without this probe the old code set gapSpan=131072, claimed huge ranges, got
+	// 1500 blocks back, and cascaded into ~21 gap-fill requests for 9000 blocks vs
+	// sequential's 6 — making parallel 23% slower in dense regions.
+	//
+	// Probe only when it pays off: a sparse skip-empties range wide enough that the
+	// portal's far-scan saves round trips. A short bounded range pins directly to its
+	// known end instead — the probe would scan barely past the range for no benefit.
+	// includeAllBlocks always probes (every returned row is a real block, so the first
+	// response is itself a direct density measurement).
+	p.gapSpan.Store(adaptiveGapMax)
+	sparseNeedsProbe := !includeAllBlocks && end >= start && end-start+1 > adaptiveGapMax
+	p.beastMode.Store(includeAllBlocks || sparseNeedsProbe)
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
@@ -267,162 +339,342 @@ func (p *parallelPrefetcher) worker(ctx context.Context) {
 
 	workerID := rand.Intn(10000) // for debug identification
 	for {
-		if ctx.Err() != nil {
+		r, ok := p.getWork(ctx)
+		if !ok {
 			return
 		}
-		p.mu.Lock()
-		stop := p.stopClaim
-		p.mu.Unlock()
-		if stop {
-			return
-		}
-
-		// Claim the next work range
-		claimIdx := p.nextClaim.Add(1) - 1
-		from := p.startBlock + claimIdx*p.pageSize
-		if from > p.endBlock {
-			return
-		}
-
-		if !p.waitForWindow(ctx, from) {
-			return
-		}
-
-		// Fetch this range and deliver chunks as they arrive
-		if !p.fetchAndDeliverChunks(ctx, cl, from, claimIdx, workerID) {
+		// One unit == one request. The worker returns to getWork immediately
+		// after, so consecutive requests are claimed by whichever worker is free —
+		// the in-order head is filled concurrently rather than by one worker
+		// cursoring a whole page.
+		if !p.fetchOne(ctx, cl, r, workerID) {
 			return // fatal error or context cancelled
 		}
 	}
 }
 
-// waitForWindow blocks until the worker is within the look-ahead window.
-func (p *parallelPrefetcher) waitForWindow(ctx context.Context, from uint64) bool {
+// windowLimit is the look-ahead budget (in blocks) ahead of nextEmit that workers
+// may claim. It tracks the adaptive stride so the window always admits about
+// 2×workers units regardless of density: wide in empty regions (a few large-span
+// but tiny-payload chunks) and narrow in dense regions (many small-span chunks,
+// bounding buffered raw JSONL). Floored at the configured page window.
+func (p *parallelPrefetcher) windowLimit() uint64 {
+	w := p.currentGapSpan() * uint64(p.workers) * 8
+	if w < p.maxAhead {
+		w = p.maxAhead
+	}
+	return w
+}
+
+// getWork claims the next unit: a pending gap (short-response remainder, highest
+// priority since it is the lowest unemitted block) or a fresh stride off the
+// cursor. It blocks until a unit is claimable within the look-ahead window, or
+// returns ok=false when the range is exhausted, an error latched stopClaim, or
+// ctx is cancelled. activeWorkers is incremented for every unit returned and must
+// be balanced by finishUnit.
+func (p *parallelPrefetcher) getWork(ctx context.Context) (blockRange, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
 		if ctx.Err() != nil || p.stopClaim {
-			return false
+			return blockRange{}, false
 		}
-		if from <= p.nextEmit+p.maxAhead {
-			return true
+		// Beast mode admits only ONE in-flight request at a time — fresh OR gap. Each
+		// beast request pins toBlock=endBlock and may far-jump, advancing the shared
+		// nextBlock cursor far past its small claimed range. Two CONCURRENT beast
+		// requests can jump to DIFFERENT extent-markers, racing the cursor ahead of a
+		// chunk the consumer still needs (nextEmit) and orphaning an intermediate hole
+		// that no unit will ever fill — a permanent stall. (Gap claims used to bypass
+		// this gate, which is exactly how the hole opened.) Serializing every beast
+		// claim keeps each far-jump's coveredTo+1 equal to the next claim's from, so
+		// nextEmit always has a corresponding chunk. Once beast mode exits (dense data
+		// found) pinned units fan out across all workers again.
+		if p.beastMode.Load() && p.activeWorkers > 0 {
+			p.cond.Wait()
+			continue
 		}
+
+		window := p.nextEmit + p.windowLimit()
+
+		// Gaps first: they are below the cursor and gate nextEmit progress.
+		if len(p.gaps) > 0 && p.gaps[0].from <= window {
+			g := p.gaps[0]
+			p.gaps = p.gaps[1:]
+			p.activeWorkers++
+			return g, true
+		}
+
+		// Fresh stride off the cursor. Probe slightly above the current estimate
+		// so the stride can grow back toward the portal's natural jump after a
+		// dense stretch; an overshoot just yields a (re-queued) gap, never a miss.
+		from := p.nextBlock.Load()
+		if from <= p.endBlock && from <= window {
+			stride := p.currentGapSpan()
+			stride += stride / 4
+			if stride > adaptiveGapMax {
+				stride = adaptiveGapMax
+			}
+			to := min(from+stride-1, p.endBlock)
+			p.nextBlock.Store(to + 1)
+			p.activeWorkers++
+			return blockRange{from: from, to: to}, true
+		}
+
+		// Termination: cursor exhausted, no gaps, nothing in flight that could
+		// enqueue a new gap. Latch stopClaim so peers and Next() unblock.
+		if from > p.endBlock && len(p.gaps) == 0 && p.activeWorkers == 0 {
+			p.stopClaim = true
+			p.cond.Broadcast()
+			return blockRange{}, false
+		}
+
 		p.cond.Wait()
 	}
 }
 
-// fetchAndDeliverChunks fetches a work range and delivers each portal response
-// as a separate chunk immediately. Returns false on fatal error.
-func (p *parallelPrefetcher) fetchAndDeliverChunks(ctx context.Context, cl *client.Client, from uint64, claimIdx uint64, workerID int) bool {
-	cur := from
-	pageEnd := min(from+p.pageSize-1, p.endBlock)
-	attempt := 0
-	chunkIdx := uint64(0) // chunk index within this page
+// finishUnit balances the activeWorkers increment from getWork and wakes peers so
+// a worker blocked in getWork re-evaluates termination or a freshly enqueued gap.
+func (p *parallelPrefetcher) finishUnit() {
+	p.mu.Lock()
+	p.activeWorkers--
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
 
-	for cur <= pageEnd {
+// fetchOne issues exactly one portal request for the unit [r.from, r.to] (pinning
+// toBlock=r.to so the response never escapes the unit), delivers the chunk, folds
+// the observed span into the density estimate, and — if the response fell short of
+// r.to (a dense region, where the portal returns fewer blocks than pinned) —
+// re-queues the uncovered remainder [coveredTo+1, r.to] as gap units. Completeness:
+// every block of the unit is covered by this chunk OR by a re-queued gap, and units
+// themselves tile [start,end] via the cursor, so no block is ever skipped.
+// Returns false on a fatal/cancelled fetch (an error chunk is delivered first).
+func (p *parallelPrefetcher) fetchOne(ctx context.Context, cl *client.Client, r blockRange, workerID int) bool {
+	defer p.finishUnit()
+
+	attempt := 0
+	for {
 		if ctx.Err() != nil {
 			return false
 		}
-		if !p.waitForWindow(ctx, cur) {
-			return false
-		}
-
 		if err := p.limiter.wait(ctx); err != nil {
-			seq := claimIdx*100 + chunkIdx // rough sequence based on page position
-			p.deliverChunk(&fetchChunk{
-				seq:  seq,
-				from: cur,
-				err:  err,
-			})
+			p.deliverChunk(&fetchChunk{seq: r.from, from: r.from, err: err})
 			return false
 		}
 
-		toPin := pageEnd
-		resp, err := cl.FetchWithParent(ctx, cur, &toPin, "", p.includeAllBlocks, p.filters)
+		// Snapshot beast mode for this attempt and choose the request's toBlock pin.
+		//
+		// Beast mode: pin toBlock to endBlock (the configured range end), NOT nil. The
+		// portal still decides its own stride — in an empty region it scans far ahead
+		// (up to its own ~106k extent-scan cap, well below a typical endBlock) and
+		// returns a single far marker, so beast mode keeps its empty-region jump. But
+		// the pin guarantees the response never escapes [r.from, endBlock]: an unpinned
+		// request lets a portal scan unboundedly (OOM) and return blocks past endBlock
+		// (over-fetch / duplicate-emit). coveredTo can still legitimately exceed the
+		// claimed r.to (the portal jumped past our small unit); the caller advances the
+		// shared cursor to coveredTo+1 so peers skip the already-covered tail.
+		//
+		// Pinned mode: toBlock = r.to (the adaptive per-unit stride), matching the
+		// dense-region fan-out where many small units are filled concurrently.
+		isBeast := p.beastMode.Load()
+		toPin := r.to
+		if isBeast {
+			toPin = p.endBlock
+		}
+		toBlockPtr := &toPin
+
+		resp, err := cl.FetchWithParent(ctx, r.from, toBlockPtr, "", p.includeAllBlocks, p.filters)
 		if err != nil {
 			if ctx.Err() != nil {
-				seq := claimIdx*100 + chunkIdx
-				p.deliverChunk(&fetchChunk{
-					seq:  seq,
-					from: cur,
-					err:  ctx.Err(),
-				})
+				p.deliverChunk(&fetchChunk{seq: r.from, from: r.from, err: ctx.Err()})
 				return false
 			}
-			// Transient error - retry with backoff
 			attempt++
 			if attempt > parallelMaxAttempts {
-				seq := claimIdx*100 + chunkIdx
-				errChunk := &fetchChunk{
-					seq:  seq,
-					from: cur,
-					err:  fmt.Errorf("worker %d claim %d: parallel fetch gave up after %d attempts: %w", workerID, claimIdx, attempt, err),
-				}
-				p.deliverChunk(errChunk)
+				p.deliverChunk(&fetchChunk{seq: r.from, from: r.from,
+					err: fmt.Errorf("worker %d: parallel fetch gave up after %d attempts: %w", workerID, attempt, err)})
 				return false
 			}
 			p.backoff(ctx, attempt)
 			continue
 		}
 
-		attempt = 0
-
-		// Calculate sequence based on block position (not delivery order)
-		// This ensures chunks are emitted in block order even when delivered out of order
-		seq := cur // use starting block number as sequence
-
-		// Parse the last block number from this response
-		coveredTo := cur
+		// coveredTo is the scanned high-water mark.
+		//
+		// Pinned mode: toBlock is pinned to r.to, so a conforming portal returns
+		// coveredTo ≤ r.to. A short/empty body gets a conservative bound of one
+		// pageSize so a dense band is never skipped by more than pageSize (the
+		// uncovered remainder is re-queued as gaps).
+		//
+		// Beast mode: toBlock is pinned to endBlock, so the portal may scan far past
+		// the small claimed r.to (up to its own extent-scan cap) and report a far
+		// coveredTo; we do NOT clamp to r.to — the caller advances the shared cursor
+		// to coveredTo+1 so peers skip the already-covered tail. Either way coveredTo
+		// is clamped to endBlock so a chunk never reports past the configured range.
+		coveredTo := min(r.from+p.pageSize-1, r.to)
+		var rawLast uint64
+		haveRawLast := false
 		if len(resp.Raw) > 0 {
 			last, lerr := lastBlockNumber(resp.Raw)
 			if lerr != nil {
-				p.deliverChunk(&fetchChunk{
-					seq:  seq,
-					from: cur,
-					err:  fmt.Errorf("worker %d claim %d: parse last block: %w", workerID, claimIdx, lerr),
-				})
+				p.deliverChunk(&fetchChunk{seq: r.from, from: r.from,
+					err: fmt.Errorf("worker %d: parse last block: %w", workerID, lerr)})
 				return false
 			}
-			if last >= cur {
-				coveredTo = last
+			rawLast, haveRawLast = last, true
+			if last < r.from {
+				last = r.from
+			}
+			// Clamp to endBlock always; clamp to r.to only in pinned mode.
+			if last > p.endBlock {
+				last = p.endBlock
+			}
+			if !isBeast && last > r.to {
+				last = r.to
+			}
+			coveredTo = last
+		}
+
+		// Density estimate: update only in pinned mode. Beast-mode spans are unguided
+		// portal jumps; feeding them into gapSpan would corrupt the pin for dense regions.
+		if !isBeast {
+			if coveredTo < r.to {
+				p.updateGapSpan(coveredTo - r.from + 1)
+			} else {
+				p.updateGapSpan(r.to - r.from + 1)
 			}
 		}
 
-		// Copy the response bytes since they're from the client's reused buffer
 		rawCopy := make([]byte, len(resp.Raw))
 		copy(rawCopy, resp.Raw)
+		// Drop any overshoot tail: if the portal returned blocks past the clamped
+		// coveredTo (it scanned a few blocks beyond the pinned toBlock, or past
+		// endBlock), trim them so the chunk's raw never carries blocks > coveredTo.
+		// Without this the consumer would emit out-of-range blocks AND the next unit
+		// (which starts at coveredTo+1) would re-fetch and re-emit the overshoot —
+		// duplicates and out-of-order blocks. No-op on the common path where the
+		// portal honours the pin (rawLast == coveredTo).
+		if haveRawLast && rawLast > coveredTo {
+			rawCopy = truncateRawAtBlock(rawCopy, coveredTo)
+		}
 
-		// Deliver this chunk immediately (even if empty)
+		// Beast-mode tracking. The turn-OFF (dense data found → contract to pinned
+		// fan-out) must apply in BOTH modes: includeAllBlocks always returns a full
+		// dense page, so the very first response should exit the initial probe into
+		// pinned mode and let the worker pool fan out — gating the turn-off on
+		// !includeAllBlocks left full-block backfills stuck in serialized beast mode.
+		// The turn-ON (empty extent-marker → portal-decides stride) stays skip-empties
+		// only: includeAllBlocks never yields an empty-marker-only response.
+		isEmpty := false
+		if !p.includeAllBlocks {
+			// A response with zero internal newlines (after trimming any trailing \n)
+			// is the extent-marker block only — no matching events in the scanned range.
+			// Trim trailing newlines first: some portal responses end with an extra \n
+			// that would make the count 1 even for a single-line extent-marker response,
+			// falsely treating every empty range as non-empty and preventing beast mode
+			// from re-engaging.
+			lineCount := bytes.Count(bytes.TrimRight(rawCopy, "\n"), []byte{'\n'})
+			isEmpty = lineCount == 0
+		}
+		if isEmpty {
+			if n := p.consecutiveEmpty.Add(1); n >= beastModeThreshold && !p.beastMode.Load() {
+				// Re-engage beast ONLY when no gaps are pending and this is the only
+				// in-flight unit. A beast request pins toBlock=endBlock and far-jumps
+				// the shared cursor; if it leaps over pending gaps (small remainders
+				// left by the prior pinned-mode walk) those chunks land below nextEmit,
+				// orphaned, and the consumer stalls forever. Requiring an empty gap
+				// queue AND no concurrent worker (which could enqueue a gap mid-flight)
+				// guarantees the far-jump has nothing to leap over, so beast stays a
+				// clean serial cursor-walk. If work is still queued we simply remain in
+				// pinned mode and let it drain first.
+				p.mu.Lock()
+				canEngage := len(p.gaps) == 0 && p.activeWorkers <= 1
+				if canEngage {
+					p.beastMode.Store(true)
+				}
+				p.mu.Unlock()
+				if canEngage {
+					log.Printf("[parallel] beast mode ON at block %d (%d consecutive empty ranges; toBlock=endBlock)", r.from, n)
+				}
+			}
+		} else {
+			p.consecutiveEmpty.Store(0)
+			if isBeast {
+				// Exit beast mode immediately: dense data found. Set gapSpan directly to
+				// the observed dense span so pinned mode starts at the right window
+				// size without waiting for EWMA to descend from adaptiveGapMax.
+				p.beastMode.Store(false)
+				denseSpan := coveredTo - r.from + 1
+				if denseSpan < adaptiveGapMin {
+					denseSpan = adaptiveGapMin
+				}
+				if denseSpan > adaptiveGapMax {
+					denseSpan = adaptiveGapMax
+				}
+				p.gapSpan.Store(denseSpan)
+				log.Printf("[parallel] beast mode OFF at block %d (dense data, span=%d; resuming pinned mode)", r.from, denseSpan)
+			}
+		}
+
+		// In beast mode the portal may jump beyond our claimed range [r.from, r.to].
+		// Advance the shared nextBlock cursor to coveredTo+1 so other workers skip
+		// the already-covered tail (best-effort; a race means a worker may still claim
+		// a now-redundant range, but it will get a small/empty response and move on).
+		if isBeast && coveredTo > r.to {
+			for {
+				old := p.nextBlock.Load()
+				if old > coveredTo+1 {
+					break // another worker already advanced past this point
+				}
+				if p.nextBlock.CompareAndSwap(old, coveredTo+1) {
+					break
+				}
+			}
+		}
+
+		// requestedTo records the request's pinned upper bound in pinned mode; in beast
+		// mode the portal decided the stride, so record what it actually covered.
+		requestedToVal := coveredTo
+		if !isBeast {
+			requestedToVal = *toBlockPtr
+		}
 		p.deliverChunk(&fetchChunk{
-			seq:         seq,
-			from:        cur,
+			seq:         r.from,
+			from:        r.from,
 			coveredTo:   coveredTo,
-			requestedTo: toPin,
+			requestedTo: requestedToVal,
 			raw:         rawCopy,
 			head:        resp.Head,
 		})
 
-		// Check if we should stop (error chunk was delivered)
-		p.mu.Lock()
-		stop := p.stopClaim
-		p.mu.Unlock()
-		if stop {
-			return false
+		// Re-queue the uncovered remainder. In pinned mode this is the classic dense
+		// gap-fill. In beast mode (undershoot only — overshoot was handled above by
+		// advancing the cursor), it ensures no blocks are silently skipped.
+		if coveredTo < r.to {
+			p.enqueueGaps(coveredTo+1, r.to)
 		}
-
-		// If coveredTo reached pageEnd, we're done with this range
-		// Note: empty response doesn't mean we're done - continue to next block
-		if coveredTo >= pageEnd {
-			return true
-		}
-		// Empty response (no blocks in this specific range) - continue to next block
-		// The loop will increment cur and try again
-
-		// Move to next block after what we just covered
-		cur = coveredTo + 1
-		chunkIdx++
+		return true
 	}
+}
 
-	return true
+// enqueueGaps splits [from,to] into estimate-sized units and inserts them into the
+// priority gap queue (kept ascending so the lowest unemitted block is fetched
+// first). Sized to the current — now contracted — estimate so a dense remainder
+// becomes several concurrent units rather than one serial cursor.
+func (p *parallelPrefetcher) enqueueGaps(from, to uint64) {
+	span := p.currentGapSpan()
+	if span < 1 {
+		span = 1
+	}
+	p.mu.Lock()
+	for cur := from; cur <= to; {
+		end := min(cur+span-1, to)
+		p.gaps = append(p.gaps, blockRange{from: cur, to: end})
+		cur = end + 1
+	}
+	sort.Slice(p.gaps, func(i, j int) bool { return p.gaps[i].from < p.gaps[j].from })
+	p.cond.Broadcast()
+	p.mu.Unlock()
 }
 
 // deliverChunk adds a chunk to the ready map and broadcasts to wake the consumer.
@@ -435,6 +687,47 @@ func (p *parallelPrefetcher) deliverChunk(chunk *fetchChunk) {
 		p.stopClaim = true
 	}
 	p.cond.Broadcast()
+}
+
+// currentGapSpan returns the adaptive per-request batch size: how many blocks the
+// next request should pin its toBlock to span, clamped to [adaptiveGapMin,
+// adaptiveGapMax]. This is the gap-fill unit fanned out across workers.
+func (p *parallelPrefetcher) currentGapSpan() uint64 {
+	s := p.gapSpan.Load()
+	if s < adaptiveGapMin {
+		return adaptiveGapMin
+	}
+	if s > adaptiveGapMax {
+		return adaptiveGapMax
+	}
+	return s
+}
+
+// updateGapSpan folds a freshly observed delivered span into the shared estimate
+// with an exponential moving average (1/4 weight on the new sample). The smoothing
+// makes the pin react quickly when responses shrink (density rising) or grow (back
+// to empty) without thrashing on a single outlier. A delivered span only counts as
+// "the portal's natural page" when the request was NOT artificially capped by the
+// page/range boundary; a boundary-capped response says nothing about density, so
+// callers pass observed=0 to skip the update in that case.
+func (p *parallelPrefetcher) updateGapSpan(observed uint64) {
+	if observed == 0 {
+		return
+	}
+	for {
+		old := p.gapSpan.Load()
+		// EWMA: new = old*3/4 + observed*1/4.
+		next := old - old/4 + observed/4
+		if next < adaptiveGapMin {
+			next = adaptiveGapMin
+		}
+		if next > adaptiveGapMax {
+			next = adaptiveGapMax
+		}
+		if p.gapSpan.CompareAndSwap(old, next) {
+			return
+		}
+	}
 }
 
 func (p *parallelPrefetcher) backoff(ctx context.Context, attempt int) {
@@ -453,6 +746,33 @@ func (p *parallelPrefetcher) backoff(ctx context.Context, attempt int) {
 // highest — which for includeAllBlocks=false is the portal's marker block (the
 // scanned high-water mark). It reverse-scans to that line and regexes the header
 // number out of it: O(tail) and no full parse of every block (and no fastjson).
+// truncateRawAtBlock returns the prefix of block-ascending JSONL `raw` holding
+// only lines whose header number is ≤ maxBlock, dropping a trailing overshoot tail
+// (blocks the portal returned beyond the pinned/clamped high-water mark). Lines
+// without a parseable header number are kept (blank trailing lines, etc.); the
+// scan stops at the first line whose number exceeds maxBlock. Callers invoke this
+// only when the last line is known to exceed maxBlock, so it always trims at least
+// that line.
+func truncateRawAtBlock(raw []byte, maxBlock uint64) []byte {
+	keep := 0
+	for off := 0; off < len(raw); {
+		lineEnd := len(raw)
+		if nl := bytes.IndexByte(raw[off:], '\n'); nl >= 0 {
+			lineEnd = off + nl + 1 // include the trailing newline
+		}
+		if t := bytes.TrimSpace(raw[off:lineEnd]); len(t) > 0 {
+			if m := headerNumberRe.FindSubmatch(t); m != nil {
+				if n, err := strconv.ParseUint(string(m[1]), 10, 64); err == nil && n > maxBlock {
+					break
+				}
+			}
+		}
+		keep = lineEnd
+		off = lineEnd
+	}
+	return raw[:keep]
+}
+
 func lastBlockNumber(raw []byte) (uint64, error) {
 	// Fast path: find the last non-empty line by scanning backwards
 	end := len(raw)

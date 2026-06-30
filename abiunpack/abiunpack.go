@@ -86,6 +86,23 @@ func DecodeTopicAddress(topic string) common.Address {
 	return common.HexToAddress(topic)
 }
 
+// DecodeAddressFromTopic decodes an indexed address topic efficiently by
+// skipping the 12 leading zero-padding bytes (24 hex chars) and decoding only
+// the final 20 bytes (40 hex chars) directly into an address.
+func DecodeAddressFromTopic(topic string) common.Address {
+	body := topic
+	if len(body) >= 2 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X') {
+		body = body[2:]
+	}
+	if len(body) == 64 {
+		var addr common.Address
+		if decodeCanonicalAddress(body[24:], addr[:]) {
+			return addr
+		}
+	}
+	return common.HexToAddress(topic)
+}
+
 // AddressFromHex decodes a 20-byte hex address string (with optional 0x
 // prefix) into a common.Address without allocating. It is byte-identical to
 // common.HexToAddress for canonical 40-hex-digit input and falls back to it

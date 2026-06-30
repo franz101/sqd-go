@@ -13,11 +13,11 @@ func TestParseModulePath(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"simple", "module github.com/franz101/sqd-go\n\ngo 1.25\n", "github.com/franz101/sqd-go"},
+		{"simple", "module github.com/franz101/sqd-go\n\ngo 1.26\n", "github.com/franz101/sqd-go"},
 		{"leading comment", "// a comment\nmodule example.com/x\n", "example.com/x"},
 		{"extra spaces", "module   example.com/y  \n", "example.com/y"},
-		{"no module", "go 1.25\nrequire foo v1\n", ""},
-		{"crlf", "module example.com/z\r\ngo 1.25\r\n", "example.com/z"},
+		{"no module", "go 1.26\nrequire foo v1\n", ""},
+		{"crlf", "module example.com/z\r\ngo 1.26\r\n", "example.com/z"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -228,7 +228,7 @@ func readFileString(t *testing.T, path string) string {
 func TestModuleInfoAndProjectChecks(t *testing.T) {
 	// Build a fake module tree: <tmp>/go.mod + <tmp>/proj/{config bits}.
 	tmp := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/fake\n\ngo 1.25\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module example.com/fake\n\ngo 1.26\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	proj := filepath.Join(tmp, "proj")

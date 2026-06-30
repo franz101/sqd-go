@@ -119,10 +119,12 @@ func PruneIntervalBlocks() uint64 {
 // ============================================================================
 
 const (
-	// SQD_PARSE_DECODE_V2 enables the fast JSONL parser and optimized ABI decoder.
-	// Set to any non-empty value to enable.
-	// Default: disabled (use legacy parser)
-	ParseDecodeV2 = "SQD_PARSE_DECODE_V2"
+	// The fast JSONL parser + optimized ABI decoder is the DEFAULT. Opt out with
+	// SQD_NO_PARSE_DECODE_V2=1 to fall back to the legacy consumer decode path. The
+	// two paths produce identical stored data (verified by the uniswap V1-vs-V2
+	// ingestion differential); the generated parser drops truncated/malformed-data
+	// events to match the legacy decoder.
+	NoParseDecodeV2 = "SQD_NO_PARSE_DECODE_V2"
 
 	// SQD_TARGET_FETCH_SECONDS is the target latency for fetch operations in seconds.
 	// The adaptive page size controller adjusts page size to hit this target.
@@ -158,9 +160,10 @@ const (
 	EnvParallelRPS = "SQD_PARALLEL_RPS"
 )
 
-// ParseDecodeV2Enabled returns true if the fast JSONL parser is enabled.
+// ParseDecodeV2Enabled returns true if the fast JSONL parser is enabled. It is the
+// default; only an explicit SQD_NO_PARSE_DECODE_V2=1 selects the legacy path.
 func ParseDecodeV2Enabled() bool {
-	return GetenvBool(ParseDecodeV2, false)
+	return !GetenvBool(NoParseDecodeV2, false)
 }
 
 // TargetFetchDuration returns the target fetch latency as duration.
@@ -326,7 +329,7 @@ const (
 
 	// SQD_METRICS_CH_INTERVAL is the metrics flush interval.
 	// Format: Go duration (e.g., "1m", "30s")
-	// Default: "1m"
+	// Default: "5s" (5 seconds)
 	MetricsCHInterval = "SQD_METRICS_CH_INTERVAL"
 
 	// SQD_METRICS_CH_TTL_DAYS is the metrics data retention period in days.

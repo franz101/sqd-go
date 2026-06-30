@@ -235,6 +235,13 @@ func buildRunner(runnerDir string, env []string) (string, int) {
 	if err := build.Run(); err != nil {
 		_ = os.Remove(binPath)
 		fmt.Fprintf(os.Stderr, "--state: go build failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, "HINT: A build error here usually means:")
+		fmt.Fprintln(os.Stderr, "  1. custom_processor.go references an event type not in config.yaml")
+		fmt.Fprintln(os.Stderr, "     Fix: Run `go run . codegen <project>` after updating config.yaml")
+		fmt.Fprintln(os.Stderr, "  2. Package name mismatch between custom_schema.go and custom_processor.go")
+		fmt.Fprintln(os.Stderr, "     Fix: Ensure both files have the same package declaration (e.g., package uniswap)")
+		fmt.Fprintln(os.Stderr, "  3. Generated code is out of sync with config")
+		fmt.Fprintln(os.Stderr, "     Fix: Run `go run . codegen <project>` to regenerate")
 		return "", 1
 	}
 	return binPath, 0

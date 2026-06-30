@@ -20,7 +20,7 @@ import (
 // runDev loads the project, runs codegen, starts docker compose, then runs the
 // ingestion pipeline. On exit it tears down docker compose. Use this for local
 // development where ClickHouse is managed by compose.
-func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool) int {
+func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
@@ -56,13 +56,13 @@ func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, en
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch, noReplay)
 }
 
 // runStartPipeline loads the project, runs codegen, then starts ingestion.
 // Unlike runDev it does not manage docker compose — the user is responsible for
 // running ClickHouse externally.
-func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool) int {
+func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -77,7 +77,7 @@ func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBl
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch, noReplay)
 }
 
 func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
@@ -123,7 +123,7 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 // the pipeline falls back to the legacy JSON-decoded path with struct-based
 // event processing. This is useful for debugging or when proto support has not
 // been validated for a new contract.
-func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool) int {
+func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
 	if protoMode {
 		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
 	}
@@ -185,6 +185,7 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 		ParallelFetch:      parallelFetch,
 		ReindexFrom:        reindexFrom,
 		Prefetch:           prefetch,
+		NoReplay:           noReplay,
 	}
 	if prefetch {
 		log.Printf("PREFETCH ENABLED: two-pass batch read-set prefetch (one ClickHouse SELECT per entity per block instead of one per missing key)")
@@ -195,6 +196,9 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 	}
 	if opts.ColdCache {
 		log.Printf("COLD TIER ENABLED: per-miss ClickHouse SELECTs served from local Pebble (off-heap, bounded)")
+	}
+	if noReplay {
+		log.Printf("NO-REPLAY MODE: fork recovery disabled; replay buffer reduced to 1024 slots; fork errors are fatal")
 	}
 	processor, err := processorForProject(project.Config.Name)
 	if err != nil {
@@ -210,10 +214,25 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 	// requested but processor does not implement ColdCacheProcessor" line downstream
 	// is this same condition). Say so up front with the fix, instead of leaving the
 	// operator to decode a cryptic capability log.
-	if processor == nil && (opts.ColdCache || hasStatefulSchema(project)) {
-		log.Printf("NOTE: no compiled processor registered for %q — custom state and the cold tier are DISABLED for this run.", project.Config.Name)
-		log.Printf("      The prebuilt binary does not contain this project's generated package. Build sqd-go from a checkout that includes %q (so its custom_processor.go init() is compiled in), then re-run, e.g.:", project.Root)
-		log.Printf("        go run . start %s        # or: go build -o sqd-go . && ./sqd-go start %s", path, path)
+	// Hard fail when a stateful project has no compiled processor. Without it,
+	// raw events still insert but derived state stays empty — a silent "looks
+	// fine, but wrong" failure (the processor is a no-op).
+	if processor == nil && hasStatefulSchema(project) {
+		fmt.Fprintf(os.Stderr, "ERROR: stateful project %q has no compiled processor registered.\n", project.Config.Name)
+		fmt.Fprintf(os.Stderr, "This project defines derived state (custom_schema.go or state: block in config)\n")
+		fmt.Fprintf(os.Stderr, "but no processor was compiled in. Causes:\n")
+		fmt.Fprintf(os.Stderr, "  (1) Using a prebuilt binary without this project\n")
+		fmt.Fprintf(os.Stderr, "  (2) custom_processor.go has a compile error\n")
+		fmt.Fprintf(os.Stderr, "  (3) Project name mismatch (config name doesn't match generated.ProjectName)\n")
+		fmt.Fprintf(os.Stderr, "Fix: go run . start %s --state\n", path)
+		return 1
+	}
+	// Cold tier requires a processor (for ColdCacheProcessor interface).
+	if processor == nil && opts.ColdCache {
+		fmt.Fprintf(os.Stderr, "ERROR: cold tier requested but no compiled processor for project %q.\n", project.Config.Name)
+		fmt.Fprintf(os.Stderr, "Build sqd-go from a checkout that includes %q (so its custom_processor.go init() is compiled in).\n", project.Root)
+		fmt.Fprintf(os.Stderr, "Fix: go run . start %s --cold-cache\n", path)
+		return 1
 	}
 	log.Printf("starting ingestion for %s (pageSize=%d)", project.Config.Name, pageSize)
 	if err := ingestion.Run(ctx, project.Config, opts); err != nil && ctx.Err() == nil {
@@ -312,6 +331,9 @@ func runInitContractImport(p *parsedArgs) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "write project: %v\n", err)
 		return 1
+	}
+	if code := runInitWithConfig(configPath); code != 0 {
+		return code
 	}
 	fmt.Printf("initialized %s (%d events)\n", configPath, len(events))
 	return 0
