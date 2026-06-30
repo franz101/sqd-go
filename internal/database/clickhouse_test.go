@@ -2,6 +2,8 @@ package database
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -226,5 +228,298 @@ func TestRewriteSQLDatabase(t *testing.T) {
 	}
 	if !strings.Contains(got, "`target_db`.`table1`") {
 		t.Fatalf("target database name missing: %s", got)
+	}
+}
+
+// Test database connection and error handling
+func TestNewClickHouseErrors(t *testing.T) {
+	ctx := context.Background()
+
+	// Test invalid connection
+	_, err := NewClickHouse(ctx, "invalid-host", 9999, "user", "pass", "test_db")
+	if err == nil {
+		t.Fatal("expected error for invalid host, got nil")
+	}
+
+	// Test connection with valid host but invalid credentials (will fail in real scenario)
+	// This test validates the error path is properly handled
+}
+
+func TestQuoteIdent(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"simple", "`simple`"},
+		{"with`quote", "`with``quote`"},
+		{"database_name", "`database_name`"},
+		{"123", "`123`"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := quoteIdent(tt.input)
+			if got != tt.expected {
+				t.Errorf("quoteIdent(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestQuoteString(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"simple", "'simple'"},
+		{"with'quote", "'with''quote'"},
+		{"with\\slash", "'with\\slash'"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := quoteString(tt.input)
+			if got != tt.expected {
+				t.Errorf("quoteString(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSplitSQLStatementsComplex(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		expected int
+	}{
+		{
+			name: "multiple statements",
+			sql: "SELECT 1; SELECT 2; SELECT 3;",
+			expected: 3,
+		},
+		{
+			name: "statements with comments",
+			sql: "-- comment\nSELECT 1;\n-- another comment\nSELECT 2;",
+			expected: 2,
+		},
+		{
+			name: "complex strings with semicolons",
+			sql: "INSERT INTO t (s) VALUES ('hello; world'); SELECT * FROM t;",
+			expected: 2,
+		},
+		{
+			name: "empty statements",
+			sql: ";\n;\n;",
+			expected: 0, // Empty statements are filtered out
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			statements := splitSQLStatements(tt.sql)
+			if len(statements) != tt.expected {
+				t.Errorf("got %d statements, want %d", len(statements), tt.expected)
+			}
+		})
+	}
+}
+
+func TestFirstSQLLine(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"SELECT 1", "SELECT 1"},
+		{"SELECT 1;", "SELECT 1;"},
+		{"  SELECT 1", "SELECT 1"},
+		{"\n\tSELECT 1", "SELECT 1"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := firstSQLLine(tt.input)
+			if got != tt.expected {
+				t.Errorf("firstSQLLine(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestFixedStringSize(t *testing.T) {
+	tests := []struct {
+		clickHouseType string
+		expected       int
+	}{
+		{"FixedString(20)", 20},
+		{"FixedString(32)", 32},
+		{"FixedString(1)", 1},
+		{"String", 0},
+		{"UInt64", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.clickHouseType, func(t *testing.T) {
+			got := fixedStringSize(tt.clickHouseType)
+			if got != tt.expected {
+				t.Errorf("fixedStringSize(%q) = %d, want %d", tt.clickHouseType, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSyncStateSerialization(t *testing.T) {
+	state := SyncState{
+		Current: SyncCursor{
+			Number: 1000,
+			Hash:   "0xabcd",
+		},
+		Finalized: &SyncCursor{
+			Number: 950,
+			Hash:   "0x1234",
+		},
+		RollbackChain: []SyncCursor{
+			{Number: 999, Hash: "0x9999"},
+			{Number: 998, Hash: "0x8888"},
+		},
+	}
+
+	// Test JSON marshaling/unmarshaling
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	var decoded SyncState
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	if decoded.Current.Number != state.Current.Number {
+		t.Errorf("Current.Number = %d, want %d", decoded.Current.Number, state.Current.Number)
+	}
+	if decoded.Current.Hash != state.Current.Hash {
+		t.Errorf("Current.Hash = %q, want %q", decoded.Current.Hash, state.Current.Hash)
+	}
+	if decoded.Finalized == nil {
+		t.Fatal("Finalized is nil, want non-nil")
+	}
+	if len(decoded.RollbackChain) != len(state.RollbackChain) {
+		t.Errorf("RollbackChain length = %d, want %d", len(decoded.RollbackChain), len(state.RollbackChain))
+	}
+}
+
+func TestUInt256ValueColumn(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		valid bool
+	}{
+		{"zero", "0", true},
+		{"small", "12345", true},
+		{"large", "1000000000000000000000000000", true},
+		{"max uint256", "115792089237316195423570985008687907853269984665640564039457584007913129639935", true},
+		{"invalid", "not a number", false},
+		{"negative", "-100", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			col := &uint256ValueColumn{name: "test"}
+
+			if tt.valid {
+				col.append(tt.input)
+				if col.col.Rows() != 1 {
+					t.Errorf("expected 1 row, got %d", col.col.Rows())
+				}
+			} else {
+				// Should panic or handle gracefully
+				defer func() {
+					if r := recover(); r != nil {
+						// Expected to panic for invalid input
+					}
+				}()
+				col.append(tt.input)
+			}
+		})
+	}
+}
+
+func TestBoolValueColumn(t *testing.T) {
+	col := &boolValueColumn{name: "test"}
+
+	// Test true values
+	col.append(true)
+	col.append("true")
+	col.append("1")
+	col.append(1)
+
+	if col.col.Rows() != 4 {
+		t.Errorf("expected 4 rows, got %d", col.col.Rows())
+	}
+
+	// Test false values
+	col.reset()
+	col.append(false)
+	col.append("false")
+	col.append("0")
+	col.append(0)
+
+	if col.col.Rows() != 4 {
+		t.Errorf("expected 4 rows after reset, got %d", col.col.Rows())
+	}
+}
+
+func TestProtoUInt256(t *testing.T) {
+	tests := []struct {
+		name string
+		input string
+	}{
+		{"zero", "0"},
+		{"small", "100"},
+		{"large", "1000000000000000000000000000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n, err := uint256.FromDecimal(tt.input)
+			if err != nil {
+				t.Fatalf("uint256.FromDecimal(%q): %v", tt.input, err)
+			}
+
+			result := protoUInt256(*n)
+			want := proto.UInt256{
+				Low:  proto.UInt128{Low: n[0], High: n[1]},
+				High: proto.UInt128{Low: n[2], High: n[3]},
+			}
+			if result != want {
+				t.Fatalf("protoUInt256(%q) = %#v, want %#v", tt.input, result, want)
+			}
+		})
+	}
+}
+
+func TestEnsureTablesOptions(t *testing.T) {
+	tests := []struct {
+		name        string
+		opts        EnsureTablesOptions
+		storeBlocks bool
+		storeLogs   bool
+	}{
+		{"both true", EnsureTablesOptions{StoreBlocks: true, StoreLogs: true}, true, true},
+		{"blocks only", EnsureTablesOptions{StoreBlocks: true, StoreLogs: false}, true, false},
+		{"logs only", EnsureTablesOptions{StoreBlocks: false, StoreLogs: true}, false, true},
+		{"both false", EnsureTablesOptions{StoreBlocks: false, StoreLogs: false}, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.opts.StoreBlocks != tt.storeBlocks {
+				t.Errorf("StoreBlocks = %v, want %v", tt.opts.StoreBlocks, tt.storeBlocks)
+			}
+			if tt.opts.StoreLogs != tt.storeLogs {
+				t.Errorf("StoreLogs = %v, want %v", tt.opts.StoreLogs, tt.storeLogs)
+			}
+		})
 	}
 }

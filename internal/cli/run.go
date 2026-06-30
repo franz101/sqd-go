@@ -214,10 +214,25 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 	// requested but processor does not implement ColdCacheProcessor" line downstream
 	// is this same condition). Say so up front with the fix, instead of leaving the
 	// operator to decode a cryptic capability log.
-	if processor == nil && (opts.ColdCache || hasStatefulSchema(project)) {
-		log.Printf("NOTE: no compiled processor registered for %q — custom state and the cold tier are DISABLED for this run.", project.Config.Name)
-		log.Printf("      The prebuilt binary does not contain this project's generated package. Build sqd-go from a checkout that includes %q (so its custom_processor.go init() is compiled in), then re-run, e.g.:", project.Root)
-		log.Printf("        go run . start %s        # or: go build -o sqd-go . && ./sqd-go start %s", path, path)
+	// Hard fail when a stateful project has no compiled processor. Without it,
+	// raw events still insert but derived state stays empty — a silent "looks
+	// fine, but wrong" failure (the processor is a no-op).
+	if processor == nil && hasStatefulSchema(project) {
+		fmt.Fprintf(os.Stderr, "ERROR: stateful project %q has no compiled processor registered.\n", project.Config.Name)
+		fmt.Fprintf(os.Stderr, "This project defines derived state (custom_schema.go or state: block in config)\n")
+		fmt.Fprintf(os.Stderr, "but no processor was compiled in. Causes:\n")
+		fmt.Fprintf(os.Stderr, "  (1) Using a prebuilt binary without this project\n")
+		fmt.Fprintf(os.Stderr, "  (2) custom_processor.go has a compile error\n")
+		fmt.Fprintf(os.Stderr, "  (3) Project name mismatch (config name doesn't match generated.ProjectName)\n")
+		fmt.Fprintf(os.Stderr, "Fix: go run . start %s --state\n", path)
+		return 1
+	}
+	// Cold tier requires a processor (for ColdCacheProcessor interface).
+	if processor == nil && opts.ColdCache {
+		fmt.Fprintf(os.Stderr, "ERROR: cold tier requested but no compiled processor for project %q.\n", project.Config.Name)
+		fmt.Fprintf(os.Stderr, "Build sqd-go from a checkout that includes %q (so its custom_processor.go init() is compiled in).\n", project.Root)
+		fmt.Fprintf(os.Stderr, "Fix: go run . start %s --cold-cache\n", path)
+		return 1
 	}
 	log.Printf("starting ingestion for %s (pageSize=%d)", project.Config.Name, pageSize)
 	if err := ingestion.Run(ctx, project.Config, opts); err != nil && ctx.Err() == nil {
@@ -316,6 +331,9 @@ func runInitContractImport(p *parsedArgs) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "write project: %v\n", err)
 		return 1
+	}
+	if code := runInitWithConfig(configPath); code != 0 {
+		return code
 	}
 	fmt.Printf("initialized %s (%d events)\n", configPath, len(events))
 	return 0

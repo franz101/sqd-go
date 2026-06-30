@@ -159,16 +159,7 @@ func GenerateProject(project *config.Project) (string, error) {
 
 	customProcessorExists, customProcessorCodegenOwned := checkFile(customProcessorPath)
 	if !customProcessorExists || customProcessorCodegenOwned {
-		// Generate the custom processor
-		var customProcessorCode []byte
-		var err error
-		// For backward compatibility, if the project is Uniswap/ERC20, we use ERC20 generator.
-		// Otherwise we can generate the empty/generic skeleton.
-		if project.Config.Name == "case_1_lbtc_event_only" && len(hotStateTables) == 0 {
-			customProcessorCode, err = generateCustomProcessorGo(events)
-		} else {
-			customProcessorCode, err = generateEmptyCustomProcessorGo(project.Config, events, hotStateTables)
-		}
+		customProcessorCode, err := generateEmptyCustomProcessorGo(project.Config, events, hotStateTables)
 		if err != nil {
 			return "", err
 		}
@@ -670,24 +661,6 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 		b.WriteString(";\n")
 	}
 
-	// Add positions table for hot state backwards compatibility if present
-	if hasERC20Transfer(events) {
-		b.WriteString("\n")
-		b.WriteString(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %[1]s.erc20_address_positions (
-  address FixedString(20),
-  balance_raw String,
-  total_in_raw String,
-  total_out_raw String,
-  net_flow_raw String,
-  realized_pnl_raw String,
-  transfer_count UInt64,
-  updated_at_block UInt64,
-  updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
-) ENGINE = ReplacingMergeTree(updated_at_block)
-ORDER BY address;
-`, tmplData.DatabaseIdent))
-	}
-
 	return b.String()
 }
 
@@ -1162,23 +1135,6 @@ func hasCommonType(events []eventSpec) bool {
 		}
 	}
 	return len(events) > 0
-}
-
-func hasERC20Transfer(events []eventSpec) bool {
-	for _, ev := range events {
-		if isERC20Transfer(ev) {
-			return true
-		}
-	}
-	return false
-}
-
-func isERC20Transfer(ev eventSpec) bool {
-	return ev.CanonicalSig == "Transfer(address,address,uint256)" &&
-		len(ev.Args) == 3 &&
-		ev.Args[0].SolidityType == "address" &&
-		ev.Args[1].SolidityType == "address" &&
-		ev.Args[2].SolidityType == "uint256"
 }
 
 func dynamicArrayElement(solType string) (string, bool) {

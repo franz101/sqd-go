@@ -142,10 +142,22 @@ func TestRunInitContractImportWritesConfig(t *testing.T) {
 		filepath.Join(projectDir, ".env"),
 		filepath.Join(projectDir, "compose.yml"),
 		filepath.Join(projectDir, "abis", "erc20.json"),
+		filepath.Join(projectDir, "custom_schema.go"),
+		filepath.Join(projectDir, "custom_processor.go"),
 	} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected scaffold file %s: %v", path, err)
 		}
+	}
+	processor, err := os.ReadFile(filepath.Join(projectDir, "custom_processor.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(processor), "*generated.USDCTransfer") {
+		t.Fatalf("contract-import processor was not derived from the ABI config:\n%s", processor)
+	}
+	if !strings.Contains(string(processor), "generated.CustomProcessProtoFn = ProcessProto") {
+		t.Fatalf("contract-import processor is not registered for default proto mode:\n%s", processor)
 	}
 
 	if code := runInitContractImport(&parsedArgs{initSource: "local", initABI: abiPath, initName: "USDC", project: projectDir}); code != 1 {
@@ -215,23 +227,33 @@ func TestRunInitTemplateWritesProject(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(projectDir, "compose.yml")); err != nil {
 		t.Fatalf("compose.yml missing: %v", err)
 	}
+	processor, err := os.ReadFile(filepath.Join(projectDir, "custom_processor.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(processor), "*generated.ERC20Transfer") {
+		t.Fatalf("ERC20 processor was not derived from config:\n%s", processor)
+	}
+	if !strings.Contains(string(processor), `generated "erc20_demo/generated"`) {
+		t.Fatalf("standalone generated import does not match scaffolded module:\n%s", processor)
+	}
 }
 
 func TestRunInitWithConfig(t *testing.T) {
 	dir := t.TempDir()
-	projectDir := filepath.Join(dir, "uniswap_pnl")
+	projectDir := filepath.Join(dir, "token_state")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	configYAML := `
-name: case_1_lbtc_event_only
+name: erc20_project
 chains:
   - id: 1
-    start_block: 0
+    start_block: 20600000
     end_block: 22200000
     contracts:
-      - name: LBTC
+      - name: Token
         address: "0x8236a87084f8B84306f72007F36F2618A5634494"
         events:
           - event: Transfer(address indexed from, address indexed to, uint256 value)
@@ -261,8 +283,11 @@ chains:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(schemaBytes), "package uniswap_pnl") {
+	if !strings.Contains(string(schemaBytes), "package token_state") {
 		t.Errorf("custom_schema.go package mismatch: %s", string(schemaBytes))
+	}
+	if !strings.Contains(string(schemaBytes), "type UserPositionSchema struct") {
+		t.Errorf("custom_schema.go is not an ERC20 state schema: %s", string(schemaBytes))
 	}
 
 	processorPath := filepath.Join(projectDir, "custom_processor.go")
@@ -273,19 +298,14 @@ chains:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(processorBytes), "package uniswap_pnl") {
+	if !strings.Contains(string(processorBytes), "package token_state") {
 		t.Errorf("custom_processor.go package mismatch: %s", string(processorBytes))
 	}
-	expectedImport := `"github.com/franz101/sqd-go/uniswap_pnl/generated"`
+	expectedImport := `"github.com/franz101/sqd-go/token_state/generated"`
 	if !strings.Contains(string(processorBytes), expectedImport) {
 		t.Errorf("custom_processor.go missing import %s: %s", expectedImport, string(processorBytes))
 	}
-
-	// Check generated files (events.go, schema.go, custom_processor.go)
-	for _, f := range []string{"events.go", "schema.go", "custom_processor.go"} {
-		path := filepath.Join(projectDir, "generated", f)
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("generated file missing: %s", path)
-		}
+	if !strings.Contains(string(processorBytes), "*generated.TokenTransfer") {
+		t.Errorf("custom_processor.go did not derive the configured event type: %s", string(processorBytes))
 	}
 }

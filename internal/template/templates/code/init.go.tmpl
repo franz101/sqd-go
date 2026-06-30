@@ -1,0 +1,212 @@
+{{define "initCustomSchema"}}// Package {{.PackageName}} contains your custom schema definitions.
+// These structs define the tables that will be created in ClickHouse.
+//
+// IMPORTANT: All files in this directory MUST use the same package name!
+// If custom_processor.go uses "package myproject", custom_schema.go must also use "package myproject".
+package {{.PackageName}}
+
+import (
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	{{- if .ERC20}}
+	"github.com/holiman/uint256"
+	{{- end}}
+)
+
+{{if .ERC20 -}}
+// UserPositionSchema stores cumulative ERC-20 transfer activity by address.
+// This struct defines a ClickHouse table that tracks token balances and transfer counts.
+//
+// Schema naming convention: <Entity>Schema -> state.<Entity>
+// Example: UserPositionSchema -> state.UserPosition (package generated)
+//
+// The "pk: Address" comment marks the primary key field.
+// sqd-go uses this to uniquely identify rows and handle state updates.
+//
+// Go struct concepts:
+// - Fields are exported (public) if they start with uppercase
+// - common.Address: Ethereum address type (20 bytes)
+// - uint256.Int: Very large integer for token amounts (256-bit unsigned)
+// - uint64: Standard 64-bit unsigned integer for counts
+// - time.Time: Date/time with timezone awareness
+// - UpdatedAtBlock/UpdatedAt: Auto-populated by Save() - tracks when state changed
+type UserPositionSchema struct {
+	Address        common.Address // Primary key: the user's wallet address
+	TotalIn        uint256.Int    // Total tokens received (cumulative)
+	TotalOut       uint256.Int    // Total tokens sent (cumulative)
+	TransferCount  uint64         // Number of transfers involving this address
+	UpdatedAtBlock uint64         // Auto-set by Save(): block number when last updated
+	UpdatedAt      time.Time      // Auto-set by Save(): timestamp when last updated
+}
+{{else -}}
+// EntityStateSchema is a generic starting point for derived state.
+// Replace ID and the value fields with keys and values meaningful to the project.
+//
+// This is a template - customize it for your specific use case:
+// - Change ID to your primary key type (common.Address, common.Hash, custom struct, etc.)
+// - Add fields that represent your derived state
+// - The "pk: ID" comment marks the primary key field
+//
+// Example: For a token balance tracker:
+//   type TokenBalanceSchema struct {
+//       TokenAddress  common.Address  // pk: TokenAddress
+//       UserAddress   common.Address  // pk: UserAddress
+//       Balance       uint256.Int
+//       UpdatedAtBlock uint64
+//       UpdatedAt      time.Time
+//   }
+type EntityStateSchema struct {
+	ID             common.Hash // Primary key: replace with your key type
+	UpdatedAtBlock uint64      // Auto-set by Save(): block number when last updated
+	UpdatedAt      time.Time   // Auto-set by Save(): timestamp when last updated
+}
+{{end -}}
+{{end}}
+
+{{define "initCustomProcessor"}}// Package {{.PackageName}} contains your custom event processing logic.
+// This is where you implement business logic that processes blockchain events.
+//
+// IMPORTANT: All files in this directory MUST use the same package name!
+// If custom_schema.go uses "package myproject", custom_processor.go must also use "package myproject".
+package {{.PackageName}}
+
+import (
+	{{- if .ERC20}}
+	"github.com/ethereum/go-ethereum/common"
+	{{- end}}
+
+	// This project's own generated package. The import is derived from the
+	// enclosing Go module, or from the standalone project name when no go.mod
+	// exists yet. `sqd-go codegen` produces this package.
+	//
+	// Import path format: "<module_name>/generated"
+	// For example, if your go.mod says "module myproject", import as "myproject/generated"
+	generated "{{.GeneratedImport}}"
+
+	// Public sqd-go facade. Project code must NOT import sqd-go/internal packages.
+	// This is because Go forbids importing internal packages from other modules.
+	// Use the public API instead - it provides everything you need.
+	"github.com/franz101/sqd-go/sqd"
+)
+
+// Process applies one decoded block to the project's derived state.
+//
+// This function is called ONCE per block with all decoded events in that block.
+// This is where you implement your business logic:
+// - Read events from the block
+// - Update state entities (balances, positions, aggregations, etc.)
+// - Save updated entities to the state store
+//
+// Go concepts for beginners:
+// - *generated.State: Pointer to State (access via pointer to avoid copying large structs)
+// - error: Return nil on success, error value on failure
+// - for ... range: Go's range loop (iterates over events)
+// - type switch: switch event := event.(type) allows type-specific handling
+// - method chaining: position.TotalOut.Add(&position.TotalOut, &value) calls methods in sequence
+//
+// IMPORTANT: Always pass event.EventMeta to Save() - it contains block number, timestamp, etc.
+func Process(state *generated.State, block *generated.ParsedBlock) error {
+	{{if .ERC20 -}}
+	// common.Address{} is the zero value (all zeros) - represents the null/zero address
+	var zero common.Address
+
+	// block.EventsIter() returns an iterator over all events in the block
+	// The for ... range syntax iterates over the iterator
+	for event := range block.EventsIter() {
+		// Type assertion: check if this event is a Transfer event
+		// The comma-ok pattern: transfer, ok := event.(*Type) returns (value, true) or (nil, false)
+		transfer, ok := event.(*generated.{{.EventGoType}})
+		if !ok {
+			continue // Skip events that aren't Transfer events
+		}
+
+		// Handle sender (From address)
+		if transfer.{{.FromField}} != zero {
+			// Get existing position or create new one
+			// Get returns (value, true) if found, (nil, false) if not
+			position, ok := state.UserPosition.Get(transfer.{{.FromField}})
+			if !ok {
+				// &generated.UserPosition{...} creates a new UserPosition and returns its address
+				position = &generated.UserPosition{Address: transfer.{{.FromField}}}
+			}
+
+			// uint256.Int.Add mutates the receiver in place: result.Add(&result, &value)
+			// This is different from most Go types - it's a design choice for performance
+			position.TotalOut.Add(&position.TotalOut, &transfer.{{.ValueField}})
+			position.TransferCount++
+
+			// Save updates the in-memory state and marks it for ClickHouse persistence
+			// event.EventMeta carries block number, timestamp, transaction hash, etc.
+			state.UserPosition.Save(position, transfer.EventMeta)
+		}
+
+		// Handle receiver (To address) - same pattern as sender
+		if transfer.{{.ToField}} != zero {
+			position, ok := state.UserPosition.Get(transfer.{{.ToField}})
+			if !ok {
+				position = &generated.UserPosition{Address: transfer.{{.ToField}}}
+			}
+			position.TotalIn.Add(&position.TotalIn, &transfer.{{.ValueField}})
+			position.TransferCount++
+			state.UserPosition.Save(position, transfer.EventMeta)
+		}
+	}
+	{{else -}}
+	// The first configured event is included as a compiling, typed starting point.
+	// Add project-specific keys and values to EntityStateSchema, then save them
+	// through state.EntityState.Save(entity, event.EventMeta).
+	//
+	// Type switch pattern: switch event := event.(type) allows type-specific handling
+	for event := range block.EventsIter() {
+		switch event := event.(type) {
+		case *generated.{{.EventGoType}}:
+			_ = event // Replace this with your actual processing logic
+		}
+	}
+	_ = state // TODO: Remove this line when you actually use the state parameter
+	{{end -}}
+	return nil // Success! Return nil to indicate no errors
+}
+
+// ProcessProto preserves the same business logic in the default columnar decoder.
+//
+// This function exists because sqd-go has two decoding modes:
+// - Proto mode: High-performance columnar decoding (uses *ProtoEventBlock)
+// - V1 mode: Original row-based decoding (uses *ParsedBlock)
+//
+// For beginners: You can keep the bridge implementation below.
+// For advanced users: Replace this bridge with direct proto-view iteration if allocation pressure matters.
+//
+// Go concepts:
+// - block.ToParsedBlock(): Converts proto format to parsed format (method call)
+// - Delegation: This function delegates to Process() to avoid code duplication
+func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) error {
+	return Process(state, block.ToParsedBlock())
+}
+
+// init() is a special function in Go that runs automatically when the program starts.
+// It runs BEFORE main() and is guaranteed to complete before any other code in the package.
+//
+// This init() function performs three critical registrations:
+// 1. generated.CustomProcessFn = Process - Wire up your V1 processing function
+// 2. generated.CustomProcessProtoFn = ProcessProto - Wire up your proto processing function
+// 3. sqd.RegisterProcessor(...) - Register this processor with the CLI
+//
+// Go concepts:
+// - init() runs automatically at startup (you don't call it manually)
+// - Assignment: fn = value sets the function to call
+// - func() (...) { ... } is an anonymous function (closure) - creates a function without a name
+// - generated.ProjectName is a constant from your generated code
+func init() {
+	// Wire your processing functions into the generated framework
+	generated.CustomProcessFn = Process
+	generated.CustomProcessProtoFn = ProcessProto
+
+	// Register this processor so sqd-go CLI can find it by name
+	// The factory function returns a Processor interface (wraps your custom logic)
+	sqd.RegisterProcessor(generated.ProjectName, func() (sqd.Processor, error) {
+		return generated.NewProcessor(sqd.GetProtoMode())
+	})
+}
+{{end}}
