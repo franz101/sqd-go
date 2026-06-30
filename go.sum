@@ -160,6 +160,10 @@ github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/
 github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO+kdMU+MU=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+github.com/templexxx/cpu v0.1.1 h1:isxHaxBXpYFWnk2DReuKkigaZyrjs2+9ypIdGP4h+HI=
+github.com/templexxx/cpu v0.1.1/go.mod h1:w7Tb+7qgcAlIyX4NhLuDKt78AHA5SzPmq0Wj6HiEnnk=
+github.com/templexxx/tsc v1.3.0 h1:gchLI+00m3eUm0aUG3qOhUterR/oGPpwsMcRqyKJbYc=
+github.com/templexxx/tsc v1.3.0/go.mod h1:FnsRbujBwVoBGlPqdwg/QB5zuQXAQR7ku3HF7IwLkTQ=
 github.com/tylertreat/boomfilters v0.0.0-20251117164519-53813c36cc1b h1:orxXh8xAGDSSlog/zk3yp9IOzfQ3xKwH8Ze+7nvqj6E=
 github.com/tylertreat/boomfilters v0.0.0-20251117164519-53813c36cc1b/go.mod h1:BojJ0v2JhBfkdhRsnpY6JP9ONFS6tTrWeI/p5OD8lR4=
 github.com/valyala/fastjson v1.6.10 h1:/yjJg8jaVQdYR3arGxPE2X5z89xrlhS0eGXdv+ADTh4=

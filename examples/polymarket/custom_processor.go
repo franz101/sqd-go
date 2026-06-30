@@ -86,12 +86,25 @@ var (
 	// fiftyCentsD256 is 0.5 at scale 18 (exact: 5e17). Splits and merges price
 	// every outcome at 0.5, so the native handlers reuse this constant instead
 	// of round-tripping the shopspring fiftyCents through fromDecimal per event.
-	fiftyCentsD256, _        = protomath.ParseDecimal256("0.5", protomath.Decimal256Scale18)
-	negRiskAdapterAddr       = common.HexToAddress(generated.NegRiskAdapterMarketPreparedAddress)
-	exchangeAddr             = common.HexToAddress(generated.ExchangeOrderFilledAddress)
-	negRiskExchangeAddr      = common.HexToAddress(generated.NegRiskExchangeOrderFilledAddress)
-	exchangeV2Addr           = common.HexToAddress(generated.ExchangeV2OrderFilledV2Address)
-	negRiskExchangeV2Addr    = common.HexToAddress(generated.NegRiskExchangeV2OrderFilledV2Address)
+	fiftyCentsD256, _     = protomath.ParseDecimal256("0.5", protomath.Decimal256Scale18)
+	negRiskAdapterAddr    = common.HexToAddress(generated.NegRiskAdapterMarketPreparedAddress)
+	exchangeAddr          = common.HexToAddress(generated.ExchangeOrderFilledAddress)
+	negRiskExchangeAddr   = common.HexToAddress(generated.NegRiskExchangeOrderFilledAddress)
+	exchangeV2Addr        = common.HexToAddress(generated.ExchangeV2OrderFilledV2Address)
+	negRiskExchangeV2Addr = common.HexToAddress(generated.NegRiskExchangeV2OrderFilledV2Address)
+	ctfCollateralAdapters = [...]common.Address{
+		common.HexToAddress("0xAdA100874d00e3331D00F2007a9c336a65009718"),
+		common.HexToAddress("0xAdA100Db00Ca00073811820692005400218FcE1f"),
+	}
+	negRiskCollateralAdapters = [...]common.Address{
+		common.HexToAddress("0xAdA200001000ef00D07553cEE7006808F895c6F1"),
+		common.HexToAddress("0xadA2005600Dec949baf300f4C6120000bDB6eAab"),
+	}
+	supportedCollateral = [...]common.Address{
+		common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), // bridged USDC
+		common.HexToAddress("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), // native USDC
+		common.HexToAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"), // pUSD
+	}
 	negRiskWrappedCollateral = common.HexToAddress("0x3A3BD7bb9528E159577F7C2e685CC81A765002E2")
 	ctP                      = uint256FromDecimal("21888242871839275222246405745257275088696311157297823662689037894645226208583")
 	ctB                      = big.NewInt(3)
@@ -325,6 +338,9 @@ func ensurePositionsLoaded(state *generated.State, block *generated.ProtoEventBl
 
 	queued := 0
 	queue := func(user common.Address, tokenID uint256.Int) {
+		if isIgnoredStakeholder(user) {
+			return
+		}
 		key := generated.UserPositionsClockKey{User: user, TokenID: tokenIDHash(tokenID)}
 		if _, ok := state.HotState.UserPositions.Get(key); ok {
 			return // present or tombstoned — already resolved
@@ -760,6 +776,10 @@ func handleOrderFilledV2Values(state *generated.State, maker common.Address, sid
 }
 
 func handleOrderFilledValues(state *generated.State, maker common.Address, makerAssetID, takerAssetID, makerAmountFilled, takerAmountFilled uint256.Int, meta generated.EventMeta) {
+	if isIgnoredStakeholder(maker) {
+		return
+	}
+
 	// Native protomath fast path: order fills are the dominant event type, and
 	// the shopspring round-trip (uint256 -> big.Int -> decimal -> Decimal256)
 	// costs ~10x the arithmetic itself (see protomath_roundtrip_bench_test.go).
@@ -806,7 +826,7 @@ func handleOrderFilledValues(state *generated.State, maker common.Address, maker
 // (raw > ~1.16e65, unreachable for real fills).
 
 func handleFixedProductMarketMakerCreation(state *generated.State, ev *generated.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation) {
-	if len(ev.ConditionIds) == 0 {
+	if len(ev.ConditionIds) == 0 || !isSupportedCollateral(ev.CollateralToken) {
 		return
 	}
 	if cond, ok := state.Condition.Get(ev.ConditionIds[0]); ok && cond.OutcomeSlotCount != 2 {
@@ -1014,7 +1034,7 @@ func isBinaryFPMM(state *generated.State, fpmm *generated.FixedProductMarketMake
 }
 
 func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokensPositionSplit) {
-	if isIgnoredStakeholder(ev.Stakeholder) {
+	if isIgnoredStakeholder(ev.Stakeholder) || !isSupportedCollateral(ev.CollateralToken) {
 		return
 	}
 	cond, ok := state.Condition.Get(ev.ConditionID)
@@ -1041,7 +1061,7 @@ func handlePositionSplit(state *generated.State, ev *generated.ConditionalTokens
 }
 
 func handlePositionsMerge(state *generated.State, ev *generated.ConditionalTokensPositionsMerge) {
-	if isIgnoredStakeholder(ev.Stakeholder) {
+	if isIgnoredStakeholder(ev.Stakeholder) || !isSupportedCollateral(ev.CollateralToken) {
 		return
 	}
 	cond, ok := state.Condition.Get(ev.ConditionID)
@@ -1066,7 +1086,7 @@ func handlePositionsMerge(state *generated.State, ev *generated.ConditionalToken
 }
 
 func handleNegRiskPositionSplit(state *generated.State, ev *generated.NegRiskAdapterPositionSplit) {
-	if ev.Stakeholder == negRiskExchangeAddr {
+	if isIgnoredStakeholder(ev.Stakeholder) {
 		return
 	}
 
@@ -1095,7 +1115,7 @@ func handleNegRiskPositionSplit(state *generated.State, ev *generated.NegRiskAda
 }
 
 func handleNegRiskPositionsMerge(state *generated.State, ev *generated.NegRiskAdapterPositionsMerge) {
-	if ev.Stakeholder == negRiskExchangeAddr {
+	if isIgnoredStakeholder(ev.Stakeholder) {
 		return
 	}
 
@@ -1124,6 +1144,10 @@ func handleNegRiskPositionsMerge(state *generated.State, ev *generated.NegRiskAd
 }
 
 func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapterPositionsConverted) {
+	if isIgnoredStakeholder(ev.Stakeholder) {
+		return
+	}
+
 	nr, ok := state.NegRiskEvent.Get(ev.MarketID)
 	if !ok || nr.QuestionCount == 0 {
 		return
@@ -1162,10 +1186,20 @@ func handlePositionsConverted(state *generated.State, ev *generated.NegRiskAdapt
 		return
 	}
 
-	// Sell NO tokens at fiftyCents (0.5), not at user's avgPrice — this generates
-	// PnL when avgPrice differs from 0.5.
+	// Conversion changes the position representation; it is not a disposal.
+	// Match the canonical pnl-subgraph by removing each NO position at its
+	// existing average price, so conversion itself realizes no PnL.
 	for _, posID := range noSells {
-		updateUserPositionWithSellD256(state, ev.Stakeholder, posID, fiftyCentsD256, amount, ev.EventMeta)
+		if up, ok := getUserPositionValue(state, ev.Stakeholder, posID); ok {
+			updateUserPositionWithSellD256(
+				state,
+				ev.Stakeholder,
+				posID,
+				up.AvgPrice,
+				amount,
+				ev.EventMeta,
+			)
+		}
 	}
 
 	if len(yesBuys) == 0 {
@@ -1258,7 +1292,7 @@ func handleConditionResolution(state *generated.State, ev *generated.Conditional
 }
 
 func handlePayoutRedemptionCTF(state *generated.State, ev *generated.ConditionalTokensPayoutRedemption) {
-	if ev.Redeemer == negRiskAdapterAddr {
+	if isIgnoredStakeholder(ev.Redeemer) || !isSupportedCollateral(ev.CollateralToken) {
 		return
 	}
 	cond, ok := state.Condition.Get(ev.ConditionID)
@@ -1291,6 +1325,10 @@ func handlePayoutRedemptionCTF(state *generated.State, ev *generated.Conditional
 }
 
 func handlePayoutRedemptionNR(state *generated.State, ev *generated.NegRiskAdapterPayoutRedemption) {
+	if isIgnoredStakeholder(ev.Redeemer) {
+		return
+	}
+
 	cond, ok := state.Condition.Get(ev.ConditionID)
 	if !ok || !cond.Resolved {
 		return
@@ -1660,11 +1698,36 @@ func CTFOutcomeToDecimal(i uint256.Int) decimal.Decimal {
 }
 
 func isIgnoredStakeholder(addr common.Address) bool {
-	return addr == negRiskAdapterAddr ||
+	if addr == negRiskAdapterAddr ||
 		addr == exchangeAddr ||
 		addr == negRiskExchangeAddr ||
 		addr == exchangeV2Addr ||
-		addr == negRiskExchangeV2Addr
+		addr == negRiskExchangeV2Addr {
+		return true
+	}
+	for _, adapter := range ctfCollateralAdapters {
+		if addr == adapter {
+			return true
+		}
+	}
+	for _, adapter := range negRiskCollateralAdapters {
+		if addr == adapter {
+			return true
+		}
+	}
+	return false
+}
+
+func isSupportedCollateral(addr common.Address) bool {
+	if addr == negRiskWrappedCollateral {
+		return true
+	}
+	for _, collateral := range supportedCollateral {
+		if addr == collateral {
+			return true
+		}
+	}
+	return false
 }
 
 func isOneHot(i *uint256.Int) bool {
