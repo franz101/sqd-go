@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,12 +24,12 @@ import (
 // validate the fix. In skipEmpties (includeAllBlocks=false) mode the portal returns
 // only NON-EMPTY blocks plus a marker at the scanned high-water mark, so the replay
 // buffer is sparse. The consumer advances its cursor across confirmed-empty gaps via
-// ReplayBuffer.CeilBlock (ingestion.go:1060-1069) WITHOUT incrementing totalBlocks
-// (which is bumped once per buffer-present block at ingestion.go:930). The old stat
-// derived "+N blocks / blk/s" from totalBlocks, under-reporting true chain coverage
-// by the empty-block ratio. The fix reports chain coverage from the consumer-cursor
-// delta and relabels the totalBlocks counter as "non-empty" (logStats at
-// ingestion.go:863-867).
+// ReplayBuffer.CeilBlock WITHOUT incrementing totalBlocks (which is bumped once per
+// buffer-present block). The old stat derived "+N blocks / blk/s" from totalBlocks,
+// under-reporting true chain coverage by the empty-block ratio. The fix reports chain
+// coverage from the consumer-cursor delta and relabels the totalBlocks counter as
+// "non-empty" in logStats. (Symbol names, not line numbers, so these references don't
+// rot as ingestion.go moves.)
 
 // sparseFakePortal mimics a SQD portal queried with includeAllBlocks=false: for a
 // request {fromBlock,toBlock} it returns ONLY the present (non-empty) block numbers
@@ -160,11 +161,11 @@ func TestCoverageReflectsSkippedEmptyGaps(t *testing.T) {
 		t.Fatalf("LatestBlock (scanned high-water mark) = %d, want 9999", got)
 	}
 
-	// Simulate the consumer EXACTLY like production:
-	//   - GetBlock(consumer) hit -> nonEmpty++ (ingestion.go:930) and consumer=number+1
-	//     (ingestion.go:1039)
-	//   - miss -> CeilBlock(consumer) jumps across the confirmed-empty gap
-	//     (ingestion.go:1060-1069) WITHOUT touching nonEmpty
+	// Mirror production's consumer advance loop:
+	//   - GetBlock(consumer) hit -> nonEmpty++ (production bumps totalBlocks once per
+	//     present block) and consumer = entry.number + 1
+	//   - miss -> CeilBlock(consumer) jumps across the confirmed-empty gap WITHOUT
+	//     touching nonEmpty
 	//   - stop once past the scanned high-water mark (LatestBlock)
 	var nonEmpty uint64
 	consumer := uint64(0)
@@ -208,12 +209,15 @@ func TestCoverageReflectsSkippedEmptyGaps(t *testing.T) {
 // blocks is a small fraction. This is the prefetcher-level view of the same artifact:
 // the chain is covered fast, but few blocks are "present". ALWAYS RUNS (no ClickHouse).
 func TestParallelPrefetcherSparseCoverageVsNonEmpty(t *testing.T) {
-	const start, end uint64 = 0, 100000
+	// Keep the range above adaptiveGapMax so the initial nil-toBlock probe is
+	// exercised before this fake endpoint reports zero forward progress and the
+	// prefetcher falls back to pinned requests.
+	const start, end uint64 = 0, 200000
 	const pageSize uint64 = 10000
 	const workers = 4
 
 	// Present (non-empty) blocks: one every 10000 across the range, plus the marker
-	// blocks the portal emits at each page's scanned high-water mark. With ~11
+	// blocks the portal emits at each page's scanned high-water mark. With ~21
 	// "real" present numbers the non-empty fraction is tiny relative to the range.
 	var present []uint64
 	for n := start; n <= end; n += 10000 {
@@ -272,7 +276,7 @@ func TestParallelPrefetcherSparseCoverageVsNonEmpty(t *testing.T) {
 		t.Fatalf("max present block %d does not span the range (end %d)", coverage, end)
 	}
 	// ...while the present (non-empty) count is a small fraction of that span. We
-	// inserted ~21 present/marker numbers across 100001 block-numbers, so non-empty
+	// inserted ~41 present/marker numbers across 200001 block-numbers, so non-empty
 	// should be well under 1% of coverage.
 	if nonEmpty == 0 {
 		t.Fatal("no present blocks parsed from sparse pages")
@@ -286,7 +290,7 @@ func TestParallelPrefetcherSparseCoverageVsNonEmpty(t *testing.T) {
 
 func covUniqueSorted(in []uint64) []uint64 {
 	seen := make(map[uint64]struct{}, len(in))
-	var out []uint64
+	out := make([]uint64, 0, len(in))
 	for _, v := range in {
 		if _, ok := seen[v]; ok {
 			continue
@@ -294,12 +298,7 @@ func covUniqueSorted(in []uint64) []uint64 {
 		seen[v] = struct{}{}
 		out = append(out, v)
 	}
-	// Simple insertion sort: the slices here are tiny.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1] > out[j]; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
+	slices.Sort(out)
 	return out
 }
 
@@ -367,7 +366,7 @@ func TestIntegrationParallelFetchCoverageStat(t *testing.T) {
 			}},
 		}},
 		// StoreBlocks and StoreRawLogs left nil (=false) so parallelSkipEmpties engages
-		// (ingestion.go:423) and the portal is fetched sparse (includeAllBlocks=false).
+		// and the portal is fetched sparse (includeAllBlocks=false).
 	}
 
 	// Set up DB + base tables + the typed event table (mirrors integration_test.go).
@@ -378,6 +377,15 @@ func TestIntegrationParallelFetchCoverageStat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup ClickHouse: %v", err)
 	}
+	// Drop the per-run database on every exit path from here on, including a failed
+	// Run or a t.Fatalf in the assertions below — otherwise those paths leak a DB.
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if err := database.DropClickHouseDatabase(cleanupCtx, host, port, "default", password, dbName); err != nil {
+			t.Logf("cleanup: %v", err)
+		}
+	}()
 	if err := store.EnsureTablesWithOptions(setupCtx, true, database.EnsureTablesOptions{}); err != nil {
 		t.Fatalf("ensure base tables: %v", err)
 	}
@@ -434,15 +442,6 @@ func TestIntegrationParallelFetchCoverageStat(t *testing.T) {
 	// Restore output so test diagnostics are visible.
 	log.SetOutput(oldOut)
 	logged := buf.String()
-
-	// Cleanup DB regardless of assertions below.
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cleanupCancel()
-	defer func() {
-		if err := database.DropClickHouseDatabase(cleanupCtx, host, port, "default", password, dbName); err != nil {
-			t.Logf("cleanup: %v", err)
-		}
-	}()
 
 	// (a) The new stats line format must be present and report chain coverage much
 	// larger than the non-empty delta implies. Sum coverage and non-empty across all

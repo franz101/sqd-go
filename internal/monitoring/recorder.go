@@ -142,7 +142,9 @@ func Stop() {
 	}
 	r.cancel()
 	<-r.done
-	r.conn.Close()
+	if r.conn != nil {
+		r.conn.Close()
+	}
 }
 
 func (r *Recorder) loop(ctx context.Context, interval time.Duration) {

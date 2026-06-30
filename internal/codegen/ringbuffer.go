@@ -16,33 +16,29 @@ func generateRingBufferGo(events []eventSpec) ([]byte, error) {
 
 	src := template.MustExecute("code/ringbufferGo", tmplData)
 
-	formatted, err := format.Source([]byte(src))
-	if err != nil {
-		return []byte(src), fmt.Errorf("format source: %w", err)
-	}
-
 	protoRingCode, err := generateProtoRingBufferGo(tmplData)
 	if err != nil {
-		return formatted, fmt.Errorf("proto ring buffer: %w", err)
+		return nil, fmt.Errorf("proto ring buffer: %w", err)
 	}
 
-	result := fmt.Sprintf("%s\n\n%s", string(formatted), string(protoRingCode))
-	return []byte(result), nil
+	// Concatenate V1 + V2 and format the whole file once. Formatting the two
+	// halves separately and then joining them left a stray double blank line at
+	// the seam, so the emitted ringbuffer.go was not gofmt-stable. format.Source
+	// on the combined source collapses the seam to a single blank line.
+	combined := fmt.Sprintf("%s\n\n%s", src, string(protoRingCode))
+	formatted, err := format.Source([]byte(combined))
+	if err != nil {
+		return []byte(combined), fmt.Errorf("format source: %w", err)
+	}
+	return formatted, nil
 }
 
-// generateProtoRingBufferGo generates the V2 proto ring buffer.
-//
-// Keep this formatted separately from ringbufferGo to preserve the old output
-// shape exactly: V1 is formatted, V2 is formatted, then both are concatenated.
+// generateProtoRingBufferGo generates the V2 proto ring buffer body. The caller
+// concatenates it after the V1 ring buffer and formats the combined file, so the
+// returned bytes need not be independently gofmt-clean.
 func generateProtoRingBufferGo(tmplData struct {
 	Events []eventSpec
 }) ([]byte, error) {
 	src := template.MustExecute("code/protoRingBufferGo", tmplData)
-
-	formatted, err := format.Source([]byte(src))
-	if err != nil {
-		return []byte(src), fmt.Errorf("format proto ring buffer: %w", err)
-	}
-
-	return formatted, nil
+	return []byte(src), nil
 }

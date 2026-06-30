@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1038,16 +1039,17 @@ func TestParallelPrefetcherAdaptiveDenseGapSizing(t *testing.T) {
 	if len(spans) == 0 {
 		t.Fatal("no requests recorded")
 	}
-	var sum uint64
-	for _, s := range spans {
-		sum += s
+	// Use the MEDIAN (as documented above), not the mean: the final unit is an
+	// inevitable sub-floor remainder — the lone last block when denseCap does not
+	// evenly divide the range — and a single such outlier would drag the mean just
+	// below the floor even though every steady-state span sits right at denseCap.
+	sort.Slice(spans, func(i, j int) bool { return spans[i] < spans[j] })
+	median := spans[len(spans)/2]
+	if median > denseCap*4 {
+		t.Fatalf("pinned span did not contract to density: median=%d, want <= %d (denseCap=%d)", median, denseCap*4, denseCap)
 	}
-	avg := sum / uint64(len(spans))
-	if avg > denseCap*4 {
-		t.Fatalf("pinned span did not contract to density: avg=%d, want <= %d (denseCap=%d)", avg, denseCap*4, denseCap)
-	}
-	if avg < adaptiveGapMin {
-		t.Fatalf("pinned span contracted below floor: avg=%d, floor=%d", avg, adaptiveGapMin)
+	if median < adaptiveGapMin {
+		t.Fatalf("pinned span contracted below floor: median=%d, floor=%d", median, adaptiveGapMin)
 	}
 }
 

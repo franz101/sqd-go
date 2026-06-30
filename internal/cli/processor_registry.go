@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -52,6 +53,19 @@ func RegisterProcessorV2(projectName string, factory func(protoMode bool) (inges
 	processorFactories.Store(name, processorFactoryV2(factory))
 }
 
+// registeredNames returns a sorted slice of all registered processor names.
+// Useful for error messages when a lookup fails.
+func registeredNames() []string {
+	var names []string
+	processorFactories.Range(func(key, value interface{}) bool {
+		if name, ok := key.(string); ok {
+			names = append(names, name)
+		}
+		return true
+	})
+	return names
+}
+
 func processorForProject(projectName string) (ingestion.Processor, error) {
 	name := strings.TrimSpace(strings.ToLower(projectName))
 	if name == "" {
@@ -59,6 +73,13 @@ func processorForProject(projectName string) (ingestion.Processor, error) {
 	}
 	value, ok := processorFactories.Load(name)
 	if !ok {
+		// Check if any processors are registered at all - if so, this is a name mismatch
+		registered := registeredNames()
+		if len(registered) > 0 {
+			return nil, fmt.Errorf("config name %q matches no registered processor; registered: [%s]. "+
+				"Register under generated.ProjectName in custom_processor.go init()",
+				projectName, strings.Join(registered, ", "))
+		}
 		return nil, nil
 	}
 

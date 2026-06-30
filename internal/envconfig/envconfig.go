@@ -329,7 +329,7 @@ const (
 
 	// SQD_METRICS_CH_INTERVAL is the metrics flush interval.
 	// Format: Go duration (e.g., "1m", "30s")
-	// Default: "1m"
+	// Default: "5s" (5 seconds)
 	MetricsCHInterval = "SQD_METRICS_CH_INTERVAL"
 
 	// SQD_METRICS_CH_TTL_DAYS is the metrics data retention period in days.

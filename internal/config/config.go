@@ -109,15 +109,22 @@ type ChainContractConfig struct {
 type Address []string
 
 func (a *Address) UnmarshalYAML(value *yaml.Node) error {
-	var s string
-	if err := value.Decode(&s); err == nil {
-		*a = []string{s}
-		return nil
+	if value.Kind == yaml.DocumentNode && len(value.Content) == 1 {
+		value = value.Content[0]
 	}
-	var slice []string
-	if err := value.Decode(&slice); err == nil {
-		*a = slice
-		return nil
+	if value.Kind == yaml.ScalarNode && value.Tag == "!!str" {
+		var s string
+		if err := value.Decode(&s); err == nil {
+			*a = []string{s}
+			return nil
+		}
+	}
+	if value.Kind == yaml.SequenceNode {
+		var slice []string
+		if err := value.Decode(&slice); err == nil {
+			*a = slice
+			return nil
+		}
 	}
 	return fmt.Errorf("line %d: address must be a string or a list of strings", value.Line)
 }

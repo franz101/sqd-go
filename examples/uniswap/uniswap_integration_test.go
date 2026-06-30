@@ -2,12 +2,19 @@ package uniswap_test
 
 import (
 	"context"
+	"os"
 	"testing"
-	"github.com/franz101/sqd-go/internal/client"
+
 	"github.com/franz101/sqd-go/examples/uniswap/generated"
+	"github.com/franz101/sqd-go/internal/client"
 )
 
 func TestUniswapFastIntegration(t *testing.T) {
+	// Hits the live SQD portal, so it is opt-in (and skipped in CI by default) to
+	// avoid network flakiness / rate limits. Set SQD_LIVE_PORTAL=1 to run.
+	if os.Getenv("SQD_LIVE_PORTAL") == "" {
+		t.Skip("live-portal integration test; set SQD_LIVE_PORTAL=1 to run")
+	}
 	cl := client.New("https://portal.sqd.dev/datasets/ethereum-mainnet/finalized-stream")
 	defer cl.Close()
 

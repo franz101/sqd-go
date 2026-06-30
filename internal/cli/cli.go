@@ -45,6 +45,17 @@ func parseArgs(args []string) (*parsedArgs, error) {
 
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		// Handle --flag=value syntax
+		if strings.Contains(a, "=") {
+			parts := strings.SplitN(a, "=", 2)
+			if len(parts) == 2 {
+				a = parts[0]
+				args = append(args[:i], append([]string{a, parts[1]}, args[i+1:]...)...)
+				// Re-process the flag with its value as a separate arg
+				i--
+				continue
+			}
+		}
 		switch a {
 		case "-r", "--restart":
 			p.restart = true
@@ -119,6 +130,9 @@ func parseArgs(args []string) (*parsedArgs, error) {
 		default:
 			if !strings.HasPrefix(a, "-") {
 				positional = append(positional, a)
+			} else {
+				// Error on unknown dash tokens instead of silently dropping them
+				return nil, fmt.Errorf("unknown flag: %s", a)
 			}
 		}
 	}
@@ -260,8 +274,10 @@ func envOrDefault(key, defaultVal string) string {
 
 func envOrDefaultInt(key string, defaultVal int) int {
 	if v := os.Getenv(key); v != "" {
-		var n int
-		fmt.Sscanf(v, "%d", &n)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return defaultVal
+		}
 		return n
 	}
 	return defaultVal
@@ -269,7 +285,14 @@ func envOrDefaultInt(key string, defaultVal int) int {
 
 func envOrDefaultBool(key string, defaultVal bool) bool {
 	if v := strings.TrimSpace(strings.ToLower(os.Getenv(key))); v != "" {
-		return v == "1" || v == "true" || v == "yes" || v == "on"
+		switch v {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		default:
+			return defaultVal
+		}
 	}
 	return defaultVal
 }
