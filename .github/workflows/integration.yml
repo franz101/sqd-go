@@ -38,6 +38,15 @@ jobs:
           test -f examples/uniswap/generated/parser.go || (echo "parser.go not generated" && exit 1)
           echo "codegen uniswap: OK"
 
+      # Same as above: examples/lbtc's generated/ package is git-ignored and
+      # produced by codegen, not committed.
+      - name: Codegen lbtc example
+        run: |
+          ./tmp/sqd-go codegen examples/lbtc
+          test -f examples/lbtc/generated/events.go || (echo "events.go not generated" && exit 1)
+          test -f examples/lbtc/generated/parser.go || (echo "parser.go not generated" && exit 1)
+          echo "codegen lbtc: OK"
+
       # Exclude examples/polymarket (heavy benches, git-ignored) and the top-level
       # coldcache package (grep matches the path segment, not "internal/coldcache"
       # which never existed). Live-portal tests self-skip unless SQD_LIVE_PORTAL=1.
