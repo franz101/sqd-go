@@ -108,7 +108,10 @@ func (s pruneStore) Conn() *ch.Client      { return s.conn }
 func (s pruneStore) PruneConn() *ch.Client { return s.pruneConn }
 func (s pruneStore) DB() string            { return s.db }
 
-const pruneDDL = "CREATE TABLE IF NOT EXISTS %s.memory_user_positions (" +
+// The generated inserter writes to the "_log" physical table (see the
+// _log/_live custom-table split), so the DDL and count queries below must use
+// that suffixed name too.
+const pruneDDL = "CREATE TABLE IF NOT EXISTS %s.memory_user_positions_log (" +
 	"user FixedString(20), token_id FixedString(32), balance UInt64, " +
 	"block_number UInt64, transaction_index UInt64, log_index UInt64, " +
 	"updated_at_block UInt64, updated_at DateTime64(3, 'UTC') DEFAULT now64(3)" +
@@ -193,7 +196,7 @@ func pruneSeedRow(t *testing.T, conn *ch.Client, db string, addr common.Address,
 func pruneCountAtBlock(t *testing.T, conn *ch.Client, db string, block uint64) uint64 {
 	t.Helper()
 	var cnt proto.ColUInt64
-	q := fmt.Sprintf("SELECT count() AS c FROM %s.memory_user_positions WHERE block_number = %d", db, block)
+	q := fmt.Sprintf("SELECT count() AS c FROM %s.memory_user_positions_log WHERE block_number = %d", db, block)
 	if err := conn.Do(context.Background(), ch.Query{
 		Body:   q,
 		Result: proto.Results{{Name: "c", Data: &cnt}},
@@ -232,7 +235,10 @@ func TestPruneCollapsesOldVersionsKeepsLatest(t *testing.T) {
 	singleOldTok := prHash(3)
 	pruneSeedRow(t, conn, db, singleOld, singleOldTok, 50)
 
-	if err := CompactionPruneState(context.Background(), store, 0, 2000); err != nil {
+	// retainInterval far larger than any seeded block => every row lands in
+	// bucket intDiv(block, N)=0, so bucketed retention degenerates to the
+	// classic collapse-to-one-latest-per-key this test asserts.
+	if err := CompactionPruneState(context.Background(), store, 0, 2000, 100000); err != nil {
 		t.Fatalf("CompactionPruneState: %v", err)
 	}
 
@@ -258,11 +264,45 @@ func TestPruneBelowMinBlockIsNoop(t *testing.T) {
 	addr, tok := pruneAddr(9), prHash(9)
 	pruneSeedRow(t, conn, db, addr, tok, 10)
 
-	if err := CompactionPruneState(context.Background(), store, 0, 999); err != nil {
+	if err := CompactionPruneState(context.Background(), store, 0, 999, 100000); err != nil {
 		t.Fatalf("CompactionPruneState: %v", err)
 	}
 	if got := pruneCountAtBlock(t, conn, db, 10); got != 1 {
 		t.Errorf("count at block 10 = %d, want 1 unchanged (blockNumber=999 must no-op)", got)
+	}
+}
+
+// TestPruneBucketedRetainsPerBucket is the correctness test for block-bucketed
+// retention (the "one snapshot every N blocks" behaviour): with a small
+// retainInterval, each intDiv(block_number, N) bucket keeps its own latest row
+// rather than the table collapsing to a single latest per key. This is what
+// makes the "_log" table a usable time series for points accrual while still
+// bounding growth.
+func TestPruneBucketedRetainsPerBucket(t *testing.T) {
+	conn, prune, db := pruneTestDial(t)
+	store := pruneStore{conn: conn, pruneConn: prune, db: db}
+
+	addr, tok := pruneAddr(11), prHash(11)
+	// retainInterval = 200 => buckets [0,200),[200,400),[400,600),[800,1000).
+	for _, b := range []uint64{100, 150, 250, 350, 450, 550, 900} {
+		pruneSeedRow(t, conn, db, addr, tok, b)
+	}
+
+	if err := CompactionPruneState(context.Background(), store, 0, 2000, 200); err != nil {
+		t.Fatalf("CompactionPruneState: %v", err)
+	}
+
+	// Non-latest rows within a bucket are dropped.
+	for _, deleted := range []uint64{100, 250, 450} {
+		if got := pruneCountAtBlock(t, conn, db, deleted); got != 0 {
+			t.Errorf("count at block %d = %d, want 0 (superseded within its bucket)", deleted, got)
+		}
+	}
+	// One surviving snapshot per bucket (the bucket's latest).
+	for _, kept := range []uint64{150, 350, 550, 900} {
+		if got := pruneCountAtBlock(t, conn, db, kept); got != 1 {
+			t.Errorf("count at block %d = %d, want 1 (per-bucket latest must survive)", kept, got)
+		}
 	}
 }
 
@@ -292,7 +332,7 @@ func TestPruneUsesPruneConnNotHotConn(t *testing.T) {
 	})
 	store := pruneStore{conn: conn, pruneConn: prune, db: db}
 
-	if err := CompactionPruneState(context.Background(), store, 0, 2000); err != nil {
+	if err := CompactionPruneState(context.Background(), store, 0, 2000, 100000); err != nil {
 		t.Fatalf("CompactionPruneState with a closed Conn: %v (it should have run entirely on PruneConn)", err)
 	}
 
@@ -323,7 +363,7 @@ func TestPruneStartPollWaitLifecycle(t *testing.T) {
 
 	state := NewState()
 	dispatchStart := time.Now()
-	if ok := state.StartPrune(context.Background(), store, 0, 2000); !ok {
+	if ok := state.StartPrune(context.Background(), store, 0, 2000, 100000); !ok {
 		t.Fatal("StartPrune returned false, want true (no prune should be in flight yet)")
 	}
 	dispatchElapsed := time.Since(dispatchStart)
@@ -331,7 +371,7 @@ func TestPruneStartPollWaitLifecycle(t *testing.T) {
 		t.Errorf("StartPrune took %s to return, want it to dispatch and return near-instantly (it must not block on the DELETE/OPTIMIZE round trip)", dispatchElapsed)
 	}
 
-	if ok := state.StartPrune(context.Background(), store, 0, 2000); ok {
+	if ok := state.StartPrune(context.Background(), store, 0, 2000, 100000); ok {
 		t.Error("StartPrune returned true while a prune was already in flight, want false (only one prune at a time)")
 	}
 

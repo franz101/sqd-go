@@ -1,4 +1,4 @@
-package uniswap
+package lbtc
 
 import (
 	"time"
@@ -18,7 +18,7 @@ import (
 // append-only history — one row per commit, suffixed "_log" — paired with a
 // "_live" view that resolves to one row per primary key (latest write wins).
 //
-// This file MUST use the same package name as custom_processor.go ("uniswap").
+// This file MUST use the same package name as custom_processor.go ("lbtc").
 
 // pk: Address
 type UserPositionSchema struct {

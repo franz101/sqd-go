@@ -19,7 +19,7 @@ Create `custom_schema.go` next to your `config.yaml`. Struct naming convention:
 
 - Name MUST end in `Schema` (e.g., `UserPositionSchema`, `MemoryConditionSchema`)
 - The struct name minus `Schema` becomes the entity name: `UserPositionSchema` → `UserPosition`
-- Table name is the pluralized snake_case: `UserPositionSchema` → `user_positions`
+- The physical table is the pluralized snake_case name suffixed `_log`: `UserPositionSchema` → `user_positions_log` (an append-only history), paired with a `user_positions_live` **view** that resolves to the current row per primary key. Config `state:` entries and `source_table:` still reference the base name (`user_positions`) — the `_log` suffix is added automatically.
 
 ### Struct Comments: Primary Key
 
@@ -44,7 +44,12 @@ type MemoryConditionSchema struct {
 }
 ```
 
-If no `pk:` comment, the codegen infers it: field named `ID` wins, then the first non-reserved field, then falls back to `block_number, transaction_index, log_index`.
+Primary-key resolution order: the `pk:` comment first; then a matching
+config.yaml `state:` entry's `key:`; then a field named `ID`; then the first
+non-reserved field; finally `block_number, transaction_index, log_index`. The
+`PRIMARY KEY` is always just these pk/sk columns — `block_number`,
+`transaction_index`, and `log_index` are added to `ORDER BY` (and the `_live`
+view's filter) only, never to the primary key.
 
 ### Supported Go Types → ClickHouse Types
 
@@ -75,14 +80,17 @@ transaction_index UInt64
 log_index UInt64
 ```
 
-These enable the `ReplacingMergeTree(block_number)` engine to deduplicate rows from reorgs.
+These order the append-only history and let the `_live` view pick the latest
+write per key. Reorgs are handled by deleting `block_number > lastBlock` rows on
+reindex, not by engine-level dedup.
 
 ## Generated DDL
 
-For each schema struct, codegen produces:
+For each schema struct, codegen produces a plain `MergeTree` `_log` history
+table plus a `_live` view:
 
 ```sql
-CREATE TABLE IF NOT EXISTS <db>.user_positions (
+CREATE TABLE IF NOT EXISTS <db>.memory_conditions_log (
   id FixedString(32),
   oracle FixedString(20),
   question_id FixedString(32),
@@ -93,10 +101,21 @@ CREATE TABLE IF NOT EXISTS <db>.user_positions (
   block_number UInt64,
   transaction_index UInt64,
   log_index UInt64
-) ENGINE = ReplacingMergeTree(block_number)
+) ENGINE = MergeTree()
 PRIMARY KEY (id)
 ORDER BY (id, block_number, transaction_index, log_index);
+
+CREATE VIEW IF NOT EXISTS <db>.memory_conditions_live AS
+SELECT * FROM <db>.memory_conditions_log
+ORDER BY id, block_number DESC, transaction_index DESC, log_index DESC
+LIMIT 1 BY id;
 ```
+
+Query `_live` for current state; query `_log` for history. Periodic compaction
+prunes `_log` to one snapshot per `(primary key, intDiv(block_number,
+CLICKHOUSE_PRUNE_INTERVAL))` bucket, bounding growth while keeping a
+block-bucketed history, and never touches rows within 1000 blocks of the sync
+head (so it stays below the finalized head).
 
 Output paths:
 - `.sqd/generated/custom_schema.sql` — canonical
@@ -236,4 +255,4 @@ type MemoryNegRiskEventSchema struct {
 }
 ```
 
-These produce three ClickHouse tables (`memory_conditions`, `memory_user_positions`, `memory_negrisk_events`) with full snapshot/restore/commit/prune lifecycle. The custom processor (`custom_processor.go`) runs the PnL logic using these in-memory maps and periodically commits to ClickHouse.
+These produce three ClickHouse history tables (`memory_conditions_log`, `memory_user_positions_log`, `memory_negrisk_events_log`), each with a paired `_live` view and the full snapshot/restore/commit/prune lifecycle. The custom processor (`custom_processor.go`) runs the PnL logic using these in-memory maps and periodically commits to ClickHouse.

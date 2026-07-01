@@ -9,7 +9,9 @@ For every `Transfer(from, to, value)` event on a token contract:
 - Increments receiver's balance, accumulates total inflow
 - Persists state to ClickHouse with snapshot-based fork recovery
 
-The result is a `user_positions` table in ClickHouse with real-time balances and flow totals for every wallet that has ever touched the token.
+The result is a `user_positions_log` history table in ClickHouse (plus a
+`user_positions_live` view for current state) with balances and flow totals for
+every wallet that has ever touched the token.
 
 ## Step 1: Config
 
@@ -46,17 +48,22 @@ import (
 // pk: Address
 type UserPositionSchema struct {
     Address        common.Address
-    Balance        uint256.Int
     TotalIn        uint256.Int
     TotalOut       uint256.Int
+    TransferCount  uint64
     UpdatedAtBlock uint64
     UpdatedAt      time.Time
 }
 ```
 
-The `// pk: Address` comment tells codegen that `Address` is the primary key. Codegen generates:
+Balance is derived on read as `total_in - total_out` rather than stored, so
+there is no separate `balance` column.
 
-- ClickHouse table `user_positions` with columns: `address FixedString(20)`, `balance UInt256`, `total_in UInt256`, `total_out UInt256`, `updated_at_block UInt64`, `updated_at DateTime64(3)`
+The `// pk: Address` comment tells codegen that `Address` is the primary key
+(the pk/sk source order is: `// pk:` comment, then a matching config.yaml
+`state:` key, then an `ID` field, then the first field). Codegen generates:
+
+- ClickHouse history table `user_positions_log` (plus the `user_positions_live` view) with columns: `address FixedString(20)`, `total_in UInt256`, `total_out UInt256`, `transfer_count UInt64`, `updated_at_block UInt64`, `updated_at DateTime64(3)`
 - Go type `generated.UserPosition` with the same fields
 - Hot state map `state.UserPosition` with `Get(address)` and `Save(pos, meta)` methods
 - Snapshot/restore/commit/prune lifecycle
@@ -149,35 +156,42 @@ make dev-polymarket
 
 ## Step 5: Query Results
 
+Each custom table is generated as a pair: an append-only history table suffixed
+`_log` (one row per commit) and a `_live` **view** that resolves to the current
+row per primary key (latest `block_number, transaction_index, log_index` wins).
+Query `_live` for current state; query `_log` for history/time-series.
+
 Top holders by balance:
 
 ```sql
 SELECT
   hex(address) as wallet,
-  balance,
+  toInt256(total_in) - toInt256(total_out) as balance,
   total_in,
   total_out
-FROM case_1_lbtc_event_only.user_positions
-FINAL
+FROM case_1_lbtc_event_only.user_positions_live
 ORDER BY balance DESC
 LIMIT 20
 ```
 
-Wallets with net outflow (potential sellers):
+Wallets with the most cumulative outflow:
 
 ```sql
 SELECT
   hex(address) as wallet,
-  total_out - total_in as net_flow,
-  balance
-FROM case_1_lbtc_event_only.user_positions
-FINAL
-WHERE total_out > total_in
-ORDER BY net_flow DESC
+  total_out,
+  toInt256(total_in) - toInt256(total_out) as balance
+FROM case_1_lbtc_event_only.user_positions_live
+ORDER BY total_out DESC
 LIMIT 20
 ```
 
-The `FINAL` keyword is important -- ClickHouse uses `ReplacingMergeTree` and `FINAL` deduplicates rows that haven't been merged yet.
+The `_live` view does the deduplication for you (`ORDER BY address,
+block_number DESC, ... LIMIT 1 BY address`), so no `FINAL` is needed — and no
+`FINAL` on the `_log` table either: it is a plain `MergeTree` history, so
+`FINAL` there would NOT collapse rows (the sort key includes
+`block_number/transaction_index/log_index`). Always read current state through
+`_live`.
 
 ## How It Works Under the Hood
 
@@ -194,7 +208,8 @@ SQD HTTP → zstd JSONL → Parse → Decode Transfer events
                                        ↓
                         Every 4000 blocks: Commit to ClickHouse
                                        ↓
-                        Every 100000 blocks: Prune old rows
+                        Every CLICKHOUSE_PRUNE_INTERVAL blocks: Prune _log to
+                        one snapshot per (pk, N-block bucket)
 ```
 
 1. **Fetch**: SQD portal delivers finalized blocks as zstd-compressed JSONL
@@ -204,7 +219,7 @@ SQD HTTP → zstd JSONL → Parse → Decode Transfer events
 5. **Process**: Your `Process` function runs per block with the typed `ParsedBlock`
 6. **State**: CLOCK cache maps with O(1) get/save. On cache eviction, cold tier (Pebble) serves the entry
 7. **Commit**: Dirty entities flushed to ClickHouse via native protocol (async insert)
-8. **Prune**: Old `ReplacingMergeTree` rows cleaned up periodically
+8. **Prune**: Every `CLICKHOUSE_PRUNE_INTERVAL` blocks the `_log` table is compacted to one snapshot per `(primary key, intDiv(block_number, interval))` bucket — bounding growth while keeping a block-bucketed history for points/time-series. Only rows more than 1000 blocks below the sync head are touched, so pruning never crosses the finalized head.
 
 ## Recent Enhancements (2026)
 
@@ -283,19 +298,32 @@ The Polymarket example in `examples/polymarket/` implements full PnL with this p
 For the simple balance tracker:
 
 ```sql
-CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.`user_positions` (
+CREATE TABLE IF NOT EXISTS `case_1_lbtc_event_only`.`user_positions_log` (
   `address` FixedString(20),
-  `balance` UInt256,
   `total_in` UInt256,
   `total_out` UInt256,
+  `transfer_count` UInt64,
   `updated_at_block` UInt64,
   `updated_at` DateTime64(3, 'UTC') DEFAULT now64(3),
   `block_number` UInt64,
   `transaction_index` UInt64,
   `log_index` UInt64
-) ENGINE = ReplacingMergeTree(block_number)
+) ENGINE = MergeTree()
 PRIMARY KEY (`address`)
 ORDER BY (`address`, `block_number`, `transaction_index`, `log_index`);
+
+CREATE VIEW IF NOT EXISTS `case_1_lbtc_event_only`.`user_positions_live` AS
+SELECT * FROM `case_1_lbtc_event_only`.`user_positions_log`
+ORDER BY `address`, block_number DESC, transaction_index DESC, log_index DESC
+LIMIT 1 BY `address`;
 ```
 
-The `ReplacingMergeTree(block_number)` engine keeps the latest row per primary key after compaction. Multiple updates to the same address during indexing produce multiple rows; `FINAL` or background merges collapse them to the latest.
+The physical `_log` table is a plain `MergeTree` append-only history: the
+`PRIMARY KEY` is the pk/sk columns only, while `block_number`,
+`transaction_index`, and `log_index` appear only in `ORDER BY` (and in the
+`_live` view's filter) — never in the primary key. Every commit appends a row,
+so an address touched N times has up to N rows. The paired `_live` view
+resolves to the single latest row per primary key via `LIMIT 1 BY` — query it
+for current balances; query `_log` when you need the full history (e.g. points
+accrual over time). Periodic pruning bounds `_log` to one snapshot per
+`(address, N-block bucket)` where `N = CLICKHOUSE_PRUNE_INTERVAL`.

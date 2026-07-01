@@ -67,11 +67,11 @@ func GenerateProject(project *config.Project) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	customTables, err := loadCustomTableSpecs(project.Root)
+	customTables, err := loadCustomTableSpecs(project.Root, project.Config)
 	if err != nil {
 		return "", err
 	}
-	customSchemaTables, err := loadCustomSchemaSpecs(project.Root, filepath.Dir(project.ConfigPath))
+	customSchemaTables, err := loadCustomSchemaSpecs(project.Root, filepath.Dir(project.ConfigPath), project.Config)
 	if err != nil {
 		return "", err
 	}
@@ -640,6 +640,7 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 		IncludeTransactionHash bool
 		Columns                []colData
 		Key                    string
+		PrimaryKey             string
 	}
 
 	tmplData := struct {
@@ -703,7 +704,8 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 			IncludeContractAddress: tmplData.IncludeContractAddress,
 			IncludeTransactionHash: tmplData.IncludeTransactionHash,
 			Columns:                cols,
-			Key:                    eventPrimaryKey(ev),
+			Key:                    eventOrderBy(ev),
+			PrimaryKey:             eventPrimaryKey(ev),
 		}
 
 		b.WriteString(template.MustExecute("sql/createEventTable", evData))
@@ -720,13 +722,33 @@ func mergeTreeEngine(collapsing bool) string {
 	return "MergeTree()"
 }
 
+// eventOrderBy returns the ORDER BY tuple for an event table: the event's
+// leading (indexed) columns, if any, followed by the metadata columns that
+// make each row unique.
+func eventOrderBy(ev eventSpec) string {
+	parts := eventKeyColumns(ev)
+	parts = append(parts, "block_number", "transaction_index", "log_index")
+	return strings.Join(parts, ", ")
+}
+
+// eventPrimaryKey returns the PRIMARY KEY tuple for an event table. ClickHouse
+// loads the primary key's sparse index fully into memory, so unlike ORDER BY
+// it should stay short — just the columns callers actually filter/join on
+// (the event's leading indexed args), not the full ORDER BY tuple.
 func eventPrimaryKey(ev eventSpec) string {
-	parts := make([]string, 0, 5)
+	parts := eventKeyColumns(ev)
+	if len(parts) == 0 {
+		return "block_number, transaction_index, log_index"
+	}
+	return strings.Join(parts, ", ")
+}
+
+func eventKeyColumns(ev eventSpec) []string {
+	parts := make([]string, 0, 2)
 	for i := 0; i < len(ev.Args) && i < 2; i++ {
 		parts = append(parts, quoteSQLIdent(ev.Args[i].ColumnName))
 	}
-	parts = append(parts, "block_number", "transaction_index", "log_index")
-	return strings.Join(parts, ", ")
+	return parts
 }
 
 func generateViewsSQL(cfg *config.Config, events []eventSpec) string {

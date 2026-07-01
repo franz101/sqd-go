@@ -12,13 +12,24 @@ import (
 	"github.com/ClickHouse/ch-go"
 )
 
-// CompactionPruneState removes superseded rows from hot-state tables. For each
-// table with a primary key, it deletes rows whose block_number is below a
-// rolling threshold (blockNumber - 1000) and that are not the latest version of
-// their primary-key group. This keeps ClickHouse tables bounded during long
-// backfill runs while preserving the most recent state for each entity.
-func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) error {
+// CompactionPruneState bounds hot-state ("_log") tables during long backfills
+// while retaining a block-bucketed history for downstream time-series work
+// (e.g. points accrual). retainInterval is the snapshot granularity: for each
+// primary key it keeps ONE row per intDiv(block_number, retainInterval) bucket
+// (the latest write in the bucket) and deletes the intra-bucket redundant rows.
+// The paired "_live" view still resolves to a single current row per key via
+// LIMIT 1 BY, so callers wanting current state never see the retained history.
+//
+// PRIMARY KEY is the pk/sk only; block_number/transaction_index/log_index live
+// exclusively in ORDER BY and here in the bucket/keep-set expressions — never in
+// the key — so a bucket's "latest" is well-defined by (block, tx, log) order.
+func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64, retainInterval uint64) error {
 	if store == nil {
+		return nil
+	}
+	// retainInterval == 0 means "no bucket size configured" — disable pruning
+	// rather than risk intDiv-by-zero in ClickHouse.
+	if retainInterval == 0 {
 		return nil
 	}
 	// Prefer a dedicated prune connection over the consumer's hot Conn so this
@@ -38,41 +49,33 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 	if blockNumber <= 1000 {
 		return nil
 	}
+	// Never prune within 1000 blocks of the sync head: this margin is far past
+	// EVM finality (~2 epochs), so the pruned region is always finalized and a
+	// reorg (which only rolls back block_number > lastBlock) can never touch it.
+	// This is the "never prune above finalized head" guarantee.
 	pruneThreshold := blockNumber - 1000
-	// Only re-collapse primary keys touched since the last prune (block_number >
-	// activeLower). BOTH subqueries — the active-key set "(pk) IN (...)" and the
-	// keep-set "(pk,version) NOT IN (...)" — use "ORDER BY pk [,version DESC] LIMIT 1
-	// BY pk", which streams one row per key in primary-key order (the table is sorted
-	// by (pk..., block_number, ...)), so memory is O(active keys), not O(all keys).
-	// CRITICAL: the active-key set must NOT use "GROUP BY pk". GROUP BY builds an
-	// AggregatingTransform hash table over the whole window in one shot, and mutations
-	// (lightweight DELETE = UPDATE _row_exists) IGNORE max_bytes_before_external_group_by,
-	// so it cannot spill — a 1M-block window of memory_user_positions OOM'd ClickHouse
-	// at 70+ GiB (Code 241, AggregatingTransform) and crash-looped the prune. LIMIT 1 BY
-	// over the PK-sorted read stream gives the same distinct keys with O(1) per-group
-	// memory and no aggregation. The sources are bounded on
-	// BOTH ends: block_number > activeLower (the caller clamps this to blockNumber -
-	// pruneInterval, so the lower bound is a recent window) AND block_number <=
-	// blockNumber. The upper bound is essential: without it, a run whose current
-	// block is far below the table's max block (e.g. a --reindex-from re-applied over
-	// a table that still holds higher-block rows from a prior run) would aggregate
-	// every key from activeLower up to the table's true max in one mutation — 100M+
-	// keys — and OOM ClickHouse (mutations ignore the spill SETTINGS). Bounding the
-	// keep-set to [activeLower, blockNumber] is safe: the DELETE only removes rows
-	// with block_number < threshold (< blockNumber), so any row above blockNumber is
-	// never a deletion candidate and never needs protecting by the keep-set; within
-	// the window, block numbers are monotonic per key, so LIMIT 1 BY still picks each
-	// active key's latest in-window version. Older versions of active keys are still
-	// deleted (the DELETE range is block_number < threshold, not just the window);
-	// keys NOT touched since the last prune were already reduced to their latest by an
-	// earlier prune, so nothing leaks.
+	// The prune only touches the current window (activeLower, blockNumber]:
+	//   - active-key set "(pk) IN (...)": keys written since the last prune, via
+	//     "ORDER BY pk LIMIT 1 BY pk" over the PK-sorted read stream (O(1) memory
+	//     per key — NOT "GROUP BY pk", which builds an AggregatingTransform hash
+	//     over the whole window and, because mutations ignore
+	//     max_bytes_before_external_group_by, cannot spill and OOM'd ClickHouse at
+	//     70+ GiB on a 1M-block window).
+	//   - keep-set "(pk,block,tx,log) NOT IN (...)": the latest row per
+	//     (pk, bucket) in the window, via "LIMIT 1 BY pk, intDiv(block, N)". Rows
+	//     in earlier windows (block <= activeLower) were already compacted to one
+	//     row per bucket by prior prunes, so the DELETE is lower-bounded to
+	//     block_number > activeLower and never re-touches — or erases — them.
+	// Both subqueries are bounded on BOTH ends (activeLower < block <= blockNumber);
+	// the caller clamps activeLower to blockNumber - pruneInterval so the window is
+	// at most one interval wide and memory is O(active keys × buckets-per-window).
 	activeLower := lowerBlock
 
 	queries := []string{
 {{- range .Tables}}
 {{- if gt (len .PrimaryKey) 0}}
-		// {{.Name}} (pk: {{join .PrimaryKey ", "}})
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number < %[2]d AND ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}} LIMIT 1 BY {{join .PrimaryKey ", "}}) AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}}, block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY {{join .PrimaryKey ", "}}) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber),
+		// {{.Name}} (pk: {{join .PrimaryKey ", "}}) — keep one row per (pk, intDiv(block_number, retainInterval)) bucket
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number < %[2]d AND ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}} LIMIT 1 BY {{join .PrimaryKey ", "}}) AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}}, intDiv(block_number, %[5]d), block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY {{join .PrimaryKey ", "}}, intDiv(block_number, %[5]d)) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber, retainInterval),
 		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60{{.Name}}\x60 FINAL", db),
 {{- end}}
 {{- end}}
@@ -84,13 +87,13 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 			return fmt.Errorf("compaction prune error executing query: %w", err)
 		}
 	}
-	log.Printf("[AUTOMATED COMPACTION] ClickHouse tables pruned and optimized in %s", time.Since(start).Round(time.Millisecond))
+	log.Printf("[AUTOMATED COMPACTION] ClickHouse tables pruned and optimized in %s (retain interval %d blocks)", time.Since(start).Round(time.Millisecond), retainInterval)
 	return nil
 }
 {{else}}
 import "context"
 
-func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) error {
+func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64, retainInterval uint64) error {
 	return nil
 }
 {{end}}

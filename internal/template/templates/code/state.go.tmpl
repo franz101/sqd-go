@@ -221,14 +221,14 @@ func (s *State) CommitInFlight() bool {
 // captured by value for the goroutine, so the caller's state can keep
 // advancing while the prune runs. Returns false (no-op) if a prune is already
 // in flight; the caller should not advance LastPruneBlock in that case.
-func (s *State) StartPrune(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) bool {
+func (s *State) StartPrune(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64, retainInterval uint64) bool {
 	if s == nil || store == nil || s.pruneDone != nil {
 		return false
 	}
 	done := make(chan statePruneResult, 1)
 	s.pruneDone = done
 	go func() {
-		done <- statePruneResult{block: blockNumber, err: CompactionPruneState(ctx, store, lowerBlock, blockNumber)}
+		done <- statePruneResult{block: blockNumber, err: CompactionPruneState(ctx, store, lowerBlock, blockNumber, retainInterval)}
 	}()
 	return true
 }

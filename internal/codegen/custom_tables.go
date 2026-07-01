@@ -40,12 +40,12 @@ type customFieldSpec struct {
 	Default    string
 }
 
-func loadCustomTableSpecs(root string) ([]customTableSpec, error) {
+func loadCustomTableSpecs(root string, cfg *config.Config) ([]customTableSpec, error) {
 	path := filepath.Join(root, "custom_types.go")
-	return loadCustomTableSpecsFromFile(path)
+	return loadCustomTableSpecsFromFile(path, cfg)
 }
 
-func loadCustomSchemaSpecs(root string, configDir string) ([]customTableSpec, error) {
+func loadCustomSchemaSpecs(root string, configDir string, cfg *config.Config) ([]customTableSpec, error) {
 	paths := []string{
 		filepath.Join(root, "custom_schema.go"),
 		filepath.Join(root, "generated", "custom_schema.go"),
@@ -67,13 +67,13 @@ func loadCustomSchemaSpecs(root string, configDir string) ([]customTableSpec, er
 	}
 	for _, path := range uniquePaths {
 		if _, err := os.Stat(path); err == nil {
-			return loadCustomTableSpecsFromFile(path)
+			return loadCustomTableSpecsFromFile(path, cfg)
 		}
 	}
 	return nil, nil
 }
 
-func loadCustomTableSpecsFromFile(path string) ([]customTableSpec, error) {
+func loadCustomTableSpecsFromFile(path string, cfg *config.Config) ([]customTableSpec, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -128,7 +128,7 @@ func loadCustomTableSpecsFromFile(path string) ([]customTableSpec, error) {
 			if len(table.Columns) == 0 {
 				return nil, fmt.Errorf("%s: custom table requires at least one field", typeSpec.Name.Name)
 			}
-			table.resolvePrimaryKey(typeSpec.Name.Name)
+			table.resolvePrimaryKey(typeSpec.Name.Name, cfg)
 			table.OrderBy = finalCustomOrderBy(table.PrimaryKey)
 			for _, column := range table.PrimaryKey {
 				if _, ok := table.fieldByColumn(column); !ok {
@@ -143,8 +143,14 @@ func loadCustomTableSpecsFromFile(path string) ([]customTableSpec, error) {
 
 func customTableFromType(gen *ast.GenDecl, typeSpec *ast.TypeSpec) (customTableSpec, error) {
 	table := customTableSpec{
+		// Name is the physical storage table, suffixed "_log": every commit appends
+		// a new row (keyed by pk + block_number/transaction_index/log_index), so it's
+		// an append-only history, not a snapshot. Plain MergeTree — no engine-level
+		// dedup is implied or needed. generateCustomSchemaSQL also emits a "_live"
+		// VIEW alongside it that resolves to one row per primary key (latest write
+		// wins), for callers that want current state without querying history.
 		Name:          customTableName(typeSpec.Name.Name),
-		Engine:        "ReplacingMergeTree(block_number)",
+		Engine:        "MergeTree()",
 		GoTypeName:    customTableEntityName(typeSpec.Name.Name),
 		PrimaryKeySet: false,
 	}
@@ -259,8 +265,30 @@ func generateCustomSchemaSQL(cfg *config.Config, tables []customTableSpec) strin
 		}
 		b.WriteString(template.MustExecute("sql/createCustomTable", tmpl))
 		b.WriteString(";\n")
+
+		// "_live" view: the "_log" table (table.Name) is an append-only history —
+		// one row per commit — so pair it with a view resolving to one row per
+		// primary key (latest write wins by block_number/transaction_index/log_index)
+		// for callers that want current state without querying/deduping history
+		// themselves.
+		liveName := strings.TrimSuffix(table.Name, "_log") + "_live"
+		b.WriteString("\n")
+		b.WriteString(template.MustExecute("sql/createCustomTableLiveView", customTableViewTmplData{
+			DatabaseIdent: db,
+			ViewIdent:     quoteSQLIdent(liveName),
+			TableIdent:    quoteSQLIdent(table.Name),
+			PrimaryKey:    strings.Join(quoteEach(table.PrimaryKey), ", "),
+		}))
+		b.WriteString(";\n")
 	}
 	return b.String()
+}
+
+type customTableViewTmplData struct {
+	DatabaseIdent string
+	ViewIdent     string
+	TableIdent    string
+	PrimaryKey    string
 }
 
 func splitCSV(raw string) []string {
@@ -335,20 +363,50 @@ func (t customTableSpec) keyFields() []customFieldSpec {
 }
 
 func findStateCustomTableSpec(tables []customTableSpec, state config.StateConfig) (customTableSpec, bool) {
-	source := strings.TrimSpace(state.SourceTable)
-	name := strings.TrimSpace(state.Name)
 	for _, table := range tables {
-		if source != "" && (strings.EqualFold(source, table.Name) || strings.EqualFold(source, table.GoTypeName)) {
+		if stateMatchesTable(state, table) {
 			return table, true
-		}
-		if name != "" {
-			base := strings.TrimPrefix(table.GoTypeName, "Memory")
-			if strings.EqualFold(name, table.Name) || strings.EqualFold(name, table.GoTypeName) || strings.EqualFold(name, base) {
-				return table, true
-			}
 		}
 	}
 	return customTableSpec{}, false
+}
+
+// stateMatchesTable reports whether a config.yaml "state:" entry refers to
+// this custom table, by source_table/name matching the table's physical
+// name, its unsuffixed base name (config.yaml references the logical name,
+// e.g. "memory_holdings", never the "_log"-suffixed physical storage table),
+// or its Go type name (optionally with a "Memory" prefix stripped).
+func stateMatchesTable(state config.StateConfig, table customTableSpec) bool {
+	base := strings.TrimSuffix(table.Name, "_log")
+	source := strings.TrimSpace(state.SourceTable)
+	if source != "" && (strings.EqualFold(source, table.Name) || strings.EqualFold(source, base) || strings.EqualFold(source, table.GoTypeName)) {
+		return true
+	}
+	name := strings.TrimSpace(state.Name)
+	if name == "" {
+		return false
+	}
+	goBase := strings.TrimPrefix(table.GoTypeName, "Memory")
+	return strings.EqualFold(name, table.Name) || strings.EqualFold(name, base) || strings.EqualFold(name, table.GoTypeName) || strings.EqualFold(name, goBase)
+}
+
+// configStatePrimaryKey looks up a matching config.yaml "state:" entry for
+// this custom table and returns its key columns, if any — this is the
+// "config" primary-key source, checked after the "// pk:" comment and before
+// falling back to an "ID" field or the first field.
+func configStatePrimaryKey(cfg *config.Config, table customTableSpec) []string {
+	if cfg == nil {
+		return nil
+	}
+	for _, state := range cfg.State {
+		if len(state.Key) == 0 {
+			continue
+		}
+		if stateMatchesTable(state, table) {
+			return state.Key
+		}
+	}
+	return nil
 }
 
 func (t *customTableSpec) addRequiredBlockFields() {
@@ -365,17 +423,34 @@ func (t *customTableSpec) addRequiredBlockFields() {
 	}
 }
 
+// customTableName returns the PHYSICAL storage table name for a custom-schema
+// type — always "_log"-suffixed (see customTableFromType). customTableBaseName
+// returns the same name without the suffix, used to derive the paired "_live"
+// view's name.
 func customTableName(typeName string) string {
+	return customTableBaseName(typeName) + "_log"
+}
+
+func customTableBaseName(typeName string) string {
 	return toSnake(pluralizeGoName(customTableEntityName(typeName)))
 }
 
-func (t *customTableSpec) resolvePrimaryKey(typeName string) {
+// resolvePrimaryKey picks the primary key in priority order: the "// pk:"
+// comment on the struct, then a matching "state:" entry's key in config.yaml
+// (see findStateCustomTableSpec, which matches the same entries by name for
+// prefetch wiring), then a field named "ID", then the first non-block field.
+func (t *customTableSpec) resolvePrimaryKey(typeName string, cfg *config.Config) {
 	if t.PrimaryKeySet {
 		t.PrimaryKey = t.normalizePrimaryKey(t.PrimaryKey)
 		return
 	}
+	if key := configStatePrimaryKey(cfg, *t); len(key) > 0 {
+		t.PrimaryKey = t.normalizePrimaryKey(key)
+		t.PrimaryKeySet = true
+		return
+	}
 	t.PrimaryKey = inferCustomPrimaryKey(t.Fields)
-	fmt.Fprintf(os.Stderr, "warning: %s has no pk comment; inferred primary key %s\n", typeName, strings.Join(t.PrimaryKey, ", "))
+	fmt.Fprintf(os.Stderr, "warning: %s has no pk comment or config state key; inferred primary key %s\n", typeName, strings.Join(t.PrimaryKey, ", "))
 }
 
 func (t customTableSpec) normalizePrimaryKey(primaryKey []string) []string {
