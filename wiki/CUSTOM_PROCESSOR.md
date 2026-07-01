@@ -153,7 +153,7 @@ The entity state handle (`entityStateHandle[T]`) wraps the hot state map and pro
 
 **Reading existing state from ClickHouse (prefetch):**
 
-The prefetch system automatically queries ClickHouse for entity state matching keys in the current block's events. For example, if a block contains `Transfer(user=0xABC, token=0xDEF)`, the prefetch query loads the existing `user_positions` row for `(0xABC, 0xDEF)` before `CustomProcessFn` runs. This means you can always assume the latest state is loaded.
+The prefetch system automatically queries ClickHouse for entity state matching keys in the current block's events. For example, if a block contains `Transfer(user=0xABC, token=0xDEF)`, the prefetch query loads the latest existing `user_positions_log` row for `(0xABC, 0xDEF)` before `CustomProcessFn` runs. This means you can always assume the latest state is loaded.
 
 ### Snapshots and Fork Recovery
 
@@ -171,8 +171,8 @@ This avoids re-fetching from the network — the ring buffer holds the last N bl
 At snapshot intervals, `State.Commit()` flushes all dirty entities to ClickHouse:
 
 ```go
-// Generated per-entity INSERT:
-INSERT INTO <db>.user_positions (user, token_id, amount, ...) VALUES
+// Generated per-entity INSERT (appends to the _log history table):
+INSERT INTO <db>.user_positions_log (user, token_id, amount, ...) VALUES
 // Uses ClickHouse native protocol (ch-go) with async inserts
 ```
 

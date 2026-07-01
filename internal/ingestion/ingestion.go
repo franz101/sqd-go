@@ -1581,8 +1581,16 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// Clean completion (backfill): force a durable commit of the tail (the blocks
 	// processed since the last periodic commit) and advance the checkpoint to it,
 	// so nothing processed is lost on a clean exit. Crash/cancel paths intentionally
-	// skip this — they resume from the last durable checkpoint and re-fetch the gap.
-	if !cursorMode && flusher != nil && lastCheckpoint > 0 {
+	// skip this — they `return` from the ctx.Done()/producer-error branches above
+	// without reaching here, so by this point the exit is already known to be a
+	// clean producerDone break; they resume from the last durable checkpoint and
+	// re-fetch the gap. cursorMode does NOT indicate a crash/cancel — the default
+	// `sqd-go start` path runs with cursorMode=true even for a bounded --end-block
+	// backfill, so gating on !cursorMode silently dropped this flush for the common
+	// case: the periodic commit cadence (SQD_COMMIT_INTERVAL blocks / 3s) can leave
+	// up to one interval's worth of derived state uncommitted at the configured end
+	// block, with no later run to pick up the slack.
+	if flusher != nil && lastCheckpoint > 0 {
 		committed, err := flusher.Flush(ctx, store, lastCheckpoint)
 		if err != nil {
 			return fmt.Errorf("final flush at %d: %w", lastCheckpoint, err)

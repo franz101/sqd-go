@@ -1,46 +1,78 @@
 {{define "createBlocksTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.blocks (
-    chain_id UInt64, block_number UInt64,
-    block_timestamp DateTime64(3, 'UTC'), block_hash String,
-    {{if .Collapsing}}sign Int8 DEFAULT 1,{{end}}
+    chain_id UInt64,
+    block_number UInt64,
+    block_timestamp DateTime64(3, 'UTC'),
+    block_hash String,
+    {{- if .Collapsing}}
+    sign Int8 DEFAULT 1,
+    {{- end}}
     inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
-) ENGINE = {{.Engine}} ORDER BY (chain_id, block_number)
+) ENGINE = {{.Engine}}
+ORDER BY (chain_id, block_number)
 {{end}}
 
 {{define "createLogsTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.logs (
-    chain_id UInt64, block_number UInt64,
-    block_timestamp DateTime64(3, 'UTC'), block_hash String,
-    transaction_hash FixedString(32), transaction_index UInt64, log_index UInt64,
-    address FixedString(20), event_name LowCardinality(String),
-    topic0 FixedString(32), params String,
-    {{if .Collapsing}}sign Int8 DEFAULT 1,{{end}}
+    chain_id UInt64,
+    block_number UInt64,
+    block_timestamp DateTime64(3, 'UTC'),
+    block_hash String,
+    transaction_hash FixedString(32),
+    transaction_index UInt64,
+    log_index UInt64,
+    address FixedString(20),
+    event_name LowCardinality(String),
+    topic0 FixedString(32),
+    params String,
+    {{- if .Collapsing}}
+    sign Int8 DEFAULT 1,
+    {{- end}}
     inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
-) ENGINE = {{.Engine}} ORDER BY (chain_id, block_number, transaction_index, log_index)
+) ENGINE = {{.Engine}}
+ORDER BY (chain_id, block_number, transaction_index, log_index)
 {{end}}
 
 {{define "createSyncStateTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.sync_state (
-    chain_id UInt64, last_block UInt64, last_hash String,
-    finalized_block UInt64, finalized_hash String,
+    chain_id UInt64,
+    last_block UInt64,
+    last_hash String,
+    finalized_block UInt64,
+    finalized_hash String,
     rollback_chain String,
     updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
-) ENGINE = MergeTree() ORDER BY (chain_id, updated_at)
+) ENGINE = MergeTree()
+ORDER BY (chain_id, updated_at)
 {{end}}
 
 {{define "createEventTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.{{.TableIdent}} (
-    {{if .IncludeChainID}}chain_id UInt64,{{end}}
-    block_number UInt64, block_timestamp DateTime64(3, 'UTC'),
-    {{if .IncludeBlockHash}}block_hash FixedString(32),{{end}}
-    {{if .IncludeContractAddress}}contract_address FixedString(20),{{end}}
-    {{if .IncludeTransactionHash}}transaction_hash FixedString(32),{{end}}
-    transaction_index UInt64, log_index UInt64
-    {{- range .Columns}}, {{.ColumnIdent}} {{.ClickHouseType}}{{end}}
-    {{if .Collapsing}}, sign Int8 DEFAULT 1{{end}}
+    {{- if .IncludeChainID}}
+    chain_id UInt64,
+    {{- end}}
+    block_number UInt64,
+    block_timestamp DateTime64(3, 'UTC'),
+    {{- if .IncludeBlockHash}}
+    block_hash FixedString(32),
+    {{- end}}
+    {{- if .IncludeContractAddress}}
+    contract_address FixedString(20),
+    {{- end}}
+    {{- if .IncludeTransactionHash}}
+    transaction_hash FixedString(32),
+    {{- end}}
+    transaction_index UInt64,
+    log_index UInt64
+    {{- range .Columns}},
+    {{.ColumnIdent}} {{.ClickHouseType}}
+    {{- end}}
+    {{- if .Collapsing}},
+    sign Int8 DEFAULT 1
+    {{- end}}
 ) ENGINE = {{.Engine}}
 ORDER BY ({{.Key}})
-PRIMARY KEY ({{.Key}})
+PRIMARY KEY ({{.PrimaryKey}})
 {{end}}
 
 {{define "createERC20AddressPositionsTable"}}CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.erc20_address_positions (
@@ -125,3 +157,9 @@ CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.{{.TableIdent}} (
 ) ENGINE = {{.Engine}}
 PRIMARY KEY ({{.PrimaryKey}})
 ORDER BY ({{.OrderBy}}){{end}}
+
+{{define "createCustomTableLiveView"}}
+CREATE VIEW IF NOT EXISTS {{.DatabaseIdent}}.{{.ViewIdent}} AS
+SELECT * FROM {{.DatabaseIdent}}.{{.TableIdent}}
+ORDER BY {{.PrimaryKey}}, block_number DESC, transaction_index DESC, log_index DESC
+LIMIT 1 BY {{.PrimaryKey}}{{end}}

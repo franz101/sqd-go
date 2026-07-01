@@ -50,7 +50,7 @@ chains:
 	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `erc20_project`.`token_transfer_events`")
 	assertContains(t, schema, "`from` FixedString(20)")
 	assertContains(t, schema, "`value` UInt256")
-	assertContains(t, schema, "PRIMARY KEY (`from`, `to`, block_number, transaction_index, log_index)")
+	assertContains(t, schema, "PRIMARY KEY (`from`, `to`)")
 
 	views := readText(t, filepath.Join(root, ".sqd", "generated", "views.sql"))
 	assertContains(t, views, "CREATE VIEW `erc20_project`.`token_transfer` AS")
@@ -199,7 +199,7 @@ type MemoryMarketSchema struct {
 
 	schema := readText(t, filepath.Join(root, ".sqd", "generated", "schema.sql"))
 	assertContains(t, schema, "-- Custom tables generated from custom schema definitions.")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `market_fixture`.`memory_holdings`")
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `market_fixture`.`memory_holdings_log`")
 	assertContains(t, schema, "`amount` Decimal(38, 18)")
 	assertContains(t, schema, "`updated_at` DateTime64(3, 'UTC')")
 	assertContains(t, schema, "`block_number` UInt64")
@@ -207,7 +207,8 @@ type MemoryMarketSchema struct {
 	assertContains(t, schema, "`log_index` UInt64")
 	assertContains(t, schema, "PRIMARY KEY (`account`, `asset_id`)")
 	assertContains(t, schema, "ORDER BY (`account`, `asset_id`, `block_number`, `transaction_index`, `log_index`);")
-	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `market_fixture`.`memory_markets`")
+	assertContains(t, schema, "CREATE VIEW IF NOT EXISTS `market_fixture`.`memory_holdings_live`")
+	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `market_fixture`.`memory_markets_log`")
 	assertContains(t, schema, "`question_ids` Array(FixedString(32))")
 	assertContains(t, schema, "PRIMARY KEY (`id`)")
 	assertContains(t, schema, "ORDER BY (`id`, `block_number`, `transaction_index`, `log_index`);")
@@ -287,7 +288,7 @@ chains:
 	assertNotContains(t, schema, "sign Int8")
 	assertContains(t, schema, ") ENGINE = MergeTree()")
 	assertContains(t, schema, "CREATE TABLE IF NOT EXISTS `hot_lbtc`.`lbtc_transfer_events`")
-	assertContains(t, schema, "PRIMARY KEY (`from`, `to`, block_number, transaction_index, log_index)")
+	assertContains(t, schema, "PRIMARY KEY (`from`, `to`)")
 
 	views := readText(t, filepath.Join(root, ".sqd", "generated", "views.sql"))
 	assertNotContains(t, views, "FINAL")
@@ -512,8 +513,8 @@ type DummyStateSchema struct {
 	// Verify custom_schema.sql is generated in BOTH .sqd/generated and generated/ under project root (configDir)
 	schemaSQL1 := readText(t, filepath.Join(configDir, ".sqd", "generated", "custom_schema.sql"))
 	schemaSQL2 := readText(t, filepath.Join(configDir, "generated", "custom_schema.sql"))
-	assertContains(t, schemaSQL1, "CREATE TABLE IF NOT EXISTS `test_custom_paths`.`dummy_states`")
-	assertContains(t, schemaSQL2, "CREATE TABLE IF NOT EXISTS `test_custom_paths`.`dummy_states`")
+	assertContains(t, schemaSQL1, "CREATE TABLE IF NOT EXISTS `test_custom_paths`.`dummy_states_log`")
+	assertContains(t, schemaSQL2, "CREATE TABLE IF NOT EXISTS `test_custom_paths`.`dummy_states_log`")
 
 	// Verify that the custom_processor.go next to the config is not modified
 	procContent, err := os.ReadFile(filepath.Join(configDir, "custom_processor.go"))
@@ -659,6 +660,12 @@ CREATE TABLE IF NOT EXISTS ` + "`test_golden`" + `.` + "`positions`" + ` (
 ) ENGINE = ReplacingMergeTree(block_number)
 PRIMARY KEY (` + "`account`" + `, ` + "`token`" + `)
 ORDER BY (` + "`account`" + `, ` + "`token`" + `, ` + "`block_number`" + `, ` + "`transaction_index`" + `, ` + "`log_index`" + `);
+
+
+CREATE VIEW IF NOT EXISTS ` + "`test_golden`" + `.` + "`positions_live`" + ` AS
+SELECT * FROM ` + "`test_golden`" + `.` + "`positions`" + `
+ORDER BY ` + "`account`" + `, ` + "`token`" + `, block_number DESC, transaction_index DESC, log_index DESC
+LIMIT 1 BY ` + "`account`" + `, ` + "`token`" + `;
 `
 
 	if got != want {

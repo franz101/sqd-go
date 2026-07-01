@@ -261,8 +261,11 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 		// Runs off the consumer's hot path on a dedicated connection (see
 		// State.StartPrune / database.Store.PruneConn) so a multi-minute OPTIMIZE
 		// TABLE ... FINAL no longer stalls block processing. Errors surface on a
-		// later PollPrune call, same as async commit errors above.
-		state.StartPrune(ctx, store, activeLower, state.LastSyncBlock)
+		// later PollPrune call, same as async commit errors above. pruneInterval
+		// doubles as the retain interval: the prune keeps one snapshot row per
+		// (pk, intDiv(block_number, pruneInterval)) bucket (see CompactionPruneState),
+		// so CLICKHOUSE_PRUNE_INTERVAL is the block-bucket snapshot granularity.
+		state.StartPrune(ctx, store, activeLower, state.LastSyncBlock, pruneInterval)
 	}
 
 	blocksElapsed := blockNumber >= state.LastSyncBlock+maxBlocks
