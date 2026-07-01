@@ -241,6 +241,26 @@ SQD HTTP → zstd JSONL → Parse → Decode Transfer events
 - **Decimal Precision** - Improved decimal handling for financial calculations using `protomath.Decimal256`
 - **Type Safety** - Enhanced type checking for schema definitions to prevent runtime errors
 
+## Recent Enhancements (2026)
+
+### Improved State Management
+
+- **Bounded Pruning** - State pruning now uses windowed operations to prevent ClickHouse OOM during mutations
+- **Disk Spillover** - Large aggregation operations can temporarily spill to disk for memory management
+- **Better Recovery** - Provisional checkpoint persistence at reindex floor enables safer recovery after failures
+
+### Performance Optimizations
+
+- **Zero-Allocation Paths** - Hot state operations are verified zero-allocation for maximum throughput
+- **CLOCK Cache** - Improved cache eviction policies for better hit rates on hot entities
+- **Snapshot Optimization** - Reduced memory footprint during snapshot operations
+
+### Enhanced Error Handling
+
+- **Collateral Validation** - For Polymarket processors, automatic collateral validation prevents scaling errors
+- **Decimal Precision** - Improved decimal handling for financial calculations using `protomath.Decimal256`
+- **Type Safety** - Enhanced type checking for schema definitions to prevent runtime errors
+
 ## Extending to Full PnL
 
 For real PnL (realized profit/loss with average cost tracking), add `AvgPrice`, `RealizedPnL`, and `TotalBought` fields to the schema and implement weighted-average cost basis:
