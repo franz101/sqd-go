@@ -71,6 +71,22 @@ func TestParseArgsStartNoResume(t *testing.T) {
 	}
 }
 
+func TestParseArgsFgprofile(t *testing.T) {
+	p, err := parseArgs([]string{"start", "examples/sample_project", "--fgprofile", "wall.pprof"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.fgprofile != "wall.pprof" {
+		t.Fatalf("fgprofile = %q, want wall.pprof", p.fgprofile)
+	}
+}
+
+func TestParseArgsFgprofileMissingValue(t *testing.T) {
+	if _, err := parseArgs([]string{"start", "examples/sample_project", "--fgprofile"}); err == nil {
+		t.Fatal("expected error for --fgprofile with no value")
+	}
+}
+
 func TestExtractEventsFromABIFormattedJSON(t *testing.T) {
 	got, err := extractEventsFromABI([]byte(erc20ABI))
 	if err != nil {

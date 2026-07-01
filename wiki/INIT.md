@@ -6,7 +6,7 @@ The `init` command family creates new sqd-go indexer projects. Three modes are a
 2. **Contract import** — `sqd-go init contract-import local --abi <file> --name <name>`
 3. **Template** — `sqd-go init template [erc20] [path]`
 
-All modes produce the same output structure: a project directory containing `config.yaml`, `.env`, `compose.yml`, and optionally an `abis/` folder.
+All modes produce the same output structure: a project directory containing `config.yaml`, `.env`, `compose.yml`, `custom_schema.go`, `custom_processor.go`, and optionally an `abis/` folder.
 
 ## Interactive Init (`sqd-go` / `sqd-go init`)
 
@@ -26,6 +26,8 @@ Output:
   config.yaml       # generated from inputs
   .env              # ClickHouse connection defaults
   compose.yml       # Docker Compose for local ClickHouse
+  custom_schema.go  # derived-state schema
+  custom_processor.go # typed event processor and registration
   abis/             # ABI JSON copy (if ABI source)
 ```
 
@@ -56,26 +58,28 @@ Scaffolds a pre-configured ERC20 indexer with USDC (`0xA0b86991c6218b36c1d19D4a2
 
 Flags: `--name`, `--blockchain`, `--start-block`, `--address` work the same as contract-import.
 
-## Intermediate Init (`sqd-go init <path>`)
+## State scaffolding performed by init
 
-For projects that already have a `config.yaml` but need the custom processor scaffolding. This command:
+After writing `config.yaml`, every init mode:
 
 1. Loads the project config from `<path>`
-2. Finds the Go module (`go.mod` walking up the directory tree)
+2. Uses an enclosing Go module when present, or a standalone module-relative import otherwise
 3. Determines the import path for the `generated/` package
-4. Writes `custom_schema.go` — a user-editable struct definition file with a `UserPositionSchema` example
-5. Writes `custom_processor.go` — a user-editable processor file wired into the CLI via `init()` registration
-6. Runs `codegen` to produce the `generated/` package (events, state, hotstate, compaction, etc.)
+4. Renders `custom_schema.go` from the config (a working address-position schema for ERC-20 Transfer; a generic state schema otherwise)
+5. Renders `custom_processor.go` with config-derived generated event and field names
+
+The generated package itself is produced by `sqd-go codegen <path>` or automatically by
+`sqd-go start <path> --state`.
 
 The generated `custom_processor.go` contains:
 
 ```go
-package <project>
+package <project> // SAME package name as custom_schema.go
 
 import (
     generated "<module>/<project>/generated"
-    "github.com/franz101/sqd-go/internal/cli"
-    "github.com/franz101/sqd-go/internal/ingestion"
+
+    "github.com/franz101/sqd-go/sqd" // PUBLIC facade — never import internal/
 )
 
 func Process(state *generated.State, block *generated.ParsedBlock) error {
@@ -91,17 +95,22 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
     return nil
 }
 
+func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) error {
+    return Process(state, block.ToParsedBlock())
+}
+
 func init() {
     generated.CustomProcessFn = Process
-    cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-        return generated.NewProcessor(cli.GetProtoMode())
+    generated.CustomProcessProtoFn = ProcessProto
+    sqd.RegisterProcessor(generated.ProjectName, func() (sqd.Processor, error) {
+        return generated.NewProcessor(sqd.GetProtoMode())
     })
 }
 ```
 
-The `init()` function registers the custom processor so the CLI's `runStartPipeline` can look it up via `processorForProject(projectName)`. When the ingestion pipeline runs, it calls `Processor.Process()` which decodes logs, fills the event ring buffer, and calls `CustomProcessFn` (i.e., your `Process` function) for each block.
+Because each project compiles as its own Go module, the scaffolded processor imports the public `sqd` facade rather than any `internal/` package — Go forbids importing another module's `internal/` packages, so this is what lets the project build standalone. The `init()` function registers the custom processor so the CLI's `runStartPipeline` can look it up via `processorForProject(projectName)`. Registering under `generated.ProjectName` (rather than a hardcoded string) keeps the registration name in sync with your config. The generated `ProcessProto` bridge keeps the same business logic in the default proto decoder; it can be replaced with direct proto-view iteration later.
 
-**Special case: `uniswap_pnl`** — if the package name is `uniswap_pnl`, a richer template is emitted with Transfer event handling (sender/receiver balance tracking using `uint256.Int` arithmetic).
+ERC-20 `Transfer(address,address,uint256)` projects receive a working address-position example. Other ABIs receive a compiling type switch for the first configured event. Both paths derive generated Go names and fields from `config.yaml`; directory and project names do not select behavior.
 
 ## Init: Config Path (`sqd-go init:<config-path>`)
 
@@ -116,6 +125,30 @@ The `extractEventsFromABI()` function in `internal/cli/init.go` parses the ABI J
 3. Returns the canonical signature strings
 
 These become the `event:` values in `config.yaml`'s `events` list.
+
+## Recent Improvements (2026)
+
+### Enhanced State Scaffolding
+
+The init command now generates more sophisticated state scaffolding:
+
+- **ERC20 Transfer Example** - Working address-position tracking with proper decimal handling
+- **Generic Schema** - For non-ERC20 contracts, a generic state schema is provided
+- **Processor Registration** - Automatic registration with proper public facade imports
+
+### Better Error Messages
+
+Init now provides clearer error messages:
+- `no events found in ABI` - When the ABI contains no events (common for router/library contracts)
+- `config.yaml already exists` - Prevents accidental overwrites
+- `invalid contract address` - Validates address format (42-char hex)
+
+### Module Handling
+
+Improved Go module handling:
+- Auto-detects existing Go modules
+- Generates proper module-relative imports
+- Ensures public facade usage (`sqd` package) instead of internal imports
 
 ## Scaffold Support Files
 

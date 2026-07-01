@@ -48,7 +48,7 @@ func New{{.KeyType}}(value {{.GoTypeName}}) {{.KeyType}} {
 	resolveAsyncEnabled bool
 	resolveInProgress   bool
 	resolveDone         chan resolveResult
-	resolveConn         *ch.Client
+	resolveConns        []*ch.Client
 	resolveDB           string
 	resolveCtx          context.Context
 	resolveCancel       context.CancelFunc
@@ -189,8 +189,8 @@ type resolveResult struct {
 	err error
 }
 
-func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, db string) bool {
-	if s == nil || conn == nil || !s.resolveAsyncEnabled {
+func (s *HotState) StartResolveAllPending(ctx context.Context, conns []*ch.Client, db string) bool {
+	if s == nil || len(conns) == 0 || !s.resolveAsyncEnabled {
 		return false
 	}
 	if s == nil || s.resolveInProgress {
@@ -207,7 +207,7 @@ func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, 
 	}
 	s.mu.Lock()
 	s.resolveInProgress = true
-	s.resolveConn = conn
+	s.resolveConns = conns
 	s.resolveDB = db
 	s.resolveCtx, s.resolveCancel = context.WithCancel(ctx)
 	s.mu.Unlock()
@@ -220,7 +220,7 @@ func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, 
 				s.resolveDone <- resolveResult{err: fmt.Errorf("resolve panic: %v", r)}
 			}
 		}()
-		err := s.resolveAllParallel(s.resolveCtx, conn, db)
+		err := s.resolveAllParallel(s.resolveCtx, conns, db)
 		s.resolveDone <- resolveResult{err: err}
 	}()
 	return true
@@ -262,7 +262,15 @@ func (s *HotState) WaitResolveAllPending(ctx context.Context) error {
 	}
 }
 
-func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db string) error {
+// resolveAllParallel resolves every entity with pending misses concurrently,
+// one goroutine per entity, each borrowing its own *ch.Client from conns for
+// the duration of its Resolve call. ch-go connections are not safe for
+// concurrent use from multiple goroutines (a shared connection here would
+// interleave requests and responses across resolvers and could silently
+// hand back the wrong entity's data), so connPool below guarantees each
+// in-flight job holds a connection exclusively; its buffer size also caps
+// concurrency at len(conns), since that's the hard resource limit.
+func (s *HotState) resolveAllParallel(ctx context.Context, conns []*ch.Client, db string) error {
 	type resolveJob struct {
 		name string
 		resolve func(context.Context, *ch.Client, string) error
@@ -281,11 +289,13 @@ func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db s
 	if len(jobs) == 0 {
 		return nil
 	}
-	concurrency := asyncResolveConcurrency()
-	if concurrency > len(jobs) {
-		concurrency = len(jobs)
+	if len(conns) == 0 {
+		return fmt.Errorf("resolveAllParallel: no connections available")
 	}
-	sem := make(chan struct{}, concurrency)
+	connPool := make(chan *ch.Client, len(conns))
+	for _, c := range conns {
+		connPool <- c
+	}
 	var wg sync.WaitGroup
 	errMu := sync.Mutex{}
 	var firstErr error
@@ -293,11 +303,11 @@ func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db s
 		wg.Add(1)
 		go func(j resolveJob) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 			if ctx.Err() != nil {
 				return
 			}
+			conn := <-connPool
+			defer func() { connPool <- conn }()
 			if err := j.resolve(ctx, conn, db); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -406,6 +416,8 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
     .Fields[]                            - per-column decode plumbing:
         .VarName .ColType .InitLines .ColumnNameQuoted .ResultData .Name .ValueExpr
     .QueryQuoted .TableNameQuoted .WhereExpr - the bucketed SELECT
+    .RecencyColumn                       - quoted recency column literal ("updated_at_block"
+                                            or "block_number"), or "" if the table has neither
     .ColdKind                            - "" (hot only) | "pointerfree" | "serializable"
     .FilterKeysPass                      - pre-rendered cold filter-keys pass (verbatim Go)
 
@@ -413,6 +425,9 @@ func (s *HotState) Commit(ctx context.Context, conn *ch.Client, db string) error
   golden parity test compares this output byte-for-byte against the original.
 */ -}}
 func (c *{{.CacheType}}) Recover(ctx context.Context, conn *ch.Client, db string) error {
+{{- if .RecencyColumn}}
+	floor := recoveryFloorFor(ctx, conn, db, {{.TableNameQuoted}}, {{.RecencyColumn}})
+{{- end}}
 	run := func(ctx context.Context, conn *ch.Client, bucket int, emit func({{.GoTypeName}})) error {
 	var (
 {{- range .Fields}}
@@ -588,10 +603,18 @@ func unmarshalCold{{.GoTypeName}}(data []byte) ({{.GoTypeName}}, bool) {
 */ -}}
 type {{.ResolverType}} struct {
 	cache  *{{.CacheType}}
+	// mu protects only misses. Cross-block resolve pipelining (State.StartPrune's
+	// sibling for resolve — see State.StartResolvePending) can call Queue and
+	// Resolve on the same resolver from two goroutines at once: real-apply's
+	// lazy fallback path (state.go's GetValue) for the in-flight block racing
+	// the next block's prefetch dry-run dispatch. Resolve detaches misses into a
+	// local batch under the lock and does all the dedup/query work — including
+	// the network round trip — outside it, so pipelined resolves never
+	// serialize on each other; only the brief append/detach does. Metrics stay
+	// single-owner/unprotected: EnableMetrics is test/diagnostic-only and never
+	// combined with pipelining in this codebase.
+	mu     sync.Mutex
 	misses []{{.KeyType}}
-	uniqueKeys map[{{.KeyType}}]struct{}
-	uniqueList []{{.KeyType}}
-	foundKeys map[{{.KeyType}}]struct{}
 	metricsEnabled bool
 	metrics BatchResolverMetrics
 	hot *HotState
@@ -629,12 +652,16 @@ func (r *{{.ResolverType}}) Queue(key {{.KeyType}}) {
 		if r.metricsEnabled {
 			r.metrics.QueuedMisses++
 		}
+		r.mu.Lock()
 		r.misses = append(r.misses, key)
+		r.mu.Unlock()
 	}
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
 func (r *{{.ResolverType}}) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.misses)
 }
 
@@ -666,23 +693,28 @@ func (r *{{.ResolverType}}) SnapshotAndResetMetrics() BatchResolverMetrics {
 }
 
 func (r *{{.ResolverType}}) Resolve(ctx context.Context, conn *ch.Client, db string) error {
+	// Detach the pending batch under the lock, then do everything else —
+	// dedup, query, and the network round trip — on this goroutine's own local
+	// copy. Queue (from a concurrently-pipelined next block, or this block's
+	// own lazy fallback) can keep appending into a fresh misses slice the
+	// instant this unlocks, without waiting on the round trip below.
+	r.mu.Lock()
 	if len(r.misses) == 0 {
+		r.mu.Unlock()
 		return nil
 	}
+	batch := r.misses
+	r.misses = nil
+	r.mu.Unlock()
 
-	if r.uniqueKeys == nil {
-		r.uniqueKeys = make(map[{{.KeyType}}]struct{})
-	}
-	clear(r.uniqueKeys)
-	uniqueList := r.uniqueList[:0]
-	for _, key := range r.misses {
-		if _, ok := r.uniqueKeys[key]; !ok {
-			r.uniqueKeys[key] = struct{}{}
+	uniqueKeys := make(map[{{.KeyType}}]struct{}, len(batch))
+	uniqueList := make([]{{.KeyType}}, 0, len(batch))
+	for _, key := range batch {
+		if _, ok := uniqueKeys[key]; !ok {
+			uniqueKeys[key] = struct{}{}
 			uniqueList = append(uniqueList, key)
 		}
 	}
-	r.uniqueList = uniqueList
-	r.misses = r.misses[:0]
 
 	if len(uniqueList) == 0 {
 		return nil
@@ -717,11 +749,7 @@ func (r *{{.ResolverType}}) Resolve(ctx context.Context, conn *ch.Client, db str
 		{Name: {{.ColumnNameQuoted}}, Data: {{.ResultData}}},
 {{- end}}
 	}
-	if r.foundKeys == nil {
-		r.foundKeys = make(map[{{.KeyType}}]struct{})
-	}
-	clear(r.foundKeys)
-	foundKeys := r.foundKeys
+	foundKeys := make(map[{{.KeyType}}]struct{}, len(uniqueList))
 	q := ch.Query{
 		Body:   queryStr,
 		Result: results,

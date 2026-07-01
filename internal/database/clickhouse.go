@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,11 +22,18 @@ import (
 
 // Store wraps a ClickHouse native-protocol connection and the target database name.
 type Store struct {
-	conn       *ch.Client
-	insertConn *ch.Client
-	commitConn *ch.Client
-	db         string
+	conn         *ch.Client
+	insertConn   *ch.Client
+	commitConn   *ch.Client
+	pruneConn    *ch.Client
+	resolveConns []*ch.Client
+	db           string
 }
+
+// defaultResolvePoolSize is how many dedicated connections NewClickHouse dials
+// for concurrent per-entity state resolves (see Store.ResolveConns). Override
+// with SQD_RESOLVE_POOL_SIZE.
+const defaultResolvePoolSize = 4
 
 // BlockRow is a single row in the blocks table, used during fork tracking.
 type BlockRow struct {
@@ -108,7 +116,45 @@ func NewClickHouse(ctx context.Context, host string, port int, user, password, d
 		conn.Close()
 		return nil, fmt.Errorf("connect clickhouse commit connection: %w", err)
 	}
-	return &Store{conn: conn, insertConn: insertConn, commitConn: commitConn, db: db}, nil
+	// pruneConn is dedicated to the periodic background compaction prune (DELETE +
+	// OPTIMIZE TABLE ... FINAL), which can take minutes on large tables. Giving it
+	// its own connection — and running it off the consumer's hot path, see
+	// State.StartPrune — keeps it from blocking lazy state resolves on Conn while
+	// a prune is in flight.
+	pruneConn, err := ch.Dial(ctx, opts)
+	if err != nil {
+		_ = commitConn.Close()
+		_ = insertConn.Close()
+		conn.Close()
+		return nil, fmt.Errorf("connect clickhouse prune connection: %w", err)
+	}
+	// resolveConns is a small dedicated pool so concurrent per-entity state
+	// resolves (see HotState.resolveAllParallel) each get their own connection
+	// instead of racing each other on one *ch.Client, which ch-go does not
+	// support — every entity resolver used to share Conn/a single passed-in
+	// conn, so "concurrent" resolves would corrupt the request/response stream.
+	poolSize := defaultResolvePoolSize
+	if v := os.Getenv("SQD_RESOLVE_POOL_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			poolSize = n
+		}
+	}
+	resolveConns := make([]*ch.Client, 0, poolSize)
+	for i := 0; i < poolSize; i++ {
+		rc, err := ch.Dial(ctx, opts)
+		if err != nil {
+			for _, c := range resolveConns {
+				_ = c.Close()
+			}
+			_ = pruneConn.Close()
+			_ = commitConn.Close()
+			_ = insertConn.Close()
+			conn.Close()
+			return nil, fmt.Errorf("connect clickhouse resolve connection %d: %w", i, err)
+		}
+		resolveConns = append(resolveConns, rc)
+	}
+	return &Store{conn: conn, insertConn: insertConn, commitConn: commitConn, pruneConn: pruneConn, resolveConns: resolveConns, db: db}, nil
 }
 
 // DropClickHouseDatabase drops the named database (used by --restart).
@@ -133,6 +179,12 @@ func (s *Store) Close() error {
 	if s.commitConn != nil {
 		_ = s.commitConn.Close()
 	}
+	if s.pruneConn != nil {
+		_ = s.pruneConn.Close()
+	}
+	for _, c := range s.resolveConns {
+		_ = c.Close()
+	}
 	return s.conn.Close()
 }
 
@@ -151,6 +203,25 @@ func (s *Store) CommitConn() *ch.Client {
 		return nil
 	}
 	return s.commitConn
+}
+
+// PruneConn is dedicated to the background compaction prune so a long-running
+// OPTIMIZE TABLE ... FINAL never contends with Conn for lazy state resolves.
+func (s *Store) PruneConn() *ch.Client {
+	if s == nil {
+		return nil
+	}
+	return s.pruneConn
+}
+
+// ResolveConns returns the dedicated connection pool for concurrent per-entity
+// state resolves (see HotState.resolveAllParallel). Each returned *ch.Client is
+// used by at most one resolve goroutine at a time.
+func (s *Store) ResolveConns() []*ch.Client {
+	if s == nil {
+		return nil
+	}
+	return s.resolveConns
 }
 
 func (s *Store) Conn() *ch.Client {

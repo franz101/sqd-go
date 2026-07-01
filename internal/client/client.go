@@ -163,7 +163,13 @@ func (c *Client) FetchWithParent(ctx context.Context, fromBlock uint64, toBlock 
 	}
 	zstdStart := time.Now()
 	if c.zstdDecoder == nil {
-		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+		// One decoder per Client, one Client per parallel-fetch worker: with
+		// WithDecoderConcurrency(0) (=GOMAXPROCS) each decoder tries to shard a
+		// single response frame across all cores, which just adds goroutine
+		// fan-out overhead on frames this size (measured ~1.3-1.6x slower and
+		// ~16x more allocation than concurrency=1 on a real captured page).
+		// Matches klauspost's own gzhttp.Transport zstd client default.
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
 		if err != nil {
 			return Response{}, fmt.Errorf("create zstd decoder: %w", err)
 		}

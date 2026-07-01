@@ -142,6 +142,7 @@ See [Custom Schema](CUSTOM_SCHEMA.md) and [Custom Processor](CUSTOM_PROCESSOR.md
 
 ## What's Next
 
+- **[New to Go?](../docs/GO_FOR_BEGINNERS.md)** -- Go concepts explained for sqd-go beginners
 - [config.yaml reference](CONFIG.md) -- full config schema
 - [Custom Schema](CUSTOM_SCHEMA.md) -- define derived state tables
 - [Custom Processor](CUSTOM_PROCESSOR.md) -- write ETL logic

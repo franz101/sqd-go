@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/felixge/fgprof"
 	"github.com/franz101/sqd-go/internal/codegen"
 	"github.com/franz101/sqd-go/internal/config"
 	"github.com/franz101/sqd-go/internal/ingestion"
@@ -20,7 +21,7 @@ import (
 // runDev loads the project, runs codegen, starts docker compose, then runs the
 // ingestion pipeline. On exit it tears down docker compose. Use this for local
 // development where ClickHouse is managed by compose.
-func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
+func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile, fgprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
 	log.Printf("dev: loading project %s", path)
 	project, err := config.LoadProject(path)
 	if err != nil {
@@ -56,13 +57,13 @@ func runDev(path string, restart, protoMode, noColdCache bool, startBlockStr, en
 		}()
 	}
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch, noReplay)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, fgprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch, noReplay)
 }
 
 // runStartPipeline loads the project, runs codegen, then starts ingestion.
 // Unlike runDev it does not manage docker compose — the user is responsible for
 // running ClickHouse externally.
-func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
+func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBlockStr, endBlockStr, chainIDStr, cpuprofile, fgprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
 	project, err := config.LoadProject(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
@@ -77,7 +78,7 @@ func runStartPipeline(path string, restart, protoMode, noColdCache bool, startBl
 	}
 	log.Printf("codegen: %s", outPath)
 
-	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch, noReplay)
+	return runStartPipelineInternal(project, path, restart, protoMode, noColdCache, outPath, cpuprofile, fgprofile, pageSizeStr, parallelFetch, reindexFromStr, prefetch, noReplay)
 }
 
 func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockStr, chainIDStr string) {
@@ -123,7 +124,7 @@ func applyOverrides(cfg *config.Config, protoMode bool, startBlockStr, endBlockS
 // the pipeline falls back to the legacy JSON-decoded path with struct-based
 // event processing. This is useful for debugging or when proto support has not
 // been validated for a new contract.
-func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
+func runStartPipelineInternal(project *config.Project, path string, restart, protoMode, noColdCache bool, outPath, cpuprofile, fgprofile string, pageSizeStr string, parallelFetch bool, reindexFromStr string, prefetch bool, noReplay bool) int {
 	if protoMode {
 		log.Printf("V2 PROTO MODE ENABLED: zero-copy views, proto-only storage")
 	}
@@ -150,6 +151,34 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 				return
 			}
 			log.Printf("cpu profile written: %s", cpuprofile)
+		}()
+	}
+
+	// fgprof samples every goroutine's stack (runtime.GoroutineProfile), not
+	// just ones currently scheduled on a CPU, so it captures off-CPU time
+	// (blocked on a channel, a mutex, or network I/O like a ClickHouse query)
+	// alongside on-CPU time in one wall-clock profile. --cpuprofile's SIGPROF
+	// sampling only fires on a running goroutine, so it is structurally blind
+	// to time spent parked/blocked — e.g. a goroutine waiting on a shared
+	// ClickHouse connection or a bounded object-pool channel shows up as 0
+	// samples there, however long it actually waited. Output is pprof-format,
+	// so `go tool pprof` and flamegraph tooling work the same as --cpuprofile.
+	if fgprofile != "" {
+		f, err := os.Create(fgprofile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create fgprof profile: %v\n", err)
+			return 1
+		}
+		stopFgprof := fgprof.Start(f, fgprof.FormatPprof)
+		defer func() {
+			if err := stopFgprof(); err != nil {
+				fmt.Fprintf(os.Stderr, "stop fgprof profile: %v\n", err)
+			}
+			if err := f.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "close fgprof profile: %v\n", err)
+				return
+			}
+			log.Printf("fgprof profile written: %s", fgprofile)
 		}()
 	}
 
