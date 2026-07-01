@@ -239,10 +239,7 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 	// usual cause is running a prebuilt `sqd-go` (go install …@latest) whose build
 	// tree did not include this project, so the generated package's init() →
 	// RegisterProcessor was never compiled in. Without it the run still indexes raw
-	// events, but custom state and the cold tier cannot engage (the "cold cache
-	// requested but processor does not implement ColdCacheProcessor" line downstream
-	// is this same condition). Say so up front with the fix, instead of leaving the
-	// operator to decode a cryptic capability log.
+	// events, but custom state cannot engage.
 	// Hard fail when a stateful project has no compiled processor. Without it,
 	// raw events still insert but derived state stays empty — a silent "looks
 	// fine, but wrong" failure (the processor is a no-op).
@@ -256,13 +253,12 @@ func runStartPipelineInternal(project *config.Project, path string, restart, pro
 		fmt.Fprintf(os.Stderr, "Fix: go run . start %s --state\n", path)
 		return 1
 	}
-	// Cold tier requires a processor (for ColdCacheProcessor interface).
-	if processor == nil && opts.ColdCache {
-		fmt.Fprintf(os.Stderr, "ERROR: cold tier requested but no compiled processor for project %q.\n", project.Config.Name)
-		fmt.Fprintf(os.Stderr, "Build sqd-go from a checkout that includes %q (so its custom_processor.go init() is compiled in).\n", project.Root)
-		fmt.Fprintf(os.Stderr, "Fix: go run . start %s --cold-cache\n", path)
-		return 1
-	}
+	// A project with no derived state has nothing for the cold tier to back, so a
+	// nil processor here is harmless even though cold cache defaults on: ingestion.Run
+	// logs "cold cache requested but processor does not implement ColdCacheProcessor"
+	// and continues without it, same as --no-cold-cache. Hard-failing this default-on
+	// combination would break every stateless project (e.g. a plain event indexer with
+	// no custom_processor.go at all).
 	log.Printf("starting ingestion for %s (pageSize=%d)", project.Config.Name, pageSize)
 	if err := ingestion.Run(ctx, project.Config, opts); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "ingestion error: %v\n", err)
