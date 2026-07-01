@@ -18,7 +18,8 @@ The result is a `user_positions` table in ClickHouse with real-time balances and
 name: case_1_lbtc_event_only
 chains:
   - id: 1
-    start_block: 0
+    # LBTC was deployed around block 20.5M; use a post-deployment range.
+    start_block: 20600000
     end_block: 22200000
     contracts:
       - name: LBTC
@@ -64,13 +65,13 @@ The `// pk: Address` comment tells codegen that `Address` is the primary key. Co
 
 ```go
 // custom_processor.go
-package uniswap
+package uniswap // SAME package name as custom_schema.go
 
 import (
     "github.com/ethereum/go-ethereum/common"
     generated "github.com/franz101/sqd-go/examples/uniswap/generated"
-    "github.com/franz101/sqd-go/internal/cli"
-    "github.com/franz101/sqd-go/internal/ingestion"
+
+    "github.com/franz101/sqd-go/sqd" // PUBLIC facade — never import internal/
 )
 
 func Process(state *generated.State, block *generated.ParsedBlock) error {
@@ -109,10 +110,15 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
     return nil
 }
 
+func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) error {
+    return Process(state, block.ToParsedBlock())
+}
+
 func init() {
     generated.CustomProcessFn = Process
-    cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-        return generated.NewProcessor(cli.GetProtoMode())
+    generated.CustomProcessProtoFn = ProcessProto
+    sqd.RegisterProcessor(generated.ProjectName, func() (sqd.Processor, error) {
+        return generated.NewProcessor(sqd.GetProtoMode())
     })
 }
 ```
@@ -199,6 +205,26 @@ SQD HTTP → zstd JSONL → Parse → Decode Transfer events
 6. **State**: CLOCK cache maps with O(1) get/save. On cache eviction, cold tier (Pebble) serves the entry
 7. **Commit**: Dirty entities flushed to ClickHouse via native protocol (async insert)
 8. **Prune**: Old `ReplacingMergeTree` rows cleaned up periodically
+
+## Recent Enhancements (2026)
+
+### Improved State Management
+
+- **Bounded Pruning** - State pruning now uses windowed operations to prevent ClickHouse OOM during mutations
+- **Disk Spillover** - Large aggregation operations can temporarily spill to disk for memory management
+- **Better Recovery** - Provisional checkpoint persistence at reindex floor enables safer recovery after failures
+
+### Performance Optimizations
+
+- **Zero-Allocation Paths** - Hot state operations are verified zero-allocation for maximum throughput
+- **CLOCK Cache** - Improved cache eviction policies for better hit rates on hot entities
+- **Snapshot Optimization** - Reduced memory footprint during snapshot operations
+
+### Enhanced Error Handling
+
+- **Collateral Validation** - For Polymarket processors, automatic collateral validation prevents scaling errors
+- **Decimal Precision** - Improved decimal handling for financial calculations using `protomath.Decimal256`
+- **Type Safety** - Enhanced type checking for schema definitions to prevent runtime errors
 
 ## Extending to Full PnL
 

@@ -86,6 +86,10 @@ type State struct {
 	// by the hybrid block/time commit cadence. 0 means "not yet committed".
 	lastCommitWallNanos int64
 	commitDone chan stateCommitResult
+	// pruneDone is non-nil while a background CompactionPruneState run is in
+	// flight (see StartPrune). Single-slot, like commitDone: only one prune
+	// runs at a time.
+	pruneDone chan statePruneResult
 	// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only
 	// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized
 	// head); during finalized backfill they are pure GC/memory churn, so the
@@ -100,6 +104,11 @@ type stateCommitResult struct {
 	err error
 }
 
+type statePruneResult struct {
+	block uint64
+	err error
+}
+
 type memorySnapshot struct {
 	blockNumber uint64
 {{- range .Snapshots}}
@@ -110,7 +119,15 @@ type memorySnapshot struct {
 const maxSnapshots = 128
 
 func NewState() *State {
-	s := &State{HotState: NewHotState(DefaultClockCacheCapacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}
+	return NewStateWithCapacity(DefaultClockCacheCapacity)
+}
+
+// NewStateWithCapacity builds a State whose hot CLOCK caches are sized to
+// capacity (0 => DefaultClockCacheCapacity). This is the seam item-4 needs: it
+// lets the hot-tier size be tuned per run. (The production wiring should read an
+// env override in the template; this constructor is the mechanism.)
+func NewStateWithCapacity(capacity uint64) *State {
+	s := &State{HotState: NewHotState(capacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}
 {{- range .Handles}}
 	s.{{.Name}} = {{.StateType}}{state: s}
 {{- end}}
@@ -192,6 +209,71 @@ func (s *State) WaitCommit(ctx context.Context) error {
 
 func (s *State) CommitInFlight() bool {
 	return s != nil && s.commitDone != nil
+}
+
+// StartPrune runs CompactionPruneState (DELETE + OPTIMIZE TABLE ... FINAL on
+// hot-state tables) in a background goroutine, off the consumer/fold hot path.
+// Unlike StartCommit, prune touches no in-memory HotState — it only deletes and
+// reorganizes rows already durably committed in ClickHouse — so it is safe to
+// run fully concurrently with the consumer continuing to process blocks via
+// Conn; the dedicated PruneConn (see database.Store) keeps it off Conn so it
+// never contends with concurrent lazy resolves. lowerBlock/blockNumber are
+// captured by value for the goroutine, so the caller's state can keep
+// advancing while the prune runs. Returns false (no-op) if a prune is already
+// in flight; the caller should not advance LastPruneBlock in that case.
+func (s *State) StartPrune(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) bool {
+	if s == nil || store == nil || s.pruneDone != nil {
+		return false
+	}
+	done := make(chan statePruneResult, 1)
+	s.pruneDone = done
+	go func() {
+		done <- statePruneResult{block: blockNumber, err: CompactionPruneState(ctx, store, lowerBlock, blockNumber)}
+	}()
+	return true
+}
+
+// PollPrune returns the result of a completed background prune without
+// blocking, advancing LastPruneBlock on success. Returns nil if no prune is in
+// flight or none has finished yet.
+func (s *State) PollPrune() error {
+	if s == nil || s.pruneDone == nil {
+		return nil
+	}
+	select {
+	case result := <-s.pruneDone:
+		s.pruneDone = nil
+		if result.err == nil && result.block > s.LastPruneBlock {
+			s.LastPruneBlock = result.block
+		}
+		return result.err
+	default:
+		return nil
+	}
+}
+
+// WaitPrune blocks until any in-flight background prune completes (or ctx is
+// done), advancing LastPruneBlock on success. Called before the prune
+// connection is closed so a shutdown never abandons an in-flight query.
+func (s *State) WaitPrune(ctx context.Context) error {
+	if s == nil || s.pruneDone == nil {
+		return nil
+	}
+	select {
+	case result := <-s.pruneDone:
+		s.pruneDone = nil
+		if result.err == nil && result.block > s.LastPruneBlock {
+			s.LastPruneBlock = result.block
+		}
+		return result.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// PruneInFlight reports whether a background prune is currently running.
+func (s *State) PruneInFlight() bool {
+	return s != nil && s.pruneDone != nil
 }
 
 // LoadFromClickHouse rebuilds the in-memory hot state from the durable memory_*

@@ -45,15 +45,17 @@ Full-featured path with state management, ring buffers, snapshots, and fork reco
 
 Place this in your project root (next to `config.yaml`). It registers with the CLI and defines your event handling logic.
 
+> **Import the public `sqd` facade, never `internal/`.** Your project builds as its own module, so it must import the public `sqd` facade, never `internal/`. `custom_schema.go` and `custom_processor.go` must share ONE package name. Register under `generated.ProjectName` (not a hardcoded string) so the name always matches your config.
+
 ### Minimal Template
 
 ```go
-package myproject
+package myproject // SAME package name as custom_schema.go
 
 import (
-    generated "<module>/myproject/generated"
-    "github.com/franz101/sqd-go/internal/cli"
-    "github.com/franz101/sqd-go/internal/ingestion"
+    generated "myproject/generated" // your module-relative generated package
+
+    "github.com/franz101/sqd-go/sqd" // PUBLIC facade — never import internal/
 )
 
 // Process is called once per block with all decoded events in the parsed block.
@@ -69,11 +71,16 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
     return nil
 }
 
+func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) error {
+    return Process(state, block.ToParsedBlock())
+}
+
 // init registers the processor so the CLI can find it by project name.
 func init() {
     generated.CustomProcessFn = Process
-    cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-        return generated.NewProcessor(cli.GetProtoMode())
+    generated.CustomProcessProtoFn = ProcessProto
+    sqd.RegisterProcessor(generated.ProjectName, func() (sqd.Processor, error) {
+        return generated.NewProcessor(sqd.GetProtoMode())
     })
 }
 ```
@@ -81,17 +88,9 @@ func init() {
 ### Registration Flow
 
 1. `init()` runs at program startup (before `main`)
-2. `cli.RegisterProcessor("myproject", factory)` stores the factory in a global `sync.Map`
+2. `sqd.RegisterProcessor(generated.ProjectName, factory)` stores the factory in a global `sync.Map`
 3. When `sqd-go start myproject/` runs, `processorForProject("myproject")` looks up the factory and calls it
-4. The returned `Processor` implements `ingestion.Processor` interface:
-
-```go
-type Processor interface {
-    Process(ctx context.Context, store *database.Store, logs []CustomLog) error
-    RestoreToBlock(blockNumber uint64) error
-    LoadFromDatabase(blockNumber uint64) error
-}
-```
+4. The returned value satisfies `sqd.Processor` (a public alias for the ingestion processor interface). You never implement this interface yourself — `generated.NewProcessor` returns the generated implementation, and your business logic lives in the `Process` function wired up via `generated.CustomProcessFn`.
 
 ### Generated `Processor.Process()` Internals
 
@@ -102,7 +101,7 @@ The generated processor:
 3. Pushes each block's events into the `OrderedHistoricRingBuffer`
 4. Retrieves `ParsedBlock` which wraps decoded events with metadata
 5. Batches blocks in groups of 8 for prefetch (loads existing state from ClickHouse)
-6. Calls `CustomProcessFn(state, block)` for each block
+6. Calls `CustomProcessFn` or `CustomProcessProtoFn` for each block
 7. At `STATE_SNAPSHOT_INTERVAL` (default 4000) blocks: saves snapshot, commits hot state to ClickHouse, prunes old rows
 
 ### `ParsedBlock.EventsIter()`
@@ -229,6 +228,41 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 | `STATE_SNAPSHOT_INTERVAL` | `4000` | Blocks between state snapshots/commits |
 | `CLICKHOUSE_PRUNE_INTERVAL` | `100000` | Blocks between compaction prune cycles |
 | `CLICKHOUSE_HTTP_PORT` | `8123` | Port for `LoadFromDatabase` HTTP queries |
+| `SQD_STATE_CACHE_CAPACITY` | `100000` | The maximum number of entries to keep in the in-memory hot CLOCK cache per entity |
+| `SQD_DEBUG_STATE_PRUNE` | `false` | Enable detailed state pruning debug logging |
+
+## Recent Improvements (2026)
+
+### Collateral Validation
+
+Polymarket processors now include collateral validation guards to prevent scaling errors:
+
+```go
+// Whitelist-supported collaterals
+supportedCollateral = [...]common.Address{
+    common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), // bridged USDC (6 dec)
+    common.HexToAddress("0x3c499c542cEF5E3811e1192ce70D8cC03d5c3359"), // native USDC (6 dec)
+    common.HexToAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"), // pUSD
+}
+
+func isSupportedCollateral(addr common.Address) bool {
+    // Check if address is in supported list
+}
+```
+
+This prevents events like CTF splits with unsupported collateral (e.g., WMATIC) from being processed with incorrect decimal scaling.
+
+### State Pruning Improvements
+
+- **Bounded Memory** - State pruning is now windowed to prevent ClickHouse OOM during mutations
+- **Disk Spillover** - Large aggregation operations can spill to disk to manage memory
+- **Provisional Checkpoints** - Checkpoint persistence at reindex floor for safer recovery
+
+### Performance Optimizations
+
+- **Zero-Allocation Paths** - Hot rescale functions (`usdcRawToDec18`, `rawIntToDec18`) are verified zero-allocation
+- **MinLZ Compression** - Cold cache profile uses MinLZ compression for better memory efficiency
+- **Fast-Path Improvements** - Optimized topic0 string handling in parser
 
 ## Without Custom Schema (Legacy Pattern)
 

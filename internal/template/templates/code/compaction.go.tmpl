@@ -18,7 +18,19 @@ import (
 // their primary-key group. This keeps ClickHouse tables bounded during long
 // backfill runs while preserving the most recent state for each entity.
 func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) error {
-	if store == nil || store.Conn() == nil {
+	if store == nil {
+		return nil
+	}
+	// Prefer a dedicated prune connection over the consumer's hot Conn so this
+	// query set (which can run for minutes via OPTIMIZE TABLE ... FINAL) never
+	// blocks lazy state resolves sharing Conn. See State.StartPrune, which is
+	// what actually moves this call off the consumer's hot path; the connection
+	// split here also protects Conn from this goroutine on its own.
+	conn := store.Conn()
+	if pruneStore, ok := store.(interface{ PruneConn() *ch.Client }); ok && pruneStore.PruneConn() != nil {
+		conn = pruneStore.PruneConn()
+	}
+	if conn == nil {
 		return nil
 	}
 	db := store.DB()
@@ -68,7 +80,7 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 
 	start := time.Now()
 	for _, q := range queries {
-		if err := store.Conn().Do(ctx, ch.Query{Body: q}); err != nil {
+		if err := conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("compaction prune error executing query: %w", err)
 		}
 	}

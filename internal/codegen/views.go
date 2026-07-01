@@ -51,6 +51,17 @@ type ProtoEventBlock struct {
 			colType := protoColType(arg.GoType)
 			colName := camelToSnake(arg.GoFieldName)
 			fmt.Fprintf(&buf, "\t%s_%s %s\n", ev.GoTypeName, colName, colType)
+			// Per-column scratch buffer for array-typed args: hotStateUInt256Slice /
+			// hotStateHashSliceBytes reuse this backing array across events instead
+			// of allocating fresh on every Append call. Never cleared in Reset() —
+			// the helper does scratch[:0] internally, so retaining capacity across
+			// blocks is the whole point (see PREFREVIEW.md #10.9).
+			switch arg.GoType {
+			case "[]uint256.Int":
+				fmt.Fprintf(&buf, "\tscratch_%s_%s []proto.UInt256\n", ev.GoTypeName, colName)
+			case "[]common.Hash":
+				fmt.Fprintf(&buf, "\tscratch_%s_%s [][]byte\n", ev.GoTypeName, colName)
+			}
 		}
 		fmt.Fprint(&buf, "\n")
 	}
@@ -128,7 +139,16 @@ type ProtoEventBlock struct {
 		fmt.Fprintf(&buf, "\tb.%s_meta_index.Append(metaIdx)\n", ev.GoTypeName)
 		for _, arg := range ev.Args {
 			colName := ev.GoTypeName + "_" + camelToSnake(arg.GoFieldName)
-			fmt.Fprintf(&buf, "\tb.%s.Append(%s)\n", colName, protoAppendExpr(arg))
+			switch arg.GoType {
+			case "[]uint256.Int":
+				fmt.Fprintf(&buf, "\tb.scratch_%s = hotStateUInt256Slice(ev.%s, b.scratch_%s)\n", colName, arg.GoFieldName, colName)
+				fmt.Fprintf(&buf, "\tb.%s.Append(b.scratch_%s)\n", colName, colName)
+			case "[]common.Hash":
+				fmt.Fprintf(&buf, "\tb.scratch_%s = hotStateHashSliceBytes(ev.%s, b.scratch_%s)\n", colName, arg.GoFieldName, colName)
+				fmt.Fprintf(&buf, "\tb.%s.Append(b.scratch_%s)\n", colName, colName)
+			default:
+				fmt.Fprintf(&buf, "\tb.%s.Append(%s)\n", colName, protoAppendExpr(arg))
+			}
 		}
 		fmt.Fprintf(&buf, "\tb.Sequence = append(b.Sequence, uint8(EventType%s))\n", ev.GoTypeName)
 		fmt.Fprint(&buf, "}\n\n")
@@ -277,6 +297,37 @@ type ProtoEventBlock struct {
 			fmt.Fprintf(&buf, "func (v %sProtoView) %s() %s {\n", ev.GoTypeName, arg.GoFieldName, arg.GoType)
 			fmt.Fprintf(&buf, "\treturn %s\n", access)
 			fmt.Fprintf(&buf, "}\n\n")
+
+			// Zero-allocation companions for array fields: callers that only need
+			// length/indexed access (the common case — most handlers read 1-2
+			// fixed indices, not the whole slice) can avoid materializing a fresh
+			// []uint256.Int/[]common.Hash via RowAppend on every event. Bypasses
+			// ColArr.Row/RowAppend (which always allocates, per ch-go's
+			// `return c.RowAppend(i, nil)`) by reading Offsets + the underlying
+			// flat Data column directly.
+			switch arg.GoType {
+			case "[]uint256.Int":
+				fmt.Fprintf(&buf, "func (v %sProtoView) %sLen() int {\n", ev.GoTypeName, arg.GoFieldName)
+				fmt.Fprintf(&buf, "\treturn v.block.%s.RowLen(v.row)\n", colName)
+				fmt.Fprint(&buf, "}\n\n")
+				fmt.Fprintf(&buf, "func (v %sProtoView) %sAt(i int) uint256.Int {\n", ev.GoTypeName, arg.GoFieldName)
+				fmt.Fprintf(&buf, "\tcol := v.block.%s\n", colName)
+				fmt.Fprint(&buf, "\tstart := 0\n")
+				fmt.Fprint(&buf, "\tif v.row > 0 {\n\t\tstart = int(col.Offsets[v.row-1])\n\t}\n")
+				fmt.Fprint(&buf, "\telem := col.Data.Row(start + i)\n")
+				fmt.Fprint(&buf, "\treturn uint256FromProto(&elem)\n")
+				fmt.Fprint(&buf, "}\n\n")
+			case "[]common.Hash":
+				fmt.Fprintf(&buf, "func (v %sProtoView) %sLen() int {\n", ev.GoTypeName, arg.GoFieldName)
+				fmt.Fprintf(&buf, "\treturn v.block.%s.RowLen(v.row)\n", colName)
+				fmt.Fprint(&buf, "}\n\n")
+				fmt.Fprintf(&buf, "func (v %sProtoView) %sAt(i int) common.Hash {\n", ev.GoTypeName, arg.GoFieldName)
+				fmt.Fprintf(&buf, "\tcol := v.block.%s\n", colName)
+				fmt.Fprint(&buf, "\tstart := 0\n")
+				fmt.Fprint(&buf, "\tif v.row > 0 {\n\t\tstart = int(col.Offsets[v.row-1])\n\t}\n")
+				fmt.Fprint(&buf, "\treturn common.BytesToHash(col.Data.Row(start + i))\n")
+				fmt.Fprint(&buf, "}\n\n")
+			}
 		}
 		fmt.Fprintf(&buf, "func (v %sProtoView) Meta() EventMeta {\n", ev.GoTypeName)
 		fmt.Fprintf(&buf, "\treturn eventMetaAt(v.block, int(v.block.%s_meta_index[v.row]))\n", ev.GoTypeName)

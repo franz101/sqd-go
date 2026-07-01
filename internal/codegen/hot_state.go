@@ -119,13 +119,9 @@ func renderHotStateImports(b *bytes.Buffer, tables []customTableSpec, events []e
 	if eventsUseUint256(events) || eventsUseUint256Slice(events) {
 		imports[`"github.com/holiman/uint256"`] = ""
 	}
-	b.WriteString("import (\n")
-	for _, imp := range sortedImportKeys(imports) {
-		b.WriteString("\t")
-		b.WriteString(imp)
-		b.WriteString("\n")
-	}
-	b.WriteString(")\n\n")
+	b.WriteString(template.MustExecute("code/hotStateImportsGo", struct{ Imports []string }{
+		Imports: sortedImportKeys(imports),
+	}))
 }
 
 type hotEntityFieldTmpl struct {
@@ -664,6 +660,7 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		QueryQuoted     string
 		TableNameQuoted string
 		WhereExpr       string
+		RecencyColumn   string
 		ColdKind        string
 		FilterKeysPass  string
 	}{
@@ -673,6 +670,7 @@ func renderClockRecover(b *bytes.Buffer, spec hotStateSpec) {
 		QueryQuoted:     strconv.Quote(recoverQuery(spec.table)),
 		TableNameQuoted: strconv.Quote(spec.table.Name),
 		WhereExpr:       recoverWhereExpr(spec.table),
+		RecencyColumn:   recencyColumnLiteral(spec.table),
 	}
 	for _, field := range spec.table.Fields {
 		data.Fields = append(data.Fields, recoverFieldTmpl{
@@ -1120,9 +1118,17 @@ func batchAppendLines(field customFieldSpec, isEvent bool) []string {
 	case "uint256.Int":
 		return []string{col + ".Append(hotStateUInt256(" + value + "))"}
 	case "[]common.Hash":
-		return []string{col + ".Append(hotStateHashSliceBytes(" + value + ", b." + batchScratchField(field) + "))"}
+		scratch := "b." + batchScratchField(field)
+		return []string{
+			scratch + " = hotStateHashSliceBytes(" + value + ", " + scratch + ")",
+			col + ".Append(" + scratch + ")",
+		}
 	case "[]uint256.Int":
-		return []string{col + ".Append(hotStateUInt256Slice(" + value + ", b." + batchScratchField(field) + "))"}
+		scratch := "b." + batchScratchField(field)
+		return []string{
+			scratch + " = hotStateUInt256Slice(" + value + ", " + scratch + ")",
+			col + ".Append(" + scratch + ")",
+		}
 	default:
 		return []string{col + ".Append(" + value + ")"}
 	}
@@ -1188,12 +1194,49 @@ func recoverQuery(table customTableSpec) string {
 
 func recoverWhereExpr(table customTableSpec) string {
 	base := recoverBucketWhereExpr(table)
-	for _, field := range table.Fields {
-		if field.ColumnName == "updated_at_block" {
-			return base + " + recoveryRecencyClause()"
-		}
+	if col := recoveryColumnFor(table); col != "" {
+		return base + " + recoveryRecencyClauseFor(floor, " + strconv.Quote(col) + ")"
 	}
 	return base
+}
+
+// recoveryColumnFor returns the column recovery uses to bound a hot-state
+// table's startup scan to a recent tail (see recoveryFloorFor in the
+// generated runtime prelude): the user-defined "updated_at_block" version
+// column when the project's state schema declares one (e.g.
+// examples/polymarket), falling back to "block_number", which
+// addRequiredBlockFields makes mandatory on every non-event hot-state table.
+// Returns "" only if neither is present, in which case recoverWhereExpr and
+// renderClockFilterKeysPass both degrade to "no recency filter" rather than
+// emit a reference to an undeclared column.
+func recoveryColumnFor(table customTableSpec) string {
+	hasColumn := func(name string) bool {
+		for _, f := range table.Fields {
+			if f.ColumnName == name {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case hasColumn("updated_at_block"):
+		return "updated_at_block"
+	case hasColumn("block_number"):
+		return "block_number"
+	default:
+		return ""
+	}
+}
+
+// recencyColumnLiteral is recoveryColumnFor's result rendered as a Go string
+// literal (including the quotes) for direct template interpolation, or "" to
+// signal "no recency column" (the template omits the floor declaration).
+func recencyColumnLiteral(table customTableSpec) string {
+	col := recoveryColumnFor(table)
+	if col == "" {
+		return ""
+	}
+	return strconv.Quote(col)
 }
 
 func recoverBucketWhereExpr(table customTableSpec) string {

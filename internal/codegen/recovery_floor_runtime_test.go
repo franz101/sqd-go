@@ -299,4 +299,99 @@ func TestRecoveryFloorResetsPreFloorPosition(t *testing.T) {
 			"negative filter with ALL keys, not just updated_at_block >= floor.", gotA.Balance)
 	}
 }
+
+// TestRecoveryFloorAutoQuantile exercises the auto-computed floor path (no
+// SQD_RECOVERY_MIN_BLOCK set): recovery should ask ClickHouse for the
+// recoveryQuantile() (default 0.95) of the recency column itself and use that
+// as the floor, instead of doing the old unconditional full-table scan. The
+// split must land in the same place the manual-floor mechanism already
+// guarantees is safe: the recent tail gets full values (GetByFields ok=true),
+// the older bulk gets keys-only negative-filter coverage (ColdMightContain
+// true, GetByFields ok=false) rather than nothing at all.
+func TestRecoveryFloorAutoQuantile(t *testing.T) {
+	addr := os.Getenv("SQD_PREFETCH_CH_ADDR")
+	if addr == "" {
+		t.Skip("set SQD_PREFETCH_CH_ADDR (host:port of a disposable ClickHouse) to run")
+	}
+	host, port := addr, "9000"
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host, port = addr[:i], addr[i+1:]
+	}
+	ctx := context.Background()
+	db := "recovery_auto_floor_test" // disposable DB; never touches existing databases
+	user := rfEnvOr("SQD_PREFETCH_CH_USER", "default")
+	password := os.Getenv("SQD_PREFETCH_CH_PASSWORD")
+
+	conn, err := ch.Dial(ctx, ch.Options{Address: addr, User: user, Password: password})
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer conn.Close()
+
+	exec := func(q string) {
+		t.Helper()
+		if err := conn.Do(ctx, ch.Query{Body: q}); err != nil {
+			t.Fatalf("exec %q: %v", q, err)
+		}
+	}
+	exec("DROP DATABASE IF EXISTS " + db)
+	exec("CREATE DATABASE " + db)
+	defer exec("DROP DATABASE IF EXISTS " + db)
+	exec(fmt.Sprintf(recoveryFloorDDL, db))
+
+	// 100 positions spread evenly over a known block range. With this few rows
+	// ClickHouse's quantile() reservoir holds every value, so the auto floor is
+	// deterministic: it must land strictly between the oldest and newest block.
+	const n = 100
+	const baseBlock = uint64(2000000)
+	const step = uint64(10)
+	seed := NewMemoryUserPositionBatch()
+	for i := 0; i < n; i++ {
+		blk := baseBlock + uint64(i)*step
+		seed.Append(MemoryUserPosition{User: rfAddr(1000 + i), TokenID: rfHash(1000 + i), Balance: uint64(i + 1), BlockNumber: blk, UpdatedAtBlock: blk})
+	}
+	if err := seed.Insert(ctx, conn, db); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	t.Setenv("CLICKHOUSE_HOST", host)
+	t.Setenv("CLICKHOUSE_NATIVE_PORT", port)
+	t.Setenv("CLICKHOUSE_USER", user)
+	t.Setenv("CLICKHOUSE_PASSWORD", password)
+	t.Setenv("CLICKHOUSE_DATABASE", db)
+	t.Setenv("SQD_RECOVERY_MIN_BLOCK", "")
+	t.Setenv("SQD_RECOVERY_AUTO_FLOOR", "")
+	t.Setenv("TEST_MODE", "0")
+	t.Setenv("CI", "0")
+
+	s := NewState()
+	s.SetSnapshotsEnabled(false)
+	s.Store = recStore{conn: conn, db: db}
+	coldDir := filepath.Join(t.TempDir(), "cold")
+	if err := s.HotState.EnableColdCache(coldDir, true /*authoritative*/, 0, 0); err != nil {
+		t.Fatalf("enable cold cache: %v", err)
+	}
+	t.Cleanup(func() { _ = s.HotState.CloseColdCache() })
+
+	if err := s.LoadFromClickHouse(ctx, baseBlock+uint64(n-1)*step); err != nil {
+		t.Fatalf("recover from ClickHouse: %v", err)
+	}
+
+	oldUser, oldTok := rfAddr(1000), rfHash(1000)
+	if _, ok := s.HotState.UserPositions.GetByFields(oldUser, oldTok); ok {
+		t.Errorf("oldest position has a cached value; want the auto floor to exclude it from the value load (keys-only tail)")
+	}
+	if !s.HotState.UserPositions.ColdMightContain(oldUser, oldTok) {
+		t.Errorf("oldest position's key is missing from the negative filter; the keys-only completeness pass did not run under the auto-computed floor")
+	}
+
+	newUser, newTok := rfAddr(1000+n-1), rfHash(1000+n-1)
+	got, ok := s.HotState.UserPositions.GetByFields(newUser, newTok)
+	if !ok {
+		t.Fatalf("newest position has no cached value; want the auto floor to keep the recent tail in the value load")
+	}
+	if got.Balance != n {
+		t.Errorf("newest position balance = %d, want %d", got.Balance, n)
+	}
+}
 `

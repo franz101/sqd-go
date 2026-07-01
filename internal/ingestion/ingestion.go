@@ -361,7 +361,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		defer sqdFinalized.Close()
 	}
 	jsonl := parser.NewFastJSONLParser(1024)
-	replayBufCap := 65536 // ~64K blocks of replay capacity
+	// replayBufCap must stay comfortably under the generated Processor's
+	// defaultRingBufferSize (custom_processor.go.tmpl, currently 8192): the
+	// batch-parse producer parses blocks into a fixed pool of that many
+	// *ProtoEventBlock objects and recycles them round-robin, independent of
+	// whether the consumer has read them yet. If this backlog bound ever
+	// exceeds that pool size, the producer will Reset() and overwrite a slot a
+	// still-unconsumed replay entry points to — a cross-goroutine
+	// use-after-reset race that can silently corrupt block data or panic
+	// (observed: index-out-of-range in a ProtoView.Meta() accessor). This was
+	// previously 65536, ~8x the ring's actual capacity, so the race was
+	// structurally guaranteed on any page >=8192 blocks — see BUGR.md. Keep
+	// this below defaultRingBufferSize (with margin for the backpressure
+	// check's own -100 slack below) if either constant changes.
+	replayBufCap := 8000 // bounded by defaultRingBufferSize (8192), see comment above
 	if noReplay {
 		replayBufCap = 1024 // small smoothing pipe; no fork recovery needed
 	}
