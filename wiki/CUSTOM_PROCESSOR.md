@@ -45,15 +45,17 @@ Full-featured path with state management, ring buffers, snapshots, and fork reco
 
 Place this in your project root (next to `config.yaml`). It registers with the CLI and defines your event handling logic.
 
+> **Import the public `sqd` facade, never `internal/`.** Your project builds as its own module, so it must import the public `sqd` facade, never `internal/`. `custom_schema.go` and `custom_processor.go` must share ONE package name. Register under `generated.ProjectName` (not a hardcoded string) so the name always matches your config.
+
 ### Minimal Template
 
 ```go
-package myproject
+package myproject // SAME package name as custom_schema.go
 
 import (
-    generated "<module>/myproject/generated"
-    "github.com/franz101/sqd-go/internal/cli"
-    "github.com/franz101/sqd-go/internal/ingestion"
+    generated "myproject/generated" // your module-relative generated package
+
+    "github.com/franz101/sqd-go/sqd" // PUBLIC facade — never import internal/
 )
 
 // Process is called once per block with all decoded events in the parsed block.
@@ -69,11 +71,16 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
     return nil
 }
 
+func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) error {
+    return Process(state, block.ToParsedBlock())
+}
+
 // init registers the processor so the CLI can find it by project name.
 func init() {
     generated.CustomProcessFn = Process
-    cli.RegisterProcessor(generated.ProjectName, func() (ingestion.Processor, error) {
-        return generated.NewProcessor(cli.GetProtoMode())
+    generated.CustomProcessProtoFn = ProcessProto
+    sqd.RegisterProcessor(generated.ProjectName, func() (sqd.Processor, error) {
+        return generated.NewProcessor(sqd.GetProtoMode())
     })
 }
 ```
@@ -81,17 +88,9 @@ func init() {
 ### Registration Flow
 
 1. `init()` runs at program startup (before `main`)
-2. `cli.RegisterProcessor("myproject", factory)` stores the factory in a global `sync.Map`
+2. `sqd.RegisterProcessor(generated.ProjectName, factory)` stores the factory in a global `sync.Map`
 3. When `sqd-go start myproject/` runs, `processorForProject("myproject")` looks up the factory and calls it
-4. The returned `Processor` implements `ingestion.Processor` interface:
-
-```go
-type Processor interface {
-    Process(ctx context.Context, store *database.Store, logs []CustomLog) error
-    RestoreToBlock(blockNumber uint64) error
-    LoadFromDatabase(blockNumber uint64) error
-}
-```
+4. The returned value satisfies `sqd.Processor` (a public alias for the ingestion processor interface). You never implement this interface yourself — `generated.NewProcessor` returns the generated implementation, and your business logic lives in the `Process` function wired up via `generated.CustomProcessFn`.
 
 ### Generated `Processor.Process()` Internals
 
@@ -102,8 +101,8 @@ The generated processor:
 3. Pushes each block's events into the `OrderedHistoricRingBuffer`
 4. Retrieves `ParsedBlock` which wraps decoded events with metadata
 5. Batches blocks in groups of 8 for prefetch (loads existing state from ClickHouse)
-6. Calls `CustomProcessFn(state, block)` for each block
-7. At `STATE_SNAPSHOT_INTERVAL` (default 4000) blocks: saves snapshot, commits hot state to ClickHouse, prunes old rows
+6. Calls `CustomProcessFn` or `CustomProcessProtoFn` for each block
+7. At the commit interval (`SQD_COMMIT_INTERVAL` blocks, default 5000, **or** `SQD_COMMIT_MAX_INTERVAL`, default 3s — whichever first): saves a snapshot and commits hot state to ClickHouse. Pruning runs on its own separate cadence (`CLICKHOUSE_PRUNE_INTERVAL` blocks).
 
 ### `ParsedBlock.EventsIter()`
 
@@ -154,11 +153,11 @@ The entity state handle (`entityStateHandle[T]`) wraps the hot state map and pro
 
 **Reading existing state from ClickHouse (prefetch):**
 
-The prefetch system automatically queries ClickHouse for entity state matching keys in the current block's events. For example, if a block contains `Transfer(user=0xABC, token=0xDEF)`, the prefetch query loads the existing `user_positions` row for `(0xABC, 0xDEF)` before `CustomProcessFn` runs. This means you can always assume the latest state is loaded.
+The prefetch system automatically queries ClickHouse for entity state matching keys in the current block's events. For example, if a block contains `Transfer(user=0xABC, token=0xDEF)`, the prefetch query loads the latest existing `user_positions_log` row for `(0xABC, 0xDEF)` before `CustomProcessFn` runs. This means you can always assume the latest state is loaded.
 
 ### Snapshots and Fork Recovery
 
-The `State` maintains a 32-slot ring buffer of deep-copied snapshots, taken every `STATE_SNAPSHOT_INTERVAL` blocks. On fork recovery:
+The `State` maintains a 32-slot ring buffer of deep-copied snapshots, one taken at each commit (see the **Commit interval** section below). On fork recovery:
 
 1. `RestoreToBlock(safeBlock)` finds the newest snapshot ≤ `safeBlock`
 2. All entity maps are restored from the snapshot
@@ -167,17 +166,36 @@ The `State` maintains a 32-slot ring buffer of deep-copied snapshots, taken ever
 
 This avoids re-fetching from the network — the ring buffer holds the last N blocks of decoded events.
 
-### Commit and Persistence
+### Commit interval (when `Save()` becomes durable)
 
-At snapshot intervals, `State.Commit()` flushes all dirty entities to ClickHouse:
+`Save()` does **not** write to ClickHouse on the spot. It updates the in-memory hot-state
+cache (a CLOCK cache per entity) and marks the entity dirty. The runtime then commits the
+accumulated dirty state to ClickHouse on a **hybrid cadence** — it commits whenever *either*
+bound below is reached, whichever comes first:
+
+| Bound | Env var | Default | Role |
+|-------|---------|---------|------|
+| Blocks since last commit | `SQD_COMMIT_INTERVAL` | `5000` | The **crash re-fetch budget**: on a crash, at most this many blocks are re-fetched and re-processed from the last durable checkpoint. Dominates during backfill. |
+| Wall-clock since last commit | `SQD_COMMIT_MAX_INTERVAL` | `3s` | The **durability-latency bound**: keeps the slow live tail (a few blocks/sec) becoming durable promptly instead of waiting `SQD_COMMIT_INTERVAL` blocks (which at the head could be ~30 min). Dominates at the chain head. |
+
+If you come from Subsquid's `processor.run()`, this is the framework-managed equivalent of
+its end-of-batch `ctx.store.save([...])`: there you accumulate into maps across `ctx.blocks`
+and flush once per batch; here your per-block `Save()` accumulates in the hot cache and the
+runtime flushes on the interval above. You never write the commit yourself.
+
+The commit runs **asynchronously, off the block-processing hot path** (on a dedicated
+ClickHouse connection), so a multi-second flush doesn't stall parsing. Each commit appends the
+dirty rows to the per-entity `_log` history table via the ClickHouse native protocol (ch-go)
+with `async_insert=1, wait_for_async_insert=0` for throughput:
 
 ```go
-// Generated per-entity INSERT:
-INSERT INTO <db>.user_positions (user, token_id, amount, ...) VALUES
-// Uses ClickHouse native protocol (ch-go) with async inserts
+INSERT INTO <db>.user_positions_log (address, total_in, total_out, ...) VALUES ...
 ```
 
-Settings: `async_insert=1`, `wait_for_async_insert=0` for maximum throughput.
+**The checkpoint never leads the durable horizon.** The ingestion checkpoint only advances to
+the highest block whose derived state has actually committed (`CommittedBlock()`), so a crash
+resumes from the last commit and re-fetches the bounded gap — un-committed `Save()`s are never
+silently lost. On a clean `--end-block` exit the runtime forces a final flush of the tail.
 
 ## Real-World Example: Uniswap PnL Transfer Tracker
 
@@ -226,9 +244,45 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STATE_SNAPSHOT_INTERVAL` | `4000` | Blocks between state snapshots/commits |
+| `SQD_COMMIT_INTERVAL` | `5000` | Blocks between durable commits of derived state (the crash re-fetch budget). Commit fires on this **or** `SQD_COMMIT_MAX_INTERVAL`, whichever first. |
+| `SQD_COMMIT_MAX_INTERVAL` | `3s` | Max wall-clock between commits (Go duration or bare seconds); keeps the slow live tail durable without waiting `SQD_COMMIT_INTERVAL` blocks. |
 | `CLICKHOUSE_PRUNE_INTERVAL` | `100000` | Blocks between compaction prune cycles |
 | `CLICKHOUSE_HTTP_PORT` | `8123` | Port for `LoadFromDatabase` HTTP queries |
+| `SQD_STATE_CACHE_CAPACITY` | `100000` | The maximum number of entries to keep in the in-memory hot CLOCK cache per entity |
+| `SQD_DEBUG_STATE_PRUNE` | `false` | Enable detailed state pruning debug logging |
+
+## Recent Improvements (2026)
+
+### Collateral Validation
+
+Polymarket processors now include collateral validation guards to prevent scaling errors:
+
+```go
+// Whitelist-supported collaterals
+supportedCollateral = [...]common.Address{
+    common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), // bridged USDC (6 dec)
+    common.HexToAddress("0x3c499c542cEF5E3811e1192ce70D8cC03d5c3359"), // native USDC (6 dec)
+    common.HexToAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"), // pUSD
+}
+
+func isSupportedCollateral(addr common.Address) bool {
+    // Check if address is in supported list
+}
+```
+
+This prevents events like CTF splits with unsupported collateral (e.g., WMATIC) from being processed with incorrect decimal scaling.
+
+### State Pruning Improvements
+
+- **Bounded Memory** - State pruning is now windowed to prevent ClickHouse OOM during mutations
+- **Disk Spillover** - Large aggregation operations can spill to disk to manage memory
+- **Provisional Checkpoints** - Checkpoint persistence at reindex floor for safer recovery
+
+### Performance Optimizations
+
+- **Zero-Allocation Paths** - Hot rescale functions (`usdcRawToDec18`, `rawIntToDec18`) are verified zero-allocation
+- **MinLZ Compression** - Cold cache profile uses MinLZ compression for better memory efficiency
+- **Fast-Path Improvements** - Optimized topic0 string handling in parser
 
 ## Without Custom Schema (Legacy Pattern)
 

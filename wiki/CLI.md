@@ -14,19 +14,23 @@ The CLI auto-loads `.env` from the current working directory and the binary's di
 
 ### `sqd-go` (no args)
 
-Runs interactive init. Prompts for project name, source (ABI file or ERC20 template), contract details, chain ID, start block, and contract address. Produces a project directory with `config.yaml`, `.env`, `compose.yml`, and an `abis/` folder.
+Runs interactive init. Prompts for project name, source (ABI file or ERC20 template), contract details, chain ID, start block, and contract address. Produces a project directory with `config.yaml`, `.env`, `compose.yml`, `custom_schema.go`, `custom_processor.go`, and an optional `abis/` folder.
 
 ### `sqd-go init`
 
 Same as no-args — interactive project setup.
 
-### `sqd-go init <path>`
+### State scaffolding in init modes
 
-Scaffolds `custom_schema.go`, `custom_processor.go` templates, and runs codegen for an existing `config.yaml`. The `<path>` can be a directory containing `config.yaml`/`config.yml` or a direct path to the config file. This is the "I have a config, now give me the full custom processor skeleton" command.
+Both `contract-import` and `template` render `custom_schema.go` and
+`custom_processor.go` from the new config. ERC-20 Transfer projects get a working
+address-position example; other ABIs get a compiling type switch for their first
+configured event. `sqd-go codegen <path>` (or `start <path> --state`) produces the
+generated package afterward.
 
 ### `sqd-go init contract-import local --abi <file> --name <name> [--address <addr>]`
 
-Non-interactive project scaffolding from an ABI JSON file. Parses the ABI, extracts all event signatures, generates `config.yaml`, `.env`, `compose.yml`, and copies the ABI to `abis/`. Produces a project in a directory named after the contract (sanitized to `kebab-case`). Accepts `--blockchain` (chain ID/name, default ethereum) and `--start-block` (default 0).
+Non-interactive project scaffolding from an ABI JSON file. Parses the ABI, extracts all event signatures, generates `config.yaml`, `.env`, `compose.yml`, and the custom state/processor files, then copies the ABI to `abis/`. Produces a project in a directory named after the contract (sanitized to `kebab-case`). Accepts `--blockchain` (chain ID/name, default ethereum) and `--start-block` (default 0).
 
 ### `sqd-go init template [erc20] [path]`
 
@@ -52,7 +56,7 @@ Validates config, builds event specs, generates all outputs:
 | `compaction.go` | `generated/` | ClickHouse compaction/pruning logic |
 | `ringbuffer.go` | `generated/` | Ring buffer for block event slots |
 
-### `sqd-go start <path> [--restart] [--no-resume] [--start-block <n>] [--end-block <n>] [--blockchain <id>] [--pagesize <n>]`
+### `sqd-go start <path> [--restart] [--no-resume] [--start-block <n>] [--end-block <n>] [--blockchain <id>] [--pagesize <n>] [--reindex-from <n>] [--state]`
 
 Runs `codegen` then starts the ingestion pipeline. Connects to ClickHouse, creates tables, fetches from SQD in pages, parses JSONL, decodes events, inserts into ClickHouse. Runs until `SIGINT`/`SIGTERM` or end block reached.
 
@@ -63,7 +67,10 @@ Flags:
 - `--end-block <n>`: Override config end block (0 = infinite)
 - `--blockchain <id|name>`: Override config chain ID (e.g. `1`, `137`, `ethereum`, `polygon`)
 - `--pagesize <n>`: Fixed page size per SQD fetch (default 0 = dynamic)
-- `--cpuprofile <file>`: Write CPU profile to file
+- `--reindex-from <n>`: Set floor for provisional checkpoint persistence (enables safer recovery)
+- `--state`: Enable custom processor with state management
+- `--cpuprofile <file>`: Write CPU profile to file (on-CPU time only — blind to goroutines blocked on I/O, locks, or channels)
+- `--fgprofile <file>`: Write an [fgprof](https://github.com/felixge/fgprof) wall-clock profile to file (pprof format). Unlike `--cpuprofile`, this also captures off-CPU time (blocked on a ClickHouse query, a channel, a mutex), which is usually where a stalled-looking ingestion run is actually spending its time. View with `go tool pprof <file>` the same way as a CPU profile.
 
 ### `sqd-go dev <path> [--restart] [--no-resume] [--start-block <n>] [--end-block <n>]`
 
@@ -87,8 +94,11 @@ Shows usage text.
 | `CLICKHOUSE_USER` | `default` | ClickHouse user |
 | `CLICKHOUSE_PASSWORD` | `sqd-clickhouse` | ClickHouse password |
 | `CLICKHOUSE_DATABASE` | project name | ClickHouse database name |
-| `STATE_SNAPSHOT_INTERVAL` | `4000` | Blocks between state snapshots |
+| `SQD_COMMIT_INTERVAL` | `5000` | Blocks between durable commits of derived state (commit fires on this or `SQD_COMMIT_MAX_INTERVAL`, whichever first) |
+| `SQD_COMMIT_MAX_INTERVAL` | `3s` | Max wall-clock between commits (Go duration or bare seconds) |
 | `CLICKHOUSE_PRUNE_INTERVAL` | `100000` | Blocks between compaction/prune cycles |
+| `SQD_STATE_CACHE_CAPACITY` | `100000` | The maximum number of entries to keep in the in-memory hot CLOCK cache per entity. |
+| `SQD_PARSE_WORKERS` | `runtime.NumCPU()` (capped at 16) | Goroutines used to parse a fetched page concurrently. `1` disables parallel parsing. |
 
 ## Config Format (config.yaml)
 
