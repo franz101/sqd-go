@@ -238,6 +238,20 @@ func Open(dir string, cacheBytes int64, memTableBytes uint64) (*Store, error) {
 				opts.Levels[i].Compression = compFn(sstable.MinLZCompression)
 			}
 			log.Printf("cold tier: optimization profile 'minlz' (fast-decode codec)")
+		case "bigmem128":
+			// 128MB memtables (vs the 16MB baseline) cut flush count ~7x on a
+			// sustained write burst (97->13 flushes per 5M entries), which
+			// collapses both compaction CPU and L0 read amplification since L0
+			// never builds the overlapping-file backlog both are downstream of:
+			// -20% compaction CPU share, avg L0 sublevels 6.3->1.4. The Bloom
+			// filter is free here (no measurable compaction CPU cost) and
+			// sharpens the miss path further: miss latency 73.6us->14.2us avg.
+			// See coldcache/COMPACTION_BENCHMARKS.md for the full comparison.
+			// Costs up to ~512MiB extra resident (128MB x
+			// MemTableStopWritesThreshold=4) on top of the block-cache budget.
+			opts.MemTableSize = 128 << 20
+			opts.Levels = withBloom(sstable.SnappyCompression)
+			log.Printf("cold tier: optimization profile 'bigmem128' (128MB memtables, Bloom filter)")
 		default:
 			log.Printf("cold tier: unknown optimization profile '%s', using baseline", optim)
 		}

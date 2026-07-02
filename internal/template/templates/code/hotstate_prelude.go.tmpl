@@ -3,6 +3,11 @@
 package generated
 
 {{end}}
+{{define "hotStateImportsGo"}}import (
+{{range .Imports}}	{{.}}
+{{end}})
+
+{{end}}
 {{define "hotStateRuntimeGo"}}const DefaultClockCacheCapacity uint64 = 100000
 {{if .HasSpecs}}const recoveryBucketCount = 8
 const recoveryConcurrency = 8
@@ -54,18 +59,88 @@ func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
 	})
 }
 
-func recoveryRecencyClause() string {
-	// SQD_RECOVERY_MIN_BLOCK floor, read inline (see recoveryDialConn).
-	var mb uint64
-	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			mb = uint64(n)
+// recoveryManualFloor returns the operator-supplied SQD_RECOVERY_MIN_BLOCK
+// floor, or (0, false) if unset/invalid. It always wins over the auto-computed
+// quantile floor, preserving exact prior behavior for anyone still setting it.
+func recoveryManualFloor() (uint64, bool) {
+	v := os.Getenv("SQD_RECOVERY_MIN_BLOCK")
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return uint64(n), true
+}
+
+// recoveryAutoFloorDisabled reports whether SQD_RECOVERY_AUTO_FLOOR=0 (or
+// "false") opts out of the quantile-based floor, restoring the old
+// unconditional full-table-scan recovery behavior.
+func recoveryAutoFloorDisabled() bool {
+	v := os.Getenv("SQD_RECOVERY_AUTO_FLOOR")
+	return v == "0" || strings.EqualFold(v, "false")
+}
+
+// recoveryQuantile is the quantile level used to auto-derive a recovery floor:
+// the table is split into a "keys-only" tail (older than the floor, added to
+// the negative filter without fetching values) and a recent head (loaded with
+// full values). The default 0.95 means the most recent ~5% of rows by recency
+// column get full value loads. Override with SQD_RECOVERY_QUANTILE.
+func recoveryQuantile() float64 {
+	if v := os.Getenv("SQD_RECOVERY_QUANTILE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f < 1 {
+			return f
 		}
 	}
-	if mb == 0 {
+	return 0.95
+}
+
+// recoveryFloorFor returns the recovery floor for one hot-state table's
+// recency column (either the user-defined "updated_at_block" version column,
+// or the codegen-injected "block_number" fallback — see recoveryColumnFor in
+// hot_state.go). SQD_RECOVERY_MIN_BLOCK always wins when set. Otherwise this
+// asks ClickHouse for the recoveryQuantile() of the column directly: a single
+// numeric-column aggregate scan (quantile() is reservoir-sampled, so it never
+// reads the whole table), not the multi-column ORDER BY ... LIMIT 1 BY the
+// bucketed recovery query needs. That turns the always-full-table-scan default
+// into a bounded "recent tail" scan without requiring an operator to compute
+// and pass a floor by hand on every restart.
+//
+// A query failure or empty table fails open (floor=0, meaning "no filter" —
+// the original full-scan behavior), so a broken auto-floor can only slow
+// recovery back down, never corrupt state: floor=0 makes
+// recoveryRecencyClauseFor/recoveryPreFloorClauseFor both no-ops, so every key
+// still goes through the normal (slow) full-value load and lands in the
+// negative filter, same as if auto-floor never ran.
+func recoveryFloorFor(ctx context.Context, conn *ch.Client, db, table, column string) uint64 {
+	if mb, ok := recoveryManualFloor(); ok {
+		return mb
+	}
+	if recoveryAutoFloorDisabled() {
+		return 0
+	}
+	// count()=0 is checked before quantile() is converted to UInt64: quantile()
+	// over zero rows returns NaN (not NULL), and toUInt64(NaN) raises a
+	// CANNOT_CONVERT_TYPE exception rather than coalescing — confirmed against a
+	// live server. Branching on count() avoids ever evaluating that conversion.
+	var q proto.ColUInt64
+	err := conn.Do(ctx, ch.Query{
+		Body: fmt.Sprintf("SELECT if(count() = 0, 0, toUInt64(quantile(%v)(%s))) AS q FROM %s.%s",
+			recoveryQuantile(), quoteIdent(column), quoteIdent(db), quoteIdent(table)),
+		Result: proto.Results{{"{{"}}Name: "q", Data: &q}},
+	})
+	if err != nil || q.Rows() == 0 {
+		return 0
+	}
+	return q.Row(0)
+}
+
+func recoveryRecencyClauseFor(floor uint64, column string) string {
+	if floor == 0 {
 		return ""
 	}
-	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " >= " + strconv.FormatUint(mb, 10)
+	return " AND " + quoteIdent("t") + "." + quoteIdent(column) + " >= " + strconv.FormatUint(floor, 10)
 }
 
 func recoverColdParallel[T any](
@@ -181,17 +256,11 @@ func flushAsyncInserts(ctx context.Context, conn *ch.Client) error {
 	return conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
 }
 
-func recoveryPreFloorClause() (clause string, active bool) {
-	var mb uint64
-	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			mb = uint64(n)
-		}
-	}
-	if mb == 0 {
+func recoveryPreFloorClauseFor(floor uint64, column string) (clause string, active bool) {
+	if floor == 0 {
 		return "", false
 	}
-	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " < " + strconv.FormatUint(mb, 10), true
+	return " AND " + quoteIdent("t") + "." + quoteIdent(column) + " < " + strconv.FormatUint(floor, 10), true
 }
 
 func recoverFilterKeysParallel[K any](

@@ -11,6 +11,7 @@ import (
 	"net/textproto"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestFetchRawOmitsToBlockInCursorMode(t *testing.T) {
@@ -129,6 +130,61 @@ func TestFetchParsesForkConflict(t *testing.T) {
 	}
 	if len(fork.PreviousBlocks) != 2 || fork.PreviousBlocks[1].Number != 11 || fork.PreviousBlocks[1].Hash != "0x11a" {
 		t.Fatalf("previous blocks = %#v", fork.PreviousBlocks)
+	}
+}
+
+func TestFetchParsesRateLimitWithRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	c := New(server.URL)
+	defer c.Close()
+	_, err := c.FetchWithParent(context.Background(), 12, nil, "", false, nil)
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("err = %v, want RateLimitError", err)
+	}
+	if rl.RetryAfter != 3*time.Second {
+		t.Fatalf("RetryAfter = %s, want 3s", rl.RetryAfter)
+	}
+}
+
+func TestFetchRateLimitWithoutRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	c := New(server.URL)
+	defer c.Close()
+	_, err := c.FetchWithParent(context.Background(), 12, nil, "", false, nil)
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("err = %v, want RateLimitError", err)
+	}
+	if rl.RetryAfter != 0 {
+		t.Fatalf("RetryAfter = %s, want 0 (absent header)", rl.RetryAfter)
+	}
+}
+
+func TestParseRetryAfterHTTPDate(t *testing.T) {
+	h := http.Header{}
+	h.Set("Retry-After", time.Now().Add(30*time.Second).UTC().Format(http.TimeFormat))
+	d := parseRetryAfter(h)
+	// HTTP-date has 1s resolution and some wall time elapses; allow a window.
+	if d < 20*time.Second || d > 31*time.Second {
+		t.Fatalf("parseRetryAfter(date) = %s, want ~30s", d)
+	}
+	if got := parseRetryAfter(http.Header{}); got != 0 {
+		t.Fatalf("parseRetryAfter(empty) = %s, want 0", got)
+	}
+	h2 := http.Header{}
+	h2.Set("Retry-After", "-5")
+	if got := parseRetryAfter(h2); got != 0 {
+		t.Fatalf("parseRetryAfter(negative) = %s, want 0", got)
 	}
 }
 

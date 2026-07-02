@@ -6,38 +6,52 @@ on:
   pull_request:
     branches: [main]
 
+# Two jobs run in parallel so total wall-clock is the slower of the two, not the
+# sum. Both reuse the Go build/module cache (actions/setup-go cache: true), so a
+# warm run skips the ~30s cold compile of go-ethereum/pebble/clickhouse.
 jobs:
-  integration:
+  build-test:
+    name: Build, unit tests, scaffold
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    services:
-      clickhouse:
-        image: clickhouse/clickhouse-server:latest
-        ports:
-          - 9000:9000
-          - 8123:8123
-        env:
-          CLICKHOUSE_USER: default
-          CLICKHOUSE_PASSWORD: sqd-clickhouse
-          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-        options: >-
-          --health-cmd "clickhouse-client --password sqd-clickhouse -q 'SELECT 1'"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 10
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          cache: true
+          cache-dependency-path: go.sum
 
       - name: Build
         run: go build -o tmp/sqd-go .
 
+      # examples/uniswap and examples/lbtc's generated/ packages are git-ignored
+      # (.gitignore's bare `generated` pattern) and produced by codegen, not
+      # committed. Both examples (and their _test files) import that package, so
+      # it must exist on disk before `go list ./...` / `go test` load them —
+      # otherwise "no required module provides package .../generated" breaks the
+      # whole job. codegen is offline (parses config + templates), so this runs
+      # without network or ClickHouse.
+      - name: Codegen uniswap example
+        run: |
+          ./tmp/sqd-go codegen examples/uniswap
+          test -f examples/uniswap/generated/events.go || (echo "events.go not generated" && exit 1)
+          test -f examples/uniswap/generated/parser.go || (echo "parser.go not generated" && exit 1)
+          echo "codegen uniswap: OK"
+
+      - name: Codegen lbtc example
+        run: |
+          ./tmp/sqd-go codegen examples/lbtc
+          test -f examples/lbtc/generated/events.go || (echo "events.go not generated" && exit 1)
+          test -f examples/lbtc/generated/parser.go || (echo "parser.go not generated" && exit 1)
+          echo "codegen lbtc: OK"
+
+      # Exclude examples/polymarket (heavy benches, git-ignored) and the top-level
+      # coldcache package (grep matches the path segment, not "internal/coldcache"
+      # which never existed). Live-portal tests self-skip unless SQD_LIVE_PORTAL=1.
       - name: Unit tests
-        run: go test $(go list ./... | grep -v 'examples/polymarket' | grep -v 'internal/coldcache') -count=1 -timeout 60s
+        run: go test $(go list ./... | grep -v 'examples/polymarket' | grep -v '/coldcache') -count=1 -timeout 180s
 
       - name: Init from ABI (contract-import)
         run: |
@@ -59,6 +73,37 @@ jobs:
           test -f usdc/generated/schema.go || (echo "schema.go not generated" && exit 1)
           echo "codegen: OK"
 
+  integration:
+    name: ClickHouse integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      clickhouse:
+        # Pinned tag (not :latest) so a ClickHouse release can't silently change
+        # startup time or behavior and break this job.
+        image: clickhouse/clickhouse-server:24.8
+        ports:
+          - 9000:9000
+          - 8123:8123
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: sqd-clickhouse
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        options: >-
+          --health-cmd "clickhouse-client --password sqd-clickhouse -q 'SELECT 1'"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: go.sum
+
       - name: Integration test (15s indexing)
         env:
           CLICKHOUSE_HOST: 127.0.0.1
@@ -67,4 +112,17 @@ jobs:
           CLICKHOUSE_USER: default
           CLICKHOUSE_PASSWORD: sqd-clickhouse
         run: |
-          go test -v -run TestIntegrationIndexSmallRange -count=1 -timeout 30s ./internal/ingestion/
+          go test -v -run TestIntegrationIndexSmallRange -count=1 -timeout 60s ./internal/ingestion/
+
+      # internal/database's live-ClickHouse tests self-skip without a reachable
+      # server (see clickhouseAvailable() in integration_test.go), so they only
+      # actually run here, against this job's service container.
+      - name: Database package tests (live ClickHouse)
+        env:
+          CLICKHOUSE_HOST: 127.0.0.1
+          CLICKHOUSE_NATIVE_PORT: "9000"
+          CLICKHOUSE_HTTP_PORT: "8123"
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: sqd-clickhouse
+        run: |
+          go test -v -count=1 -timeout 120s ./internal/database/

@@ -215,12 +215,17 @@ func findHotStateSpec(specs []hotStateSpec, table customTableSpec) (hotStateSpec
 
 func stateImports(handles []stateHandleSpec) []string {
 	imports := map[string]struct{}{
-		`"context"`:                     {},
-		`"fmt"`:                         {},
-		`"os"`:                          {},
-		`"strconv"`:                     {},
-		`"sync"`:                        {},
-		`"github.com/ClickHouse/ch-go"`: {},
+		`"bufio"`:                              {},
+		`"context"`:                            {},
+		`"encoding/json"`:                      {},
+		`"fmt"`:                                {},
+		`"log"`:                                {},
+		`"os"`:                                 {},
+		`"path/filepath"`:                      {},
+		`"strconv"`:                            {},
+		`"sync"`:                               {},
+		`"github.com/ClickHouse/ch-go"`:        {},
+		`"github.com/klauspost/compress/zstd"`: {},
 	}
 	for _, handle := range handles {
 		for _, field := range handle.spec.table.keyFields() {

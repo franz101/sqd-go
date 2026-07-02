@@ -150,8 +150,8 @@ func TestDropClickHouseDatabaseIdempotent(t *testing.T) {
 // --- Close / Conn / DB accessors -------------------------------------------
 
 // TestStoreAccessors verifies DB() returns the configured database name, the
-// three connection accessors return distinct non-nil *ch.Client before
-// Close, and Close itself does not error.
+// four connection accessors return distinct non-nil *ch.Client before Close,
+// and Close itself does not error.
 func TestStoreAccessors(t *testing.T) {
 	store := newTestStore(t)
 
@@ -164,11 +164,30 @@ func TestStoreAccessors(t *testing.T) {
 	if store.CommitConn() == nil {
 		t.Error("CommitConn() is nil")
 	}
+	if store.PruneConn() == nil {
+		t.Error("PruneConn() is nil")
+	}
 	if store.Conn() == store.InsertConn() {
 		t.Error("Conn() and InsertConn() unexpectedly share the same *ch.Client")
 	}
 	if store.Conn() == store.CommitConn() {
 		t.Error("Conn() and CommitConn() unexpectedly share the same *ch.Client")
+	}
+	if store.Conn() == store.PruneConn() {
+		t.Error("Conn() and PruneConn() unexpectedly share the same *ch.Client")
+	}
+	if store.CommitConn() == store.PruneConn() {
+		t.Error("CommitConn() and PruneConn() unexpectedly share the same *ch.Client")
+	}
+
+	// PruneConn must be a genuinely live, independent connection, not just a
+	// distinct pointer — exercise it directly the way CompactionPruneState does.
+	var cnt proto.ColUInt64
+	if err := store.PruneConn().Do(context.Background(), ch.Query{
+		Body:   "SELECT toUInt64(1) AS c",
+		Result: proto.Results{{Name: "c", Data: &cnt}},
+	}); err != nil {
+		t.Errorf("PruneConn().Do: %v", err)
 	}
 }
 

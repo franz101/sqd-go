@@ -66,6 +66,43 @@ func (e *ForkError) Error() string {
 	return fmt.Sprintf("sqd fork detected, latest portal block sample is %d/%s", last.Number, last.Hash)
 }
 
+// RateLimitError is returned when the portal responds 429 Too Many Requests.
+// RetryAfter carries the server's requested back-off (0 if the Retry-After
+// header was absent or unparseable). The fetch loop honors it verbatim and,
+// unlike a generic fetch error, must NOT shrink the adaptive page size — the
+// request was well-formed, it was only throttled.
+type RateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("sqd rate limited (429), retry after %s", e.RetryAfter)
+	}
+	return "sqd rate limited (429)"
+}
+
+// parseRetryAfter reads the Retry-After header, which is either an integer
+// number of seconds or an HTTP-date. Returns 0 when absent or unparseable.
+func parseRetryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 func DefaultEVMFields() Fields {
 	return Fields{
 		"block": {
@@ -149,6 +186,9 @@ func (c *Client) FetchWithParent(ctx context.Context, fromBlock uint64, toBlock 
 		}
 		return Response{}, fork
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return Response{}, &RateLimitError{RetryAfter: parseRetryAfter(resp.Header)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return Response{}, fmt.Errorf("sqd status %d: %s", resp.StatusCode, strings.TrimSpace(string(detail)))
@@ -163,7 +203,13 @@ func (c *Client) FetchWithParent(ctx context.Context, fromBlock uint64, toBlock 
 	}
 	zstdStart := time.Now()
 	if c.zstdDecoder == nil {
-		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+		// One decoder per Client, one Client per parallel-fetch worker: with
+		// WithDecoderConcurrency(0) (=GOMAXPROCS) each decoder tries to shard a
+		// single response frame across all cores, which just adds goroutine
+		// fan-out overhead on frames this size (measured ~1.3-1.6x slower and
+		// ~16x more allocation than concurrency=1 on a real captured page).
+		// Matches klauspost's own gzhttp.Transport zstd client default.
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
 		if err != nil {
 			return Response{}, fmt.Errorf("create zstd decoder: %w", err)
 		}

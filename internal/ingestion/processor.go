@@ -83,12 +83,20 @@ type Flusher interface {
 	Flush(ctx context.Context, store *database.Store, blockNumber uint64) (uint64, error)
 }
 
-// SnapshotController is optionally implemented by processors that keep in-memory
-// fork-recovery snapshots. The ingestion layer disables them during finalized
-// backfill (no reorgs) to remove their GC/memory cost, and enables them in cursor
-// mode where reorg recovery may need them.
+// SnapshotController is optionally implemented by processors that keep
+// fork-recovery rollback state. The ingestion layer disables it during finalized
+// backfill (no reorgs) to remove its capture cost, and enables it in cursor
+// mode where reorg recovery may need it.
 type SnapshotController interface {
 	SetSnapshotsEnabled(enabled bool)
+}
+
+// RollbackPruner is optionally implemented by processors whose fork-recovery
+// state keeps an on-disk rollback journal. The ingestion layer reports the
+// advancing finalized head so journal segments that can never be rewound to
+// (at or below finality) are deleted promptly.
+type RollbackPruner interface {
+	PruneRollback(finalizedBlock uint64)
 }
 
 // ProcessorProfileReporter optionally exposes processor-specific cumulative

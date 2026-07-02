@@ -587,7 +587,9 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 			evPosSplit.CollateralToken = ev.CollateralToken()
 			evPosSplit.ParentCollectionID = ev.ParentCollectionID()
 			evPosSplit.ConditionID = ev.ConditionID()
-			evPosSplit.Partition = ev.Partition()
+			// Partition intentionally not materialized: handlePositionSplit never
+			// reads it (it hardcodes the binary-outcome 0/1 split), so allocating
+			// a fresh []uint256.Int here was pure waste.
 			evPosSplit.Amount = ev.Amount()
 			handlePositionSplit(state, &evPosSplit)
 		case generated.EventTypeConditionalTokensPositionsMerge:
@@ -598,7 +600,8 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 			evPosMerge.CollateralToken = ev.CollateralToken()
 			evPosMerge.ParentCollectionID = ev.ParentCollectionID()
 			evPosMerge.ConditionID = ev.ConditionID()
-			evPosMerge.Partition = ev.Partition()
+			// Partition intentionally not materialized: handlePositionsMerge never
+			// reads it, same as handlePositionSplit above.
 			evPosMerge.Amount = ev.Amount()
 			handlePositionsMerge(state, &evPosMerge)
 		case generated.EventTypeConditionalTokensPayoutRedemption:
@@ -609,7 +612,9 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 			evPayoutCTF.CollateralToken = ev.CollateralToken()
 			evPayoutCTF.ParentCollectionID = ev.ParentCollectionID()
 			evPayoutCTF.ConditionID = ev.ConditionID()
-			evPayoutCTF.IndexSets = ev.IndexSets()
+			// IndexSets intentionally not materialized: handlePayoutRedemptionCTF
+			// derives outcome indices from cond.Payouts (state), never from this
+			// event field.
 			evPayoutCTF.Payout = ev.Payout()
 			handlePayoutRedemptionCTF(state, &evPayoutCTF)
 		case generated.EventTypeExchangeOrderFilled:
@@ -677,7 +682,15 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 			evNRPayout.EventMeta = ev.Meta()
 			evNRPayout.Redeemer = ev.Redeemer()
 			evNRPayout.ConditionID = ev.ConditionID()
-			evNRPayout.Amounts = ev.Amounts()
+			// Fill from evNRPayout's own backing array (reused across events, like
+			// the scratch struct itself) instead of ev.Amounts(), which allocates a
+			// fresh []uint256.Int via ColArr.RowAppend on every call. Steady-state
+			// zero-alloc once the capacity reaches the (always small, 2-element)
+			// high-water mark.
+			evNRPayout.Amounts = evNRPayout.Amounts[:0]
+			for i := 0; i < ev.AmountsLen(); i++ {
+				evNRPayout.Amounts = append(evNRPayout.Amounts, ev.AmountsAt(i))
+			}
 			evNRPayout.Payout = ev.Payout()
 			handlePayoutRedemptionNR(state, &evNRPayout)
 		case generated.EventTypeFixedProductMarketMakerFactoryFixedProductMarketMakerCreation:
@@ -688,7 +701,15 @@ func ProcessProto(state *generated.State, block *generated.ProtoEventBlock) erro
 			evFpmmCreation.FixedProductMarketMaker = ev.FixedProductMarketMaker()
 			evFpmmCreation.ConditionalTokens = ev.ConditionalTokens()
 			evFpmmCreation.CollateralToken = ev.CollateralToken()
-			evFpmmCreation.ConditionIds = ev.ConditionIds()
+			// handleFixedProductMarketMakerCreation only ever reads ConditionIds[0]
+			// (guarded by a len==0 check), so materialize at most one element
+			// instead of the whole array via ev.ConditionIds() (ColArr.RowAppend
+			// allocates unconditionally). Reuses evFpmmCreation's own backing
+			// array like the Amounts case above.
+			evFpmmCreation.ConditionIds = evFpmmCreation.ConditionIds[:0]
+			if ev.ConditionIdsLen() > 0 {
+				evFpmmCreation.ConditionIds = append(evFpmmCreation.ConditionIds, ev.ConditionIdsAt(0))
+			}
 			evFpmmCreation.Fee = ev.Fee()
 			handleFixedProductMarketMakerCreation(state, &evFpmmCreation)
 		case generated.EventTypeFixedProductMarketMakerFPMMBuy:

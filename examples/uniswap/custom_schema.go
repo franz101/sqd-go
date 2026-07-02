@@ -13,7 +13,10 @@ import (
 // from the generated State: the "Schema" suffix is stripped, so
 // UserPositionSchema -> state.UserPosition with .Get(key) / .Save(value, meta).
 // The "// pk:" comment immediately above the struct names the primary-key
-// field(s).
+// field(s) (falling back to a matching config.yaml "state:" entry's key, then
+// an "ID" field, then the first field). Every table is a plain MergeTree
+// append-only history — one row per commit, suffixed "_log" — paired with a
+// "_live" view that resolves to one row per primary key (latest write wins).
 //
 // This file MUST use the same package name as custom_processor.go ("uniswap").
 

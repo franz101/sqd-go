@@ -71,6 +71,22 @@ func TestParseArgsStartNoResume(t *testing.T) {
 	}
 }
 
+func TestParseArgsFgprofile(t *testing.T) {
+	p, err := parseArgs([]string{"start", "examples/sample_project", "--fgprofile", "wall.pprof"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.fgprofile != "wall.pprof" {
+		t.Fatalf("fgprofile = %q, want wall.pprof", p.fgprofile)
+	}
+}
+
+func TestParseArgsFgprofileMissingValue(t *testing.T) {
+	if _, err := parseArgs([]string{"start", "examples/sample_project", "--fgprofile"}); err == nil {
+		t.Fatal("expected error for --fgprofile with no value")
+	}
+}
+
 func TestExtractEventsFromABIFormattedJSON(t *testing.T) {
 	got, err := extractEventsFromABI([]byte(erc20ABI))
 	if err != nil {
@@ -308,4 +324,49 @@ chains:
 	if !strings.Contains(string(processorBytes), "*generated.TokenTransfer") {
 		t.Errorf("custom_processor.go did not derive the configured event type: %s", string(processorBytes))
 	}
+}
+
+// TestHasStatefulSchema locks in which projects are allowed to run with a nil
+// compiled processor. A plain event indexer (no `state:` block, no
+// custom_schema.go — e.g. a bare ERC20 transfer demo) must report false: cold
+// cache defaults on for every project, and runStartPipelineInternal only hard
+// fails a nil processor when hasStatefulSchema is true. Regressing this to
+// "true" for stateless projects would make the default cold-cache-on path
+// fatal for the most basic possible project.
+func TestHasStatefulSchema(t *testing.T) {
+	t.Run("nil project", func(t *testing.T) {
+		if hasStatefulSchema(nil) {
+			t.Error("hasStatefulSchema(nil) = true, want false")
+		}
+	})
+
+	t.Run("stateless project (no state block, no custom_schema.go)", func(t *testing.T) {
+		dir := t.TempDir()
+		project := &config.Project{Root: dir, Config: &config.Config{Name: "erc20demo"}}
+		if hasStatefulSchema(project) {
+			t.Error("hasStatefulSchema = true for a stateless project, want false")
+		}
+	})
+
+	t.Run("config state block present", func(t *testing.T) {
+		dir := t.TempDir()
+		project := &config.Project{
+			Root:   dir,
+			Config: &config.Config{Name: "poly", State: []config.StateConfig{{}}},
+		}
+		if !hasStatefulSchema(project) {
+			t.Error("hasStatefulSchema = false with a non-empty state block, want true")
+		}
+	})
+
+	t.Run("custom_schema.go present on disk", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "custom_schema.go"), []byte("package main"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		project := &config.Project{Root: dir, Config: &config.Config{Name: "poly"}}
+		if !hasStatefulSchema(project) {
+			t.Error("hasStatefulSchema = false with custom_schema.go on disk, want true")
+		}
+	})
 }

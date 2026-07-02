@@ -80,6 +80,11 @@ const (
 	cursorPollInterval = 5 * time.Second
 	statsInterval      = 10 * time.Second
 
+	// rateLimitDefaultBackoff is the fallback pause after a 429 whose response
+	// carried no usable Retry-After header. The portal's documented ceiling is
+	// ~5 req/s, so a full second is a gentle, correct default.
+	rateLimitDefaultBackoff = 1 * time.Second
+
 	// Adaptive page sizing: when pageSize=0, grow page size based on performance
 	// Target ~20k blocks/second processing rate
 	targetBlocksPerSec  = 20000
@@ -184,6 +189,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	} else if err := store.EnsureTablesWithOptions(ctx, forkMode.UsesCollapsingMergeTree(), database.EnsureTablesOptions{
 		StoreBlocks: cfg.ShouldStoreBlocks(),
 		StoreLogs:   cfg.ShouldStoreRawLogs(),
+		Codec:       cfg.ColumnCodec(),
 	}); err != nil {
 		return fmt.Errorf("ensure tables: %w", err)
 	}
@@ -361,7 +367,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		defer sqdFinalized.Close()
 	}
 	jsonl := parser.NewFastJSONLParser(1024)
-	replayBufCap := 65536 // ~64K blocks of replay capacity
+	// replayBufCap must stay comfortably under the generated Processor's
+	// defaultRingBufferSize (custom_processor.go.tmpl, currently 8192): the
+	// batch-parse producer parses blocks into a fixed pool of that many
+	// *ProtoEventBlock objects and recycles them round-robin, independent of
+	// whether the consumer has read them yet. If this backlog bound ever
+	// exceeds that pool size, the producer will Reset() and overwrite a slot a
+	// still-unconsumed replay entry points to — a cross-goroutine
+	// use-after-reset race that can silently corrupt block data or panic
+	// (observed: index-out-of-range in a ProtoView.Meta() accessor). This was
+	// previously 65536, ~8x the ring's actual capacity, so the race was
+	// structurally guaranteed on any page >=8192 blocks — see BUGR.md. Keep
+	// this below defaultRingBufferSize (with margin for the backpressure
+	// check's own -100 slack below) if either constant changes.
+	replayBufCap := 8000 // bounded by defaultRingBufferSize (8192), see comment above
 	if noReplay {
 		replayBufCap = 1024 // small smoothing pipe; no fork recovery needed
 	}
@@ -387,6 +406,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 			sc.SetSnapshotsEnabled(!cursorMode) // backfill: off; non-cursor: on (no finalized head to track)
 		}
 	}
+	// Rollback-journal pruning: segments at or below the finalized head can
+	// never be rewound to, so the processor drops them as finality advances.
+	rollbackPruner, _ := proc.(RollbackPruner)
+	var lastRollbackPrune uint64
 	backfillGC := cursorMode && !snapshotsActive
 	var previousGOGC int
 	if backfillGC {
@@ -492,11 +515,25 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// sequential one. parallelBound is the highest block the prefetcher produces;
 	// the consumer uses it to gate the empty-gap skip below.
 	//
-	// parallelSkipEmpties fetches with includeAllBlocks=false (sparse: matching
-	// blocks + the portal's marker), which transfers far less data but leaves
-	// block-number gaps. The consumer skips those gaps (see CeilBlock below). It is
-	// only safe when the project does not need every block — i.e. it stores neither
-	// the raw blocks table nor the raw logs table; otherwise we fetch every block.
+	// parallelSkipEmpties/sequentialSkipEmpties fetch with includeAllBlocks=false
+	// (sparse: matching blocks + the portal's marker), which transfers far less
+	// data but leaves block-number gaps. The consumer skips those gaps (see
+	// CeilBlock below). It is only safe when the project does not need every
+	// block — i.e. it stores neither the raw blocks table nor the raw logs
+	// table; otherwise we fetch every block.
+	//
+	// sequentialSkipEmpties used to also require !cursorMode, but CursorMode is
+	// hardcoded true for every real `start`/`dev` invocation (internal/cli/run.go),
+	// so that gate made it permanently dead in production — the sequential
+	// (non --parallel-fetch) path always fetched full block+log data, even
+	// across long empty ranges during backfill. Unlike parallelSkipEmpties
+	// (proven via --parallel-fetch, but scoped to the immutable finalized
+	// region only), enabling this for the sequential path also reaches the
+	// paced /stream endpoint once the producer is within finalizedCatchupMargin
+	// of the finalized head (see sqdFinalized below) — an untested combination
+	// (sparse marker blocks + live-tip fork detection). Opt in explicitly with
+	// SQD_SEQUENTIAL_SKIP_EMPTIES=1 until that's verified; default stays off so
+	// existing runs are unaffected.
 	parallelEnabled := parallelFetch && cursorMode
 	if parallelFetch && !cursorMode {
 		log.Printf("Chain %d: --parallel-fetch requires cursor mode; using sequential fetch", chain.ID)
@@ -504,7 +541,11 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	parallelWorkers, parallelPageSize, parallelRPS := ParallelFetchSettings()
 	parallelLimiter := newRateLimiter(parallelRPS, defaultParallelBurst)
 	parallelSkipEmpties := parallelEnabled && !storeBlocks && !cfg.ShouldStoreRawLogs()
-	sequentialSkipEmpties := !cursorMode && !storeBlocks && !cfg.ShouldStoreRawLogs()
+	sequentialSkipEmpties := envconfig.GetenvBool("SQD_SEQUENTIAL_SKIP_EMPTIES", false) &&
+		!storeBlocks && !cfg.ShouldStoreRawLogs()
+	if sequentialSkipEmpties {
+		log.Printf("Chain %d: SQD_SEQUENTIAL_SKIP_EMPTIES=1 — sequential fetch uses includeAllBlocks=false (sparse empty-range skipping)", chain.ID)
+	}
 	parallelEndpoint := chainEndpoint(chain.ID, false)
 	var parallelBound atomic.Uint64
 	// Per-fetch latency budget for the dense adaptive path (sequential cursor mode).
@@ -689,6 +730,25 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 						if cursorMode && errors.As(err, &forkErr) {
 							sendSignal(producerSignal{forkErr: forkErr})
 							return
+						}
+						// Rate limiting (429) is not a malformed-request signal: the range
+						// was fine, the portal just wants us to slow down. Honor Retry-After
+						// verbatim and, critically, do NOT shrink the adaptive page size —
+						// halving here would permanently degrade throughput after a transient
+						// throttle. pBlock is unchanged, so no block is skipped.
+						var rlErr *client.RateLimitError
+						if errors.As(err, &rlErr) {
+							wait := rlErr.RetryAfter
+							if wait <= 0 {
+								wait = rateLimitDefaultBackoff
+							}
+							log.Printf("Chain %d: fetch %s rate limited (429), backing off %s...", chain.ID, rangeLabel, wait)
+							select {
+							case <-pCtx.Done():
+								return
+							case <-time.After(wait):
+							}
+							continue
 						}
 						log.Printf("Chain %d: fetch %s error: %v, retrying...", chain.ID, rangeLabel, err)
 						// Adaptive paging back-off: a too-large range can reject/time out, so
@@ -1237,6 +1297,10 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 							chain.ID, entry.number, snapshotEnableMargin, entry.finalized.Number)
 					}
 				}
+				if rollbackPruner != nil && snapshotsActive && entry.finalized != nil && entry.finalized.Number > lastRollbackPrune {
+					lastRollbackPrune = entry.finalized.Number
+					rollbackPruner.PruneRollback(entry.finalized.Number)
+				}
 			}
 
 			atomic.AddUint64(&totalEvents, uint64(len(entry.events)))
@@ -1409,10 +1473,20 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 		// returns a marker block at the end of every scanned response), the
 		// gap is confirmed-empty and was never fetched, so jump to the next
 		// present block instead of waiting forever for it.
+		//
+		// sequentialSkipEmpties makes gaps legitimate everywhere the sequential
+		// fetch runs (both before parallel engages and after it hands back at
+		// pb), so it must unconditionally allow the skip. parallelSkipEmpties
+		// alone only makes gaps legitimate up to pb — beyond that, sequential
+		// fetch (dense, when sequentialSkipEmpties is off) never leaves a real
+		// gap, so waiting is correct. Gating solely on "!parallelSkipEmpties ||
+		// c <= pb" (ignoring sequentialSkipEmpties) livelocks the consumer once
+		// c > pb with both flags on: it refuses to skip a block that was
+		// genuinely never fetched and will never arrive.
 		if parallelSkipEmpties || sequentialSkipEmpties {
 			c := currentConsumerBlockVal
 			pb := parallelBound.Load()
-			if (!parallelSkipEmpties || (pb != 0 && c <= pb)) && c <= replayBuf.LatestBlock() {
+			if (sequentialSkipEmpties || (pb != 0 && c <= pb)) && c <= replayBuf.LatestBlock() {
 				if next, ok := replayBuf.CeilBlock(c); ok {
 					currentConsumerBlockVal = next
 					currentConsumerBlock.Store(currentConsumerBlockVal)
@@ -1568,8 +1642,16 @@ func processChain(ctx context.Context, store *database.Store, cfg *config.Config
 	// Clean completion (backfill): force a durable commit of the tail (the blocks
 	// processed since the last periodic commit) and advance the checkpoint to it,
 	// so nothing processed is lost on a clean exit. Crash/cancel paths intentionally
-	// skip this — they resume from the last durable checkpoint and re-fetch the gap.
-	if !cursorMode && flusher != nil && lastCheckpoint > 0 {
+	// skip this — they `return` from the ctx.Done()/producer-error branches above
+	// without reaching here, so by this point the exit is already known to be a
+	// clean producerDone break; they resume from the last durable checkpoint and
+	// re-fetch the gap. cursorMode does NOT indicate a crash/cancel — the default
+	// `sqd-go start` path runs with cursorMode=true even for a bounded --end-block
+	// backfill, so gating on !cursorMode silently dropped this flush for the common
+	// case: the periodic commit cadence (SQD_COMMIT_INTERVAL blocks / 3s) can leave
+	// up to one interval's worth of derived state uncommitted at the configured end
+	// block, with no later run to pick up the slack.
+	if flusher != nil && lastCheckpoint > 0 {
 		committed, err := flusher.Flush(ctx, store, lastCheckpoint)
 		if err != nil {
 			return fmt.Errorf("final flush at %d: %w", lastCheckpoint, err)

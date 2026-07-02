@@ -35,12 +35,13 @@ type ProtoEventBlock struct {
 	ConditionalTokensConditionPreparation_outcome_slot_count proto.ColUInt256
 
 	// ConditionalTokensConditionResolution event columns
-	ConditionalTokensConditionResolution_meta_index         proto.ColUInt64
-	ConditionalTokensConditionResolution_condition_i_d      proto.ColFixedStr // 32 bytes
-	ConditionalTokensConditionResolution_oracle             proto.ColFixedStr // 20 bytes
-	ConditionalTokensConditionResolution_question_i_d       proto.ColFixedStr // 32 bytes
-	ConditionalTokensConditionResolution_payout_denominator proto.ColUInt256
-	ConditionalTokensConditionResolution_payout_numerators  *proto.ColArr[proto.UInt256]
+	ConditionalTokensConditionResolution_meta_index                proto.ColUInt64
+	ConditionalTokensConditionResolution_condition_i_d             proto.ColFixedStr // 32 bytes
+	ConditionalTokensConditionResolution_oracle                    proto.ColFixedStr // 20 bytes
+	ConditionalTokensConditionResolution_question_i_d              proto.ColFixedStr // 32 bytes
+	ConditionalTokensConditionResolution_payout_denominator        proto.ColUInt256
+	ConditionalTokensConditionResolution_payout_numerators         *proto.ColArr[proto.UInt256]
+	scratch_ConditionalTokensConditionResolution_payout_numerators []proto.UInt256
 
 	// ConditionalTokensPositionSplit event columns
 	ConditionalTokensPositionSplit_meta_index            proto.ColUInt64
@@ -49,6 +50,7 @@ type ProtoEventBlock struct {
 	ConditionalTokensPositionSplit_parent_collection_i_d proto.ColFixedStr // 32 bytes
 	ConditionalTokensPositionSplit_condition_i_d         proto.ColFixedStr // 32 bytes
 	ConditionalTokensPositionSplit_partition             *proto.ColArr[proto.UInt256]
+	scratch_ConditionalTokensPositionSplit_partition     []proto.UInt256
 	ConditionalTokensPositionSplit_amount                proto.ColUInt256
 
 	// ConditionalTokensPositionsMerge event columns
@@ -58,6 +60,7 @@ type ProtoEventBlock struct {
 	ConditionalTokensPositionsMerge_parent_collection_i_d proto.ColFixedStr // 32 bytes
 	ConditionalTokensPositionsMerge_condition_i_d         proto.ColFixedStr // 32 bytes
 	ConditionalTokensPositionsMerge_partition             *proto.ColArr[proto.UInt256]
+	scratch_ConditionalTokensPositionsMerge_partition     []proto.UInt256
 	ConditionalTokensPositionsMerge_amount                proto.ColUInt256
 
 	// ConditionalTokensPayoutRedemption event columns
@@ -67,6 +70,7 @@ type ProtoEventBlock struct {
 	ConditionalTokensPayoutRedemption_parent_collection_i_d proto.ColFixedStr // 32 bytes
 	ConditionalTokensPayoutRedemption_condition_i_d         proto.ColFixedStr // 32 bytes
 	ConditionalTokensPayoutRedemption_index_sets            *proto.ColArr[proto.UInt256]
+	scratch_ConditionalTokensPayoutRedemption_index_sets    []proto.UInt256
 	ConditionalTokensPayoutRedemption_payout                proto.ColUInt256
 
 	// ExchangeOrderFilled event columns
@@ -165,11 +169,12 @@ type ProtoEventBlock struct {
 	NegRiskAdapterPositionsConverted_amount      proto.ColUInt256
 
 	// NegRiskAdapterPayoutRedemption event columns
-	NegRiskAdapterPayoutRedemption_meta_index    proto.ColUInt64
-	NegRiskAdapterPayoutRedemption_redeemer      proto.ColFixedStr // 20 bytes
-	NegRiskAdapterPayoutRedemption_condition_i_d proto.ColFixedStr // 32 bytes
-	NegRiskAdapterPayoutRedemption_amounts       *proto.ColArr[proto.UInt256]
-	NegRiskAdapterPayoutRedemption_payout        proto.ColUInt256
+	NegRiskAdapterPayoutRedemption_meta_index      proto.ColUInt64
+	NegRiskAdapterPayoutRedemption_redeemer        proto.ColFixedStr // 20 bytes
+	NegRiskAdapterPayoutRedemption_condition_i_d   proto.ColFixedStr // 32 bytes
+	NegRiskAdapterPayoutRedemption_amounts         *proto.ColArr[proto.UInt256]
+	scratch_NegRiskAdapterPayoutRedemption_amounts []proto.UInt256
+	NegRiskAdapterPayoutRedemption_payout          proto.ColUInt256
 
 	// FixedProductMarketMakerFactoryFixedProductMarketMakerCreation event columns
 	FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_meta_index                 proto.ColUInt64
@@ -178,6 +183,7 @@ type ProtoEventBlock struct {
 	FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_conditional_tokens         proto.ColFixedStr // 20 bytes
 	FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_collateral_token           proto.ColFixedStr // 20 bytes
 	FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids              *proto.ColArr[[]byte]
+	scratch_FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids      [][]byte
 	FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_fee                        proto.ColUInt256
 
 	// FixedProductMarketMakerFPMMBuy event columns
@@ -197,15 +203,17 @@ type ProtoEventBlock struct {
 	FixedProductMarketMakerFPMMSell_outcome_tokens_sold proto.ColUInt256
 
 	// FixedProductMarketMakerFPMMFundingAdded event columns
-	FixedProductMarketMakerFPMMFundingAdded_meta_index    proto.ColUInt64
-	FixedProductMarketMakerFPMMFundingAdded_funder        proto.ColFixedStr // 20 bytes
-	FixedProductMarketMakerFPMMFundingAdded_amounts_added *proto.ColArr[proto.UInt256]
-	FixedProductMarketMakerFPMMFundingAdded_shares_minted proto.ColUInt256
+	FixedProductMarketMakerFPMMFundingAdded_meta_index            proto.ColUInt64
+	FixedProductMarketMakerFPMMFundingAdded_funder                proto.ColFixedStr // 20 bytes
+	FixedProductMarketMakerFPMMFundingAdded_amounts_added         *proto.ColArr[proto.UInt256]
+	scratch_FixedProductMarketMakerFPMMFundingAdded_amounts_added []proto.UInt256
+	FixedProductMarketMakerFPMMFundingAdded_shares_minted         proto.ColUInt256
 
 	// FixedProductMarketMakerFPMMFundingRemoved event columns
 	FixedProductMarketMakerFPMMFundingRemoved_meta_index                       proto.ColUInt64
 	FixedProductMarketMakerFPMMFundingRemoved_funder                           proto.ColFixedStr // 20 bytes
 	FixedProductMarketMakerFPMMFundingRemoved_amounts_removed                  *proto.ColArr[proto.UInt256]
+	scratch_FixedProductMarketMakerFPMMFundingRemoved_amounts_removed          []proto.UInt256
 	FixedProductMarketMakerFPMMFundingRemoved_collateral_removed_from_fee_pool proto.ColUInt256
 	FixedProductMarketMakerFPMMFundingRemoved_shares_burnt                     proto.ColUInt256
 }
@@ -476,7 +484,8 @@ func (b *ProtoEventBlock) AppendConditionalTokensConditionResolution(meta EventM
 	b.ConditionalTokensConditionResolution_oracle.Append(ev.Oracle.Bytes())
 	b.ConditionalTokensConditionResolution_question_i_d.Append(ev.QuestionID.Bytes())
 	b.ConditionalTokensConditionResolution_payout_denominator.Append(clickHouseUInt256(ev.PayoutDenominator))
-	b.ConditionalTokensConditionResolution_payout_numerators.Append(hotStateUInt256Slice(ev.PayoutNumerators, nil))
+	b.scratch_ConditionalTokensConditionResolution_payout_numerators = hotStateUInt256Slice(ev.PayoutNumerators, b.scratch_ConditionalTokensConditionResolution_payout_numerators)
+	b.ConditionalTokensConditionResolution_payout_numerators.Append(b.scratch_ConditionalTokensConditionResolution_payout_numerators)
 	b.Sequence = append(b.Sequence, uint8(EventTypeConditionalTokensConditionResolution))
 }
 
@@ -491,7 +500,8 @@ func (b *ProtoEventBlock) AppendConditionalTokensPositionSplit(meta EventMeta, e
 	b.ConditionalTokensPositionSplit_collateral_token.Append(ev.CollateralToken.Bytes())
 	b.ConditionalTokensPositionSplit_parent_collection_i_d.Append(ev.ParentCollectionID.Bytes())
 	b.ConditionalTokensPositionSplit_condition_i_d.Append(ev.ConditionID.Bytes())
-	b.ConditionalTokensPositionSplit_partition.Append(hotStateUInt256Slice(ev.Partition, nil))
+	b.scratch_ConditionalTokensPositionSplit_partition = hotStateUInt256Slice(ev.Partition, b.scratch_ConditionalTokensPositionSplit_partition)
+	b.ConditionalTokensPositionSplit_partition.Append(b.scratch_ConditionalTokensPositionSplit_partition)
 	b.ConditionalTokensPositionSplit_amount.Append(clickHouseUInt256(ev.Amount))
 	b.Sequence = append(b.Sequence, uint8(EventTypeConditionalTokensPositionSplit))
 }
@@ -507,7 +517,8 @@ func (b *ProtoEventBlock) AppendConditionalTokensPositionsMerge(meta EventMeta, 
 	b.ConditionalTokensPositionsMerge_collateral_token.Append(ev.CollateralToken.Bytes())
 	b.ConditionalTokensPositionsMerge_parent_collection_i_d.Append(ev.ParentCollectionID.Bytes())
 	b.ConditionalTokensPositionsMerge_condition_i_d.Append(ev.ConditionID.Bytes())
-	b.ConditionalTokensPositionsMerge_partition.Append(hotStateUInt256Slice(ev.Partition, nil))
+	b.scratch_ConditionalTokensPositionsMerge_partition = hotStateUInt256Slice(ev.Partition, b.scratch_ConditionalTokensPositionsMerge_partition)
+	b.ConditionalTokensPositionsMerge_partition.Append(b.scratch_ConditionalTokensPositionsMerge_partition)
 	b.ConditionalTokensPositionsMerge_amount.Append(clickHouseUInt256(ev.Amount))
 	b.Sequence = append(b.Sequence, uint8(EventTypeConditionalTokensPositionsMerge))
 }
@@ -523,7 +534,8 @@ func (b *ProtoEventBlock) AppendConditionalTokensPayoutRedemption(meta EventMeta
 	b.ConditionalTokensPayoutRedemption_collateral_token.Append(ev.CollateralToken.Bytes())
 	b.ConditionalTokensPayoutRedemption_parent_collection_i_d.Append(ev.ParentCollectionID.Bytes())
 	b.ConditionalTokensPayoutRedemption_condition_i_d.Append(ev.ConditionID.Bytes())
-	b.ConditionalTokensPayoutRedemption_index_sets.Append(hotStateUInt256Slice(ev.IndexSets, nil))
+	b.scratch_ConditionalTokensPayoutRedemption_index_sets = hotStateUInt256Slice(ev.IndexSets, b.scratch_ConditionalTokensPayoutRedemption_index_sets)
+	b.ConditionalTokensPayoutRedemption_index_sets.Append(b.scratch_ConditionalTokensPayoutRedemption_index_sets)
 	b.ConditionalTokensPayoutRedemption_payout.Append(clickHouseUInt256(ev.Payout))
 	b.Sequence = append(b.Sequence, uint8(EventTypeConditionalTokensPayoutRedemption))
 }
@@ -709,7 +721,8 @@ func (b *ProtoEventBlock) AppendNegRiskAdapterPayoutRedemption(meta EventMeta, e
 	b.NegRiskAdapterPayoutRedemption_meta_index.Append(metaIdx)
 	b.NegRiskAdapterPayoutRedemption_redeemer.Append(ev.Redeemer.Bytes())
 	b.NegRiskAdapterPayoutRedemption_condition_i_d.Append(ev.ConditionID.Bytes())
-	b.NegRiskAdapterPayoutRedemption_amounts.Append(hotStateUInt256Slice(ev.Amounts, nil))
+	b.scratch_NegRiskAdapterPayoutRedemption_amounts = hotStateUInt256Slice(ev.Amounts, b.scratch_NegRiskAdapterPayoutRedemption_amounts)
+	b.NegRiskAdapterPayoutRedemption_amounts.Append(b.scratch_NegRiskAdapterPayoutRedemption_amounts)
 	b.NegRiskAdapterPayoutRedemption_payout.Append(clickHouseUInt256(ev.Payout))
 	b.Sequence = append(b.Sequence, uint8(EventTypeNegRiskAdapterPayoutRedemption))
 }
@@ -725,7 +738,8 @@ func (b *ProtoEventBlock) AppendFixedProductMarketMakerFactoryFixedProductMarket
 	b.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_fixed_product_market_maker.Append(ev.FixedProductMarketMaker.Bytes())
 	b.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_conditional_tokens.Append(ev.ConditionalTokens.Bytes())
 	b.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_collateral_token.Append(ev.CollateralToken.Bytes())
-	b.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids.Append(hotStateHashSliceBytes(ev.ConditionIds, nil))
+	b.scratch_FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids = hotStateHashSliceBytes(ev.ConditionIds, b.scratch_FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids)
+	b.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids.Append(b.scratch_FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids)
 	b.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_fee.Append(clickHouseUInt256(ev.Fee))
 	b.Sequence = append(b.Sequence, uint8(EventTypeFixedProductMarketMakerFactoryFixedProductMarketMakerCreation))
 }
@@ -768,7 +782,8 @@ func (b *ProtoEventBlock) AppendFixedProductMarketMakerFPMMFundingAdded(meta Eve
 	metaIdx := b.appendMeta(meta)
 	b.FixedProductMarketMakerFPMMFundingAdded_meta_index.Append(metaIdx)
 	b.FixedProductMarketMakerFPMMFundingAdded_funder.Append(ev.Funder.Bytes())
-	b.FixedProductMarketMakerFPMMFundingAdded_amounts_added.Append(hotStateUInt256Slice(ev.AmountsAdded, nil))
+	b.scratch_FixedProductMarketMakerFPMMFundingAdded_amounts_added = hotStateUInt256Slice(ev.AmountsAdded, b.scratch_FixedProductMarketMakerFPMMFundingAdded_amounts_added)
+	b.FixedProductMarketMakerFPMMFundingAdded_amounts_added.Append(b.scratch_FixedProductMarketMakerFPMMFundingAdded_amounts_added)
 	b.FixedProductMarketMakerFPMMFundingAdded_shares_minted.Append(clickHouseUInt256(ev.SharesMinted))
 	b.Sequence = append(b.Sequence, uint8(EventTypeFixedProductMarketMakerFPMMFundingAdded))
 }
@@ -781,7 +796,8 @@ func (b *ProtoEventBlock) AppendFixedProductMarketMakerFPMMFundingRemoved(meta E
 	metaIdx := b.appendMeta(meta)
 	b.FixedProductMarketMakerFPMMFundingRemoved_meta_index.Append(metaIdx)
 	b.FixedProductMarketMakerFPMMFundingRemoved_funder.Append(ev.Funder.Bytes())
-	b.FixedProductMarketMakerFPMMFundingRemoved_amounts_removed.Append(hotStateUInt256Slice(ev.AmountsRemoved, nil))
+	b.scratch_FixedProductMarketMakerFPMMFundingRemoved_amounts_removed = hotStateUInt256Slice(ev.AmountsRemoved, b.scratch_FixedProductMarketMakerFPMMFundingRemoved_amounts_removed)
+	b.FixedProductMarketMakerFPMMFundingRemoved_amounts_removed.Append(b.scratch_FixedProductMarketMakerFPMMFundingRemoved_amounts_removed)
 	b.FixedProductMarketMakerFPMMFundingRemoved_collateral_removed_from_fee_pool.Append(clickHouseUInt256(ev.CollateralRemovedFromFeePool))
 	b.FixedProductMarketMakerFPMMFundingRemoved_shares_burnt.Append(clickHouseUInt256(ev.SharesBurnt))
 	b.Sequence = append(b.Sequence, uint8(EventTypeFixedProductMarketMakerFPMMFundingRemoved))
@@ -1541,6 +1557,20 @@ func (v ConditionalTokensConditionResolutionProtoView) PayoutNumerators() []uint
 	return hotStateUint256Slice(v.block.ConditionalTokensConditionResolution_payout_numerators.Row(v.row))
 }
 
+func (v ConditionalTokensConditionResolutionProtoView) PayoutNumeratorsLen() int {
+	return v.block.ConditionalTokensConditionResolution_payout_numerators.RowLen(v.row)
+}
+
+func (v ConditionalTokensConditionResolutionProtoView) PayoutNumeratorsAt(i int) uint256.Int {
+	col := v.block.ConditionalTokensConditionResolution_payout_numerators
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	elem := col.Data.Row(start + i)
+	return uint256FromProto(&elem)
+}
+
 func (v ConditionalTokensConditionResolutionProtoView) Meta() EventMeta {
 	return eventMetaAt(v.block, int(v.block.ConditionalTokensConditionResolution_meta_index[v.row]))
 }
@@ -1570,6 +1600,20 @@ func (v ConditionalTokensPositionSplitProtoView) ConditionID() common.Hash {
 
 func (v ConditionalTokensPositionSplitProtoView) Partition() []uint256.Int {
 	return hotStateUint256Slice(v.block.ConditionalTokensPositionSplit_partition.Row(v.row))
+}
+
+func (v ConditionalTokensPositionSplitProtoView) PartitionLen() int {
+	return v.block.ConditionalTokensPositionSplit_partition.RowLen(v.row)
+}
+
+func (v ConditionalTokensPositionSplitProtoView) PartitionAt(i int) uint256.Int {
+	col := v.block.ConditionalTokensPositionSplit_partition
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	elem := col.Data.Row(start + i)
+	return uint256FromProto(&elem)
 }
 
 func (v ConditionalTokensPositionSplitProtoView) Amount() uint256.Int {
@@ -1607,6 +1651,20 @@ func (v ConditionalTokensPositionsMergeProtoView) Partition() []uint256.Int {
 	return hotStateUint256Slice(v.block.ConditionalTokensPositionsMerge_partition.Row(v.row))
 }
 
+func (v ConditionalTokensPositionsMergeProtoView) PartitionLen() int {
+	return v.block.ConditionalTokensPositionsMerge_partition.RowLen(v.row)
+}
+
+func (v ConditionalTokensPositionsMergeProtoView) PartitionAt(i int) uint256.Int {
+	col := v.block.ConditionalTokensPositionsMerge_partition
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	elem := col.Data.Row(start + i)
+	return uint256FromProto(&elem)
+}
+
 func (v ConditionalTokensPositionsMergeProtoView) Amount() uint256.Int {
 	return uint256FromProto(&v.block.ConditionalTokensPositionsMerge_amount[v.row])
 }
@@ -1640,6 +1698,20 @@ func (v ConditionalTokensPayoutRedemptionProtoView) ConditionID() common.Hash {
 
 func (v ConditionalTokensPayoutRedemptionProtoView) IndexSets() []uint256.Int {
 	return hotStateUint256Slice(v.block.ConditionalTokensPayoutRedemption_index_sets.Row(v.row))
+}
+
+func (v ConditionalTokensPayoutRedemptionProtoView) IndexSetsLen() int {
+	return v.block.ConditionalTokensPayoutRedemption_index_sets.RowLen(v.row)
+}
+
+func (v ConditionalTokensPayoutRedemptionProtoView) IndexSetsAt(i int) uint256.Int {
+	col := v.block.ConditionalTokensPayoutRedemption_index_sets
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	elem := col.Data.Row(start + i)
+	return uint256FromProto(&elem)
 }
 
 func (v ConditionalTokensPayoutRedemptionProtoView) Payout() uint256.Int {
@@ -2038,6 +2110,20 @@ func (v NegRiskAdapterPayoutRedemptionProtoView) Amounts() []uint256.Int {
 	return hotStateUint256Slice(v.block.NegRiskAdapterPayoutRedemption_amounts.Row(v.row))
 }
 
+func (v NegRiskAdapterPayoutRedemptionProtoView) AmountsLen() int {
+	return v.block.NegRiskAdapterPayoutRedemption_amounts.RowLen(v.row)
+}
+
+func (v NegRiskAdapterPayoutRedemptionProtoView) AmountsAt(i int) uint256.Int {
+	col := v.block.NegRiskAdapterPayoutRedemption_amounts
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	elem := col.Data.Row(start + i)
+	return uint256FromProto(&elem)
+}
+
 func (v NegRiskAdapterPayoutRedemptionProtoView) Payout() uint256.Int {
 	return uint256FromProto(&v.block.NegRiskAdapterPayoutRedemption_payout[v.row])
 }
@@ -2071,6 +2157,19 @@ func (v FixedProductMarketMakerFactoryFixedProductMarketMakerCreationProtoView) 
 
 func (v FixedProductMarketMakerFactoryFixedProductMarketMakerCreationProtoView) ConditionIds() []common.Hash {
 	return hotStateHashSlice(v.block.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids.Row(v.row))
+}
+
+func (v FixedProductMarketMakerFactoryFixedProductMarketMakerCreationProtoView) ConditionIdsLen() int {
+	return v.block.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids.RowLen(v.row)
+}
+
+func (v FixedProductMarketMakerFactoryFixedProductMarketMakerCreationProtoView) ConditionIdsAt(i int) common.Hash {
+	col := v.block.FixedProductMarketMakerFactoryFixedProductMarketMakerCreation_condition_ids
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	return common.BytesToHash(col.Data.Row(start + i))
 }
 
 func (v FixedProductMarketMakerFactoryFixedProductMarketMakerCreationProtoView) Fee() uint256.Int {
@@ -2158,6 +2257,20 @@ func (v FixedProductMarketMakerFPMMFundingAddedProtoView) AmountsAdded() []uint2
 	return hotStateUint256Slice(v.block.FixedProductMarketMakerFPMMFundingAdded_amounts_added.Row(v.row))
 }
 
+func (v FixedProductMarketMakerFPMMFundingAddedProtoView) AmountsAddedLen() int {
+	return v.block.FixedProductMarketMakerFPMMFundingAdded_amounts_added.RowLen(v.row)
+}
+
+func (v FixedProductMarketMakerFPMMFundingAddedProtoView) AmountsAddedAt(i int) uint256.Int {
+	col := v.block.FixedProductMarketMakerFPMMFundingAdded_amounts_added
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	elem := col.Data.Row(start + i)
+	return uint256FromProto(&elem)
+}
+
 func (v FixedProductMarketMakerFPMMFundingAddedProtoView) SharesMinted() uint256.Int {
 	return uint256FromProto(&v.block.FixedProductMarketMakerFPMMFundingAdded_shares_minted[v.row])
 }
@@ -2179,6 +2292,20 @@ func (v FixedProductMarketMakerFPMMFundingRemovedProtoView) Funder() common.Addr
 
 func (v FixedProductMarketMakerFPMMFundingRemovedProtoView) AmountsRemoved() []uint256.Int {
 	return hotStateUint256Slice(v.block.FixedProductMarketMakerFPMMFundingRemoved_amounts_removed.Row(v.row))
+}
+
+func (v FixedProductMarketMakerFPMMFundingRemovedProtoView) AmountsRemovedLen() int {
+	return v.block.FixedProductMarketMakerFPMMFundingRemoved_amounts_removed.RowLen(v.row)
+}
+
+func (v FixedProductMarketMakerFPMMFundingRemovedProtoView) AmountsRemovedAt(i int) uint256.Int {
+	col := v.block.FixedProductMarketMakerFPMMFundingRemoved_amounts_removed
+	start := 0
+	if v.row > 0 {
+		start = int(col.Offsets[v.row-1])
+	}
+	elem := col.Data.Row(start + i)
+	return uint256FromProto(&elem)
 }
 
 func (v FixedProductMarketMakerFPMMFundingRemovedProtoView) CollateralRemovedFromFeePool() uint256.Int {

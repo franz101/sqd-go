@@ -7,5 +7,13 @@ package generated
 // parseProfilingEnabled gates the per-line/per-event parse profiling baked into
 // parser.go. The default build compiles it out: the timing calls fold to zero and
 // the [PARSE 10s] summary block is dead-code eliminated. Build with the
-// sqdparseprof tag to re-enable the instrumentation.
+// sqdparseprof tag to re-enable the instrumentation. _pinit/_pnow/_psince are
+// no-ops here so this file never imports tsc (see parseProfilingOnFile for why
+// that matters).
 const parseProfilingEnabled = false
+
+func _pinit() {}
+
+func _pnow() int64 { return 0 }
+
+func _psince(t0 int64) int64 { return 0 }

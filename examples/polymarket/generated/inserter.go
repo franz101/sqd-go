@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
@@ -76,17 +77,35 @@ func clickHouseColumnNames(valueColumns []string) []string {
 	return names
 }
 
-func InsertEventBatch(ctx context.Context, conn *ch.Client, db string, batch ClickHouseEventBatch) error {
-	if batch.Rows() == 0 {
-		return nil
+// insertQueryCache caches the fully quoted "INSERT INTO db.table (cols) VALUES"
+// body per (db, table): the column list is fixed per table, so re-quoting and
+// re-formatting it on every insert call is pure per-call allocation. Keyed by
+// db+table since the same generated batch type could in principle be inserted
+// against more than one database name within a process. sync.Map because
+// insert calls may run from more than one goroutine (e.g. async insert).
+var insertQueryCache sync.Map
+
+func insertQueryFor(db string, batch ClickHouseEventBatch) string {
+	key := db + "\x00" + batch.TableName()
+	if v, ok := insertQueryCache.Load(key); ok {
+		return v.(string)
 	}
 	cols := batch.ColumnNames()
 	quoted := make([]string, 0, len(cols))
 	for _, col := range cols {
 		quoted = append(quoted, quoteIdent(col))
 	}
+	query := fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES", quoteIdent(db), quoteIdent(batch.TableName()), strings.Join(quoted, ", "))
+	actual, _ := insertQueryCache.LoadOrStore(key, query)
+	return actual.(string)
+}
+
+func InsertEventBatch(ctx context.Context, conn *ch.Client, db string, batch ClickHouseEventBatch) error {
+	if batch.Rows() == 0 {
+		return nil
+	}
 	return conn.Do(ctx, ch.Query{
-		Body:  fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES", quoteIdent(db), quoteIdent(batch.TableName()), strings.Join(quoted, ", ")),
+		Body:  insertQueryFor(db, batch),
 		Input: batch.Inputs(),
 	})
 }
@@ -191,6 +210,13 @@ type ConditionalTokensConditionPreparationBatch struct {
 	colOracle           proto.ColFixedStr
 	colQuestionID       proto.ColFixedStr
 	colOutcomeSlotCount proto.ColUInt256
+	// columnNames/inputs are computed once in NewConditionalTokensConditionPreparationBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewConditionalTokensConditionPreparationBatch() *ConditionalTokensConditionPreparationBatch {
@@ -199,6 +225,19 @@ func NewConditionalTokensConditionPreparationBatch() *ConditionalTokensCondition
 	b.colConditionID = proto.ColFixedStr{Size: 32}
 	b.colOracle = proto.ColFixedStr{Size: 20}
 	b.colQuestionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"conditionId",
+		"oracle",
+		"questionId",
+		"outcomeSlotCount",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "oracle", Data: &b.colOracle},
+		proto.InputColumn{Name: "questionId", Data: &b.colQuestionID},
+		proto.InputColumn{Name: "outcomeSlotCount", Data: &b.colOutcomeSlotCount},
+	)
 	return b
 }
 
@@ -214,21 +253,10 @@ func (b *ConditionalTokensConditionPreparationBatch) Reset() {
 	b.colOutcomeSlotCount.Reset()
 }
 func (b *ConditionalTokensConditionPreparationBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"conditionId",
-		"oracle",
-		"questionId",
-		"outcomeSlotCount",
-	})
+	return b.columnNames
 }
 func (b *ConditionalTokensConditionPreparationBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "oracle", Data: &b.colOracle},
-		proto.InputColumn{Name: "questionId", Data: &b.colQuestionID},
-		proto.InputColumn{Name: "outcomeSlotCount", Data: &b.colOutcomeSlotCount},
-	)
+	return b.inputs
 }
 func (b *ConditionalTokensConditionPreparationBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ConditionalTokensConditionPreparation)
@@ -250,6 +278,13 @@ type ConditionalTokensConditionResolutionBatch struct {
 	colQuestionID        proto.ColFixedStr
 	colPayoutDenominator proto.ColUInt256
 	colPayoutNumerators  proto.ColStr
+	// columnNames/inputs are computed once in NewConditionalTokensConditionResolutionBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewConditionalTokensConditionResolutionBatch() *ConditionalTokensConditionResolutionBatch {
@@ -258,6 +293,21 @@ func NewConditionalTokensConditionResolutionBatch() *ConditionalTokensConditionR
 	b.colConditionID = proto.ColFixedStr{Size: 32}
 	b.colOracle = proto.ColFixedStr{Size: 20}
 	b.colQuestionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"conditionId",
+		"oracle",
+		"questionId",
+		"payoutDenominator",
+		"payoutNumerators",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "oracle", Data: &b.colOracle},
+		proto.InputColumn{Name: "questionId", Data: &b.colQuestionID},
+		proto.InputColumn{Name: "payoutDenominator", Data: &b.colPayoutDenominator},
+		proto.InputColumn{Name: "payoutNumerators", Data: &b.colPayoutNumerators},
+	)
 	return b
 }
 
@@ -274,23 +324,10 @@ func (b *ConditionalTokensConditionResolutionBatch) Reset() {
 	b.colPayoutNumerators.Reset()
 }
 func (b *ConditionalTokensConditionResolutionBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"conditionId",
-		"oracle",
-		"questionId",
-		"payoutDenominator",
-		"payoutNumerators",
-	})
+	return b.columnNames
 }
 func (b *ConditionalTokensConditionResolutionBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "oracle", Data: &b.colOracle},
-		proto.InputColumn{Name: "questionId", Data: &b.colQuestionID},
-		proto.InputColumn{Name: "payoutDenominator", Data: &b.colPayoutDenominator},
-		proto.InputColumn{Name: "payoutNumerators", Data: &b.colPayoutNumerators},
-	)
+	return b.inputs
 }
 func (b *ConditionalTokensConditionResolutionBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ConditionalTokensConditionResolution)
@@ -314,6 +351,13 @@ type ConditionalTokensPositionSplitBatch struct {
 	colConditionID        proto.ColFixedStr
 	colPartition          proto.ColStr
 	colAmount             proto.ColUInt256
+	// columnNames/inputs are computed once in NewConditionalTokensPositionSplitBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewConditionalTokensPositionSplitBatch() *ConditionalTokensPositionSplitBatch {
@@ -323,6 +367,23 @@ func NewConditionalTokensPositionSplitBatch() *ConditionalTokensPositionSplitBat
 	b.colCollateralToken = proto.ColFixedStr{Size: 20}
 	b.colParentCollectionID = proto.ColFixedStr{Size: 32}
 	b.colConditionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"stakeholder",
+		"collateralToken",
+		"parentCollectionId",
+		"conditionId",
+		"partition",
+		"amount",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
+		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
+		proto.InputColumn{Name: "parentCollectionId", Data: &b.colParentCollectionID},
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "partition", Data: &b.colPartition},
+		proto.InputColumn{Name: "amount", Data: &b.colAmount},
+	)
 	return b
 }
 
@@ -340,25 +401,10 @@ func (b *ConditionalTokensPositionSplitBatch) Reset() {
 	b.colAmount.Reset()
 }
 func (b *ConditionalTokensPositionSplitBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"stakeholder",
-		"collateralToken",
-		"parentCollectionId",
-		"conditionId",
-		"partition",
-		"amount",
-	})
+	return b.columnNames
 }
 func (b *ConditionalTokensPositionSplitBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
-		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
-		proto.InputColumn{Name: "parentCollectionId", Data: &b.colParentCollectionID},
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "partition", Data: &b.colPartition},
-		proto.InputColumn{Name: "amount", Data: &b.colAmount},
-	)
+	return b.inputs
 }
 func (b *ConditionalTokensPositionSplitBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ConditionalTokensPositionSplit)
@@ -383,6 +429,13 @@ type ConditionalTokensPositionsMergeBatch struct {
 	colConditionID        proto.ColFixedStr
 	colPartition          proto.ColStr
 	colAmount             proto.ColUInt256
+	// columnNames/inputs are computed once in NewConditionalTokensPositionsMergeBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewConditionalTokensPositionsMergeBatch() *ConditionalTokensPositionsMergeBatch {
@@ -392,6 +445,23 @@ func NewConditionalTokensPositionsMergeBatch() *ConditionalTokensPositionsMergeB
 	b.colCollateralToken = proto.ColFixedStr{Size: 20}
 	b.colParentCollectionID = proto.ColFixedStr{Size: 32}
 	b.colConditionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"stakeholder",
+		"collateralToken",
+		"parentCollectionId",
+		"conditionId",
+		"partition",
+		"amount",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
+		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
+		proto.InputColumn{Name: "parentCollectionId", Data: &b.colParentCollectionID},
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "partition", Data: &b.colPartition},
+		proto.InputColumn{Name: "amount", Data: &b.colAmount},
+	)
 	return b
 }
 
@@ -409,25 +479,10 @@ func (b *ConditionalTokensPositionsMergeBatch) Reset() {
 	b.colAmount.Reset()
 }
 func (b *ConditionalTokensPositionsMergeBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"stakeholder",
-		"collateralToken",
-		"parentCollectionId",
-		"conditionId",
-		"partition",
-		"amount",
-	})
+	return b.columnNames
 }
 func (b *ConditionalTokensPositionsMergeBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
-		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
-		proto.InputColumn{Name: "parentCollectionId", Data: &b.colParentCollectionID},
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "partition", Data: &b.colPartition},
-		proto.InputColumn{Name: "amount", Data: &b.colAmount},
-	)
+	return b.inputs
 }
 func (b *ConditionalTokensPositionsMergeBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ConditionalTokensPositionsMerge)
@@ -452,6 +507,13 @@ type ConditionalTokensPayoutRedemptionBatch struct {
 	colConditionID        proto.ColFixedStr
 	colIndexSets          proto.ColStr
 	colPayout             proto.ColUInt256
+	// columnNames/inputs are computed once in NewConditionalTokensPayoutRedemptionBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewConditionalTokensPayoutRedemptionBatch() *ConditionalTokensPayoutRedemptionBatch {
@@ -461,6 +523,23 @@ func NewConditionalTokensPayoutRedemptionBatch() *ConditionalTokensPayoutRedempt
 	b.colCollateralToken = proto.ColFixedStr{Size: 20}
 	b.colParentCollectionID = proto.ColFixedStr{Size: 32}
 	b.colConditionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"redeemer",
+		"collateralToken",
+		"parentCollectionId",
+		"conditionId",
+		"indexSets",
+		"payout",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "redeemer", Data: &b.colRedeemer},
+		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
+		proto.InputColumn{Name: "parentCollectionId", Data: &b.colParentCollectionID},
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "indexSets", Data: &b.colIndexSets},
+		proto.InputColumn{Name: "payout", Data: &b.colPayout},
+	)
 	return b
 }
 
@@ -478,25 +557,10 @@ func (b *ConditionalTokensPayoutRedemptionBatch) Reset() {
 	b.colPayout.Reset()
 }
 func (b *ConditionalTokensPayoutRedemptionBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"redeemer",
-		"collateralToken",
-		"parentCollectionId",
-		"conditionId",
-		"indexSets",
-		"payout",
-	})
+	return b.columnNames
 }
 func (b *ConditionalTokensPayoutRedemptionBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "redeemer", Data: &b.colRedeemer},
-		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
-		proto.InputColumn{Name: "parentCollectionId", Data: &b.colParentCollectionID},
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "indexSets", Data: &b.colIndexSets},
-		proto.InputColumn{Name: "payout", Data: &b.colPayout},
-	)
+	return b.inputs
 }
 func (b *ConditionalTokensPayoutRedemptionBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ConditionalTokensPayoutRedemption)
@@ -522,6 +586,13 @@ type ExchangeOrderFilledBatch struct {
 	colMakerAmountFilled proto.ColUInt256
 	colTakerAmountFilled proto.ColUInt256
 	colFee               proto.ColUInt256
+	// columnNames/inputs are computed once in NewExchangeOrderFilledBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewExchangeOrderFilledBatch() *ExchangeOrderFilledBatch {
@@ -529,6 +600,25 @@ func NewExchangeOrderFilledBatch() *ExchangeOrderFilledBatch {
 	b.common.init()
 	b.colMaker = proto.ColFixedStr{Size: 20}
 	b.colTaker = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"maker",
+		"taker",
+		"makerAssetId",
+		"takerAssetId",
+		"makerAmountFilled",
+		"takerAmountFilled",
+		"fee",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "maker", Data: &b.colMaker},
+		proto.InputColumn{Name: "taker", Data: &b.colTaker},
+		proto.InputColumn{Name: "makerAssetId", Data: &b.colMakerAssetID},
+		proto.InputColumn{Name: "takerAssetId", Data: &b.colTakerAssetID},
+		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
+		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
+		proto.InputColumn{Name: "fee", Data: &b.colFee},
+	)
 	return b
 }
 
@@ -545,27 +635,10 @@ func (b *ExchangeOrderFilledBatch) Reset() {
 	b.colFee.Reset()
 }
 func (b *ExchangeOrderFilledBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"maker",
-		"taker",
-		"makerAssetId",
-		"takerAssetId",
-		"makerAmountFilled",
-		"takerAmountFilled",
-		"fee",
-	})
+	return b.columnNames
 }
 func (b *ExchangeOrderFilledBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "maker", Data: &b.colMaker},
-		proto.InputColumn{Name: "taker", Data: &b.colTaker},
-		proto.InputColumn{Name: "makerAssetId", Data: &b.colMakerAssetID},
-		proto.InputColumn{Name: "takerAssetId", Data: &b.colTakerAssetID},
-		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
-		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
-		proto.InputColumn{Name: "fee", Data: &b.colFee},
-	)
+	return b.inputs
 }
 func (b *ExchangeOrderFilledBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ExchangeOrderFilled)
@@ -592,6 +665,13 @@ type NegRiskExchangeOrderFilledBatch struct {
 	colMakerAmountFilled proto.ColUInt256
 	colTakerAmountFilled proto.ColUInt256
 	colFee               proto.ColUInt256
+	// columnNames/inputs are computed once in NewNegRiskExchangeOrderFilledBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskExchangeOrderFilledBatch() *NegRiskExchangeOrderFilledBatch {
@@ -599,6 +679,25 @@ func NewNegRiskExchangeOrderFilledBatch() *NegRiskExchangeOrderFilledBatch {
 	b.common.init()
 	b.colMaker = proto.ColFixedStr{Size: 20}
 	b.colTaker = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"maker",
+		"taker",
+		"makerAssetId",
+		"takerAssetId",
+		"makerAmountFilled",
+		"takerAmountFilled",
+		"fee",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "maker", Data: &b.colMaker},
+		proto.InputColumn{Name: "taker", Data: &b.colTaker},
+		proto.InputColumn{Name: "makerAssetId", Data: &b.colMakerAssetID},
+		proto.InputColumn{Name: "takerAssetId", Data: &b.colTakerAssetID},
+		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
+		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
+		proto.InputColumn{Name: "fee", Data: &b.colFee},
+	)
 	return b
 }
 
@@ -617,27 +716,10 @@ func (b *NegRiskExchangeOrderFilledBatch) Reset() {
 	b.colFee.Reset()
 }
 func (b *NegRiskExchangeOrderFilledBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"maker",
-		"taker",
-		"makerAssetId",
-		"takerAssetId",
-		"makerAmountFilled",
-		"takerAmountFilled",
-		"fee",
-	})
+	return b.columnNames
 }
 func (b *NegRiskExchangeOrderFilledBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "maker", Data: &b.colMaker},
-		proto.InputColumn{Name: "taker", Data: &b.colTaker},
-		proto.InputColumn{Name: "makerAssetId", Data: &b.colMakerAssetID},
-		proto.InputColumn{Name: "takerAssetId", Data: &b.colTakerAssetID},
-		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
-		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
-		proto.InputColumn{Name: "fee", Data: &b.colFee},
-	)
+	return b.inputs
 }
 func (b *NegRiskExchangeOrderFilledBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskExchangeOrderFilled)
@@ -666,6 +748,13 @@ type ExchangeV2OrderFilledV2Batch struct {
 	colFee               proto.ColUInt256
 	colBuilder           proto.ColFixedStr
 	colMetadata          proto.ColFixedStr
+	// columnNames/inputs are computed once in NewExchangeV2OrderFilledV2Batch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewExchangeV2OrderFilledV2Batch() *ExchangeV2OrderFilledV2Batch {
@@ -675,6 +764,29 @@ func NewExchangeV2OrderFilledV2Batch() *ExchangeV2OrderFilledV2Batch {
 	b.colTaker = proto.ColFixedStr{Size: 20}
 	b.colBuilder = proto.ColFixedStr{Size: 32}
 	b.colMetadata = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"maker",
+		"taker",
+		"side",
+		"tokenId",
+		"makerAmountFilled",
+		"takerAmountFilled",
+		"fee",
+		"builder",
+		"metadata",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "maker", Data: &b.colMaker},
+		proto.InputColumn{Name: "taker", Data: &b.colTaker},
+		proto.InputColumn{Name: "side", Data: &b.colSide},
+		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
+		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
+		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
+		proto.InputColumn{Name: "fee", Data: &b.colFee},
+		proto.InputColumn{Name: "builder", Data: &b.colBuilder},
+		proto.InputColumn{Name: "metadata", Data: &b.colMetadata},
+	)
 	return b
 }
 
@@ -695,31 +807,10 @@ func (b *ExchangeV2OrderFilledV2Batch) Reset() {
 	b.colMetadata.Reset()
 }
 func (b *ExchangeV2OrderFilledV2Batch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"maker",
-		"taker",
-		"side",
-		"tokenId",
-		"makerAmountFilled",
-		"takerAmountFilled",
-		"fee",
-		"builder",
-		"metadata",
-	})
+	return b.columnNames
 }
 func (b *ExchangeV2OrderFilledV2Batch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "maker", Data: &b.colMaker},
-		proto.InputColumn{Name: "taker", Data: &b.colTaker},
-		proto.InputColumn{Name: "side", Data: &b.colSide},
-		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
-		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
-		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
-		proto.InputColumn{Name: "fee", Data: &b.colFee},
-		proto.InputColumn{Name: "builder", Data: &b.colBuilder},
-		proto.InputColumn{Name: "metadata", Data: &b.colMetadata},
-	)
+	return b.inputs
 }
 func (b *ExchangeV2OrderFilledV2Batch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ExchangeV2OrderFilledV2)
@@ -747,6 +838,13 @@ type ExchangeV2OrdersMatchedBatch struct {
 	colTokenID           proto.ColUInt256
 	colMakerAmountFilled proto.ColUInt256
 	colTakerAmountFilled proto.ColUInt256
+	// columnNames/inputs are computed once in NewExchangeV2OrdersMatchedBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewExchangeV2OrdersMatchedBatch() *ExchangeV2OrdersMatchedBatch {
@@ -754,6 +852,23 @@ func NewExchangeV2OrdersMatchedBatch() *ExchangeV2OrdersMatchedBatch {
 	b.common.init()
 	b.colTakerOrderHash = proto.ColFixedStr{Size: 32}
 	b.colTakerOrderMaker = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"takerOrderHash",
+		"takerOrderMaker",
+		"side",
+		"tokenId",
+		"makerAmountFilled",
+		"takerAmountFilled",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "takerOrderHash", Data: &b.colTakerOrderHash},
+		proto.InputColumn{Name: "takerOrderMaker", Data: &b.colTakerOrderMaker},
+		proto.InputColumn{Name: "side", Data: &b.colSide},
+		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
+		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
+		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
+	)
 	return b
 }
 
@@ -769,25 +884,10 @@ func (b *ExchangeV2OrdersMatchedBatch) Reset() {
 	b.colTakerAmountFilled.Reset()
 }
 func (b *ExchangeV2OrdersMatchedBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"takerOrderHash",
-		"takerOrderMaker",
-		"side",
-		"tokenId",
-		"makerAmountFilled",
-		"takerAmountFilled",
-	})
+	return b.columnNames
 }
 func (b *ExchangeV2OrdersMatchedBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "takerOrderHash", Data: &b.colTakerOrderHash},
-		proto.InputColumn{Name: "takerOrderMaker", Data: &b.colTakerOrderMaker},
-		proto.InputColumn{Name: "side", Data: &b.colSide},
-		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
-		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
-		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
-	)
+	return b.inputs
 }
 func (b *ExchangeV2OrdersMatchedBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*ExchangeV2OrdersMatched)
@@ -815,6 +915,13 @@ type NegRiskExchangeV2OrderFilledV2Batch struct {
 	colFee               proto.ColUInt256
 	colBuilder           proto.ColFixedStr
 	colMetadata          proto.ColFixedStr
+	// columnNames/inputs are computed once in NewNegRiskExchangeV2OrderFilledV2Batch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskExchangeV2OrderFilledV2Batch() *NegRiskExchangeV2OrderFilledV2Batch {
@@ -824,6 +931,29 @@ func NewNegRiskExchangeV2OrderFilledV2Batch() *NegRiskExchangeV2OrderFilledV2Bat
 	b.colTaker = proto.ColFixedStr{Size: 20}
 	b.colBuilder = proto.ColFixedStr{Size: 32}
 	b.colMetadata = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"maker",
+		"taker",
+		"side",
+		"tokenId",
+		"makerAmountFilled",
+		"takerAmountFilled",
+		"fee",
+		"builder",
+		"metadata",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "maker", Data: &b.colMaker},
+		proto.InputColumn{Name: "taker", Data: &b.colTaker},
+		proto.InputColumn{Name: "side", Data: &b.colSide},
+		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
+		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
+		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
+		proto.InputColumn{Name: "fee", Data: &b.colFee},
+		proto.InputColumn{Name: "builder", Data: &b.colBuilder},
+		proto.InputColumn{Name: "metadata", Data: &b.colMetadata},
+	)
 	return b
 }
 
@@ -844,31 +974,10 @@ func (b *NegRiskExchangeV2OrderFilledV2Batch) Reset() {
 	b.colMetadata.Reset()
 }
 func (b *NegRiskExchangeV2OrderFilledV2Batch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"maker",
-		"taker",
-		"side",
-		"tokenId",
-		"makerAmountFilled",
-		"takerAmountFilled",
-		"fee",
-		"builder",
-		"metadata",
-	})
+	return b.columnNames
 }
 func (b *NegRiskExchangeV2OrderFilledV2Batch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "maker", Data: &b.colMaker},
-		proto.InputColumn{Name: "taker", Data: &b.colTaker},
-		proto.InputColumn{Name: "side", Data: &b.colSide},
-		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
-		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
-		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
-		proto.InputColumn{Name: "fee", Data: &b.colFee},
-		proto.InputColumn{Name: "builder", Data: &b.colBuilder},
-		proto.InputColumn{Name: "metadata", Data: &b.colMetadata},
-	)
+	return b.inputs
 }
 func (b *NegRiskExchangeV2OrderFilledV2Batch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskExchangeV2OrderFilledV2)
@@ -896,6 +1005,13 @@ type NegRiskExchangeV2OrdersMatchedBatch struct {
 	colTokenID           proto.ColUInt256
 	colMakerAmountFilled proto.ColUInt256
 	colTakerAmountFilled proto.ColUInt256
+	// columnNames/inputs are computed once in NewNegRiskExchangeV2OrdersMatchedBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskExchangeV2OrdersMatchedBatch() *NegRiskExchangeV2OrdersMatchedBatch {
@@ -903,6 +1019,23 @@ func NewNegRiskExchangeV2OrdersMatchedBatch() *NegRiskExchangeV2OrdersMatchedBat
 	b.common.init()
 	b.colTakerOrderHash = proto.ColFixedStr{Size: 32}
 	b.colTakerOrderMaker = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"takerOrderHash",
+		"takerOrderMaker",
+		"side",
+		"tokenId",
+		"makerAmountFilled",
+		"takerAmountFilled",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "takerOrderHash", Data: &b.colTakerOrderHash},
+		proto.InputColumn{Name: "takerOrderMaker", Data: &b.colTakerOrderMaker},
+		proto.InputColumn{Name: "side", Data: &b.colSide},
+		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
+		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
+		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
+	)
 	return b
 }
 
@@ -920,25 +1053,10 @@ func (b *NegRiskExchangeV2OrdersMatchedBatch) Reset() {
 	b.colTakerAmountFilled.Reset()
 }
 func (b *NegRiskExchangeV2OrdersMatchedBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"takerOrderHash",
-		"takerOrderMaker",
-		"side",
-		"tokenId",
-		"makerAmountFilled",
-		"takerAmountFilled",
-	})
+	return b.columnNames
 }
 func (b *NegRiskExchangeV2OrdersMatchedBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "takerOrderHash", Data: &b.colTakerOrderHash},
-		proto.InputColumn{Name: "takerOrderMaker", Data: &b.colTakerOrderMaker},
-		proto.InputColumn{Name: "side", Data: &b.colSide},
-		proto.InputColumn{Name: "tokenId", Data: &b.colTokenID},
-		proto.InputColumn{Name: "makerAmountFilled", Data: &b.colMakerAmountFilled},
-		proto.InputColumn{Name: "takerAmountFilled", Data: &b.colTakerAmountFilled},
-	)
+	return b.inputs
 }
 func (b *NegRiskExchangeV2OrdersMatchedBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskExchangeV2OrdersMatched)
@@ -961,6 +1079,13 @@ type NegRiskAdapterMarketPreparedBatch struct {
 	colCreator  proto.ColFixedStr
 	colFeeBips  proto.ColUInt256
 	colData     proto.ColStr
+	// columnNames/inputs are computed once in NewNegRiskAdapterMarketPreparedBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskAdapterMarketPreparedBatch() *NegRiskAdapterMarketPreparedBatch {
@@ -968,6 +1093,19 @@ func NewNegRiskAdapterMarketPreparedBatch() *NegRiskAdapterMarketPreparedBatch {
 	b.common.init()
 	b.colMarketID = proto.ColFixedStr{Size: 32}
 	b.colCreator = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"marketId",
+		"creator",
+		"feeBips",
+		"data",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "marketId", Data: &b.colMarketID},
+		proto.InputColumn{Name: "creator", Data: &b.colCreator},
+		proto.InputColumn{Name: "feeBips", Data: &b.colFeeBips},
+		proto.InputColumn{Name: "data", Data: &b.colData},
+	)
 	return b
 }
 
@@ -983,21 +1121,10 @@ func (b *NegRiskAdapterMarketPreparedBatch) Reset() {
 	b.colData.Reset()
 }
 func (b *NegRiskAdapterMarketPreparedBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"marketId",
-		"creator",
-		"feeBips",
-		"data",
-	})
+	return b.columnNames
 }
 func (b *NegRiskAdapterMarketPreparedBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "marketId", Data: &b.colMarketID},
-		proto.InputColumn{Name: "creator", Data: &b.colCreator},
-		proto.InputColumn{Name: "feeBips", Data: &b.colFeeBips},
-		proto.InputColumn{Name: "data", Data: &b.colData},
-	)
+	return b.inputs
 }
 func (b *NegRiskAdapterMarketPreparedBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskAdapterMarketPrepared)
@@ -1018,6 +1145,13 @@ type NegRiskAdapterQuestionPreparedBatch struct {
 	colQuestionID proto.ColFixedStr
 	colIndex      proto.ColUInt256
 	colData       proto.ColStr
+	// columnNames/inputs are computed once in NewNegRiskAdapterQuestionPreparedBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskAdapterQuestionPreparedBatch() *NegRiskAdapterQuestionPreparedBatch {
@@ -1025,6 +1159,19 @@ func NewNegRiskAdapterQuestionPreparedBatch() *NegRiskAdapterQuestionPreparedBat
 	b.common.init()
 	b.colMarketID = proto.ColFixedStr{Size: 32}
 	b.colQuestionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"marketId",
+		"questionId",
+		"index",
+		"data",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "marketId", Data: &b.colMarketID},
+		proto.InputColumn{Name: "questionId", Data: &b.colQuestionID},
+		proto.InputColumn{Name: "index", Data: &b.colIndex},
+		proto.InputColumn{Name: "data", Data: &b.colData},
+	)
 	return b
 }
 
@@ -1040,21 +1187,10 @@ func (b *NegRiskAdapterQuestionPreparedBatch) Reset() {
 	b.colData.Reset()
 }
 func (b *NegRiskAdapterQuestionPreparedBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"marketId",
-		"questionId",
-		"index",
-		"data",
-	})
+	return b.columnNames
 }
 func (b *NegRiskAdapterQuestionPreparedBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "marketId", Data: &b.colMarketID},
-		proto.InputColumn{Name: "questionId", Data: &b.colQuestionID},
-		proto.InputColumn{Name: "index", Data: &b.colIndex},
-		proto.InputColumn{Name: "data", Data: &b.colData},
-	)
+	return b.inputs
 }
 func (b *NegRiskAdapterQuestionPreparedBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskAdapterQuestionPrepared)
@@ -1074,6 +1210,13 @@ type NegRiskAdapterPositionSplitBatch struct {
 	colStakeholder proto.ColFixedStr
 	colConditionID proto.ColFixedStr
 	colAmount      proto.ColUInt256
+	// columnNames/inputs are computed once in NewNegRiskAdapterPositionSplitBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskAdapterPositionSplitBatch() *NegRiskAdapterPositionSplitBatch {
@@ -1081,6 +1224,17 @@ func NewNegRiskAdapterPositionSplitBatch() *NegRiskAdapterPositionSplitBatch {
 	b.common.init()
 	b.colStakeholder = proto.ColFixedStr{Size: 20}
 	b.colConditionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"stakeholder",
+		"conditionId",
+		"amount",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "amount", Data: &b.colAmount},
+	)
 	return b
 }
 
@@ -1095,19 +1249,10 @@ func (b *NegRiskAdapterPositionSplitBatch) Reset() {
 	b.colAmount.Reset()
 }
 func (b *NegRiskAdapterPositionSplitBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"stakeholder",
-		"conditionId",
-		"amount",
-	})
+	return b.columnNames
 }
 func (b *NegRiskAdapterPositionSplitBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "amount", Data: &b.colAmount},
-	)
+	return b.inputs
 }
 func (b *NegRiskAdapterPositionSplitBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskAdapterPositionSplit)
@@ -1126,6 +1271,13 @@ type NegRiskAdapterPositionsMergeBatch struct {
 	colStakeholder proto.ColFixedStr
 	colConditionID proto.ColFixedStr
 	colAmount      proto.ColUInt256
+	// columnNames/inputs are computed once in NewNegRiskAdapterPositionsMergeBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskAdapterPositionsMergeBatch() *NegRiskAdapterPositionsMergeBatch {
@@ -1133,6 +1285,17 @@ func NewNegRiskAdapterPositionsMergeBatch() *NegRiskAdapterPositionsMergeBatch {
 	b.common.init()
 	b.colStakeholder = proto.ColFixedStr{Size: 20}
 	b.colConditionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"stakeholder",
+		"conditionId",
+		"amount",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "amount", Data: &b.colAmount},
+	)
 	return b
 }
 
@@ -1147,19 +1310,10 @@ func (b *NegRiskAdapterPositionsMergeBatch) Reset() {
 	b.colAmount.Reset()
 }
 func (b *NegRiskAdapterPositionsMergeBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"stakeholder",
-		"conditionId",
-		"amount",
-	})
+	return b.columnNames
 }
 func (b *NegRiskAdapterPositionsMergeBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "amount", Data: &b.colAmount},
-	)
+	return b.inputs
 }
 func (b *NegRiskAdapterPositionsMergeBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskAdapterPositionsMerge)
@@ -1179,6 +1333,13 @@ type NegRiskAdapterPositionsConvertedBatch struct {
 	colMarketID    proto.ColFixedStr
 	colIndexSet    proto.ColUInt256
 	colAmount      proto.ColUInt256
+	// columnNames/inputs are computed once in NewNegRiskAdapterPositionsConvertedBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskAdapterPositionsConvertedBatch() *NegRiskAdapterPositionsConvertedBatch {
@@ -1186,6 +1347,19 @@ func NewNegRiskAdapterPositionsConvertedBatch() *NegRiskAdapterPositionsConverte
 	b.common.init()
 	b.colStakeholder = proto.ColFixedStr{Size: 20}
 	b.colMarketID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"stakeholder",
+		"marketId",
+		"indexSet",
+		"amount",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
+		proto.InputColumn{Name: "marketId", Data: &b.colMarketID},
+		proto.InputColumn{Name: "indexSet", Data: &b.colIndexSet},
+		proto.InputColumn{Name: "amount", Data: &b.colAmount},
+	)
 	return b
 }
 
@@ -1201,21 +1375,10 @@ func (b *NegRiskAdapterPositionsConvertedBatch) Reset() {
 	b.colAmount.Reset()
 }
 func (b *NegRiskAdapterPositionsConvertedBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"stakeholder",
-		"marketId",
-		"indexSet",
-		"amount",
-	})
+	return b.columnNames
 }
 func (b *NegRiskAdapterPositionsConvertedBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "stakeholder", Data: &b.colStakeholder},
-		proto.InputColumn{Name: "marketId", Data: &b.colMarketID},
-		proto.InputColumn{Name: "indexSet", Data: &b.colIndexSet},
-		proto.InputColumn{Name: "amount", Data: &b.colAmount},
-	)
+	return b.inputs
 }
 func (b *NegRiskAdapterPositionsConvertedBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskAdapterPositionsConverted)
@@ -1236,6 +1399,13 @@ type NegRiskAdapterPayoutRedemptionBatch struct {
 	colConditionID proto.ColFixedStr
 	colAmounts     proto.ColStr
 	colPayout      proto.ColUInt256
+	// columnNames/inputs are computed once in NewNegRiskAdapterPayoutRedemptionBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewNegRiskAdapterPayoutRedemptionBatch() *NegRiskAdapterPayoutRedemptionBatch {
@@ -1243,6 +1413,19 @@ func NewNegRiskAdapterPayoutRedemptionBatch() *NegRiskAdapterPayoutRedemptionBat
 	b.common.init()
 	b.colRedeemer = proto.ColFixedStr{Size: 20}
 	b.colConditionID = proto.ColFixedStr{Size: 32}
+	b.columnNames = clickHouseColumnNames([]string{
+		"redeemer",
+		"conditionId",
+		"amounts",
+		"payout",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "redeemer", Data: &b.colRedeemer},
+		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
+		proto.InputColumn{Name: "amounts", Data: &b.colAmounts},
+		proto.InputColumn{Name: "payout", Data: &b.colPayout},
+	)
 	return b
 }
 
@@ -1258,21 +1441,10 @@ func (b *NegRiskAdapterPayoutRedemptionBatch) Reset() {
 	b.colPayout.Reset()
 }
 func (b *NegRiskAdapterPayoutRedemptionBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"redeemer",
-		"conditionId",
-		"amounts",
-		"payout",
-	})
+	return b.columnNames
 }
 func (b *NegRiskAdapterPayoutRedemptionBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "redeemer", Data: &b.colRedeemer},
-		proto.InputColumn{Name: "conditionId", Data: &b.colConditionID},
-		proto.InputColumn{Name: "amounts", Data: &b.colAmounts},
-		proto.InputColumn{Name: "payout", Data: &b.colPayout},
-	)
+	return b.inputs
 }
 func (b *NegRiskAdapterPayoutRedemptionBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*NegRiskAdapterPayoutRedemption)
@@ -1295,6 +1467,13 @@ type FixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch struct {
 	colCollateralToken         proto.ColFixedStr
 	colConditionIds            proto.ColStr
 	colFee                     proto.ColUInt256
+	// columnNames/inputs are computed once in NewFixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewFixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch() *FixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch {
@@ -1304,6 +1483,23 @@ func NewFixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch() *Fi
 	b.colFixedProductMarketMaker = proto.ColFixedStr{Size: 20}
 	b.colConditionalTokens = proto.ColFixedStr{Size: 20}
 	b.colCollateralToken = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"creator",
+		"fixedProductMarketMaker",
+		"conditionalTokens",
+		"collateralToken",
+		"conditionIds",
+		"fee",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "creator", Data: &b.colCreator},
+		proto.InputColumn{Name: "fixedProductMarketMaker", Data: &b.colFixedProductMarketMaker},
+		proto.InputColumn{Name: "conditionalTokens", Data: &b.colConditionalTokens},
+		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
+		proto.InputColumn{Name: "conditionIds", Data: &b.colConditionIds},
+		proto.InputColumn{Name: "fee", Data: &b.colFee},
+	)
 	return b
 }
 
@@ -1323,25 +1519,10 @@ func (b *FixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch) Res
 	b.colFee.Reset()
 }
 func (b *FixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"creator",
-		"fixedProductMarketMaker",
-		"conditionalTokens",
-		"collateralToken",
-		"conditionIds",
-		"fee",
-	})
+	return b.columnNames
 }
 func (b *FixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "creator", Data: &b.colCreator},
-		proto.InputColumn{Name: "fixedProductMarketMaker", Data: &b.colFixedProductMarketMaker},
-		proto.InputColumn{Name: "conditionalTokens", Data: &b.colConditionalTokens},
-		proto.InputColumn{Name: "collateralToken", Data: &b.colCollateralToken},
-		proto.InputColumn{Name: "conditionIds", Data: &b.colConditionIds},
-		proto.InputColumn{Name: "fee", Data: &b.colFee},
-	)
+	return b.inputs
 }
 func (b *FixedProductMarketMakerFactoryFixedProductMarketMakerCreationBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*FixedProductMarketMakerFactoryFixedProductMarketMakerCreation)
@@ -1365,12 +1546,34 @@ type FixedProductMarketMakerFPMMBuyBatch struct {
 	colFeeAmount           proto.ColUInt256
 	colOutcomeIndex        proto.ColUInt256
 	colOutcomeTokensBought proto.ColUInt256
+	// columnNames/inputs are computed once in NewFixedProductMarketMakerFPMMBuyBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewFixedProductMarketMakerFPMMBuyBatch() *FixedProductMarketMakerFPMMBuyBatch {
 	b := &FixedProductMarketMakerFPMMBuyBatch{}
 	b.common.init()
 	b.colBuyer = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"buyer",
+		"investmentAmount",
+		"feeAmount",
+		"outcomeIndex",
+		"outcomeTokensBought",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "buyer", Data: &b.colBuyer},
+		proto.InputColumn{Name: "investmentAmount", Data: &b.colInvestmentAmount},
+		proto.InputColumn{Name: "feeAmount", Data: &b.colFeeAmount},
+		proto.InputColumn{Name: "outcomeIndex", Data: &b.colOutcomeIndex},
+		proto.InputColumn{Name: "outcomeTokensBought", Data: &b.colOutcomeTokensBought},
+	)
 	return b
 }
 
@@ -1387,23 +1590,10 @@ func (b *FixedProductMarketMakerFPMMBuyBatch) Reset() {
 	b.colOutcomeTokensBought.Reset()
 }
 func (b *FixedProductMarketMakerFPMMBuyBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"buyer",
-		"investmentAmount",
-		"feeAmount",
-		"outcomeIndex",
-		"outcomeTokensBought",
-	})
+	return b.columnNames
 }
 func (b *FixedProductMarketMakerFPMMBuyBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "buyer", Data: &b.colBuyer},
-		proto.InputColumn{Name: "investmentAmount", Data: &b.colInvestmentAmount},
-		proto.InputColumn{Name: "feeAmount", Data: &b.colFeeAmount},
-		proto.InputColumn{Name: "outcomeIndex", Data: &b.colOutcomeIndex},
-		proto.InputColumn{Name: "outcomeTokensBought", Data: &b.colOutcomeTokensBought},
-	)
+	return b.inputs
 }
 func (b *FixedProductMarketMakerFPMMBuyBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*FixedProductMarketMakerFPMMBuy)
@@ -1426,12 +1616,34 @@ type FixedProductMarketMakerFPMMSellBatch struct {
 	colFeeAmount         proto.ColUInt256
 	colOutcomeIndex      proto.ColUInt256
 	colOutcomeTokensSold proto.ColUInt256
+	// columnNames/inputs are computed once in NewFixedProductMarketMakerFPMMSellBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewFixedProductMarketMakerFPMMSellBatch() *FixedProductMarketMakerFPMMSellBatch {
 	b := &FixedProductMarketMakerFPMMSellBatch{}
 	b.common.init()
 	b.colSeller = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"seller",
+		"returnAmount",
+		"feeAmount",
+		"outcomeIndex",
+		"outcomeTokensSold",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "seller", Data: &b.colSeller},
+		proto.InputColumn{Name: "returnAmount", Data: &b.colReturnAmount},
+		proto.InputColumn{Name: "feeAmount", Data: &b.colFeeAmount},
+		proto.InputColumn{Name: "outcomeIndex", Data: &b.colOutcomeIndex},
+		proto.InputColumn{Name: "outcomeTokensSold", Data: &b.colOutcomeTokensSold},
+	)
 	return b
 }
 
@@ -1448,23 +1660,10 @@ func (b *FixedProductMarketMakerFPMMSellBatch) Reset() {
 	b.colOutcomeTokensSold.Reset()
 }
 func (b *FixedProductMarketMakerFPMMSellBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"seller",
-		"returnAmount",
-		"feeAmount",
-		"outcomeIndex",
-		"outcomeTokensSold",
-	})
+	return b.columnNames
 }
 func (b *FixedProductMarketMakerFPMMSellBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "seller", Data: &b.colSeller},
-		proto.InputColumn{Name: "returnAmount", Data: &b.colReturnAmount},
-		proto.InputColumn{Name: "feeAmount", Data: &b.colFeeAmount},
-		proto.InputColumn{Name: "outcomeIndex", Data: &b.colOutcomeIndex},
-		proto.InputColumn{Name: "outcomeTokensSold", Data: &b.colOutcomeTokensSold},
-	)
+	return b.inputs
 }
 func (b *FixedProductMarketMakerFPMMSellBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*FixedProductMarketMakerFPMMSell)
@@ -1485,12 +1684,30 @@ type FixedProductMarketMakerFPMMFundingAddedBatch struct {
 	colFunder       proto.ColFixedStr
 	colAmountsAdded proto.ColStr
 	colSharesMinted proto.ColUInt256
+	// columnNames/inputs are computed once in NewFixedProductMarketMakerFPMMFundingAddedBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewFixedProductMarketMakerFPMMFundingAddedBatch() *FixedProductMarketMakerFPMMFundingAddedBatch {
 	b := &FixedProductMarketMakerFPMMFundingAddedBatch{}
 	b.common.init()
 	b.colFunder = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"funder",
+		"amountsAdded",
+		"sharesMinted",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "funder", Data: &b.colFunder},
+		proto.InputColumn{Name: "amountsAdded", Data: &b.colAmountsAdded},
+		proto.InputColumn{Name: "sharesMinted", Data: &b.colSharesMinted},
+	)
 	return b
 }
 
@@ -1505,19 +1722,10 @@ func (b *FixedProductMarketMakerFPMMFundingAddedBatch) Reset() {
 	b.colSharesMinted.Reset()
 }
 func (b *FixedProductMarketMakerFPMMFundingAddedBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"funder",
-		"amountsAdded",
-		"sharesMinted",
-	})
+	return b.columnNames
 }
 func (b *FixedProductMarketMakerFPMMFundingAddedBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "funder", Data: &b.colFunder},
-		proto.InputColumn{Name: "amountsAdded", Data: &b.colAmountsAdded},
-		proto.InputColumn{Name: "sharesMinted", Data: &b.colSharesMinted},
-	)
+	return b.inputs
 }
 func (b *FixedProductMarketMakerFPMMFundingAddedBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*FixedProductMarketMakerFPMMFundingAdded)
@@ -1537,12 +1745,32 @@ type FixedProductMarketMakerFPMMFundingRemovedBatch struct {
 	colAmountsRemoved               proto.ColStr
 	colCollateralRemovedFromFeePool proto.ColUInt256
 	colSharesBurnt                  proto.ColUInt256
+	// columnNames/inputs are computed once in NewFixedProductMarketMakerFPMMFundingRemovedBatch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func NewFixedProductMarketMakerFPMMFundingRemovedBatch() *FixedProductMarketMakerFPMMFundingRemovedBatch {
 	b := &FixedProductMarketMakerFPMMFundingRemovedBatch{}
 	b.common.init()
 	b.colFunder = proto.ColFixedStr{Size: 20}
+	b.columnNames = clickHouseColumnNames([]string{
+		"funder",
+		"amountsRemoved",
+		"collateralRemovedFromFeePool",
+		"sharesBurnt",
+	})
+	inputs := b.common.Inputs()
+	b.inputs = append(inputs,
+		proto.InputColumn{Name: "funder", Data: &b.colFunder},
+		proto.InputColumn{Name: "amountsRemoved", Data: &b.colAmountsRemoved},
+		proto.InputColumn{Name: "collateralRemovedFromFeePool", Data: &b.colCollateralRemovedFromFeePool},
+		proto.InputColumn{Name: "sharesBurnt", Data: &b.colSharesBurnt},
+	)
 	return b
 }
 
@@ -1558,21 +1786,10 @@ func (b *FixedProductMarketMakerFPMMFundingRemovedBatch) Reset() {
 	b.colSharesBurnt.Reset()
 }
 func (b *FixedProductMarketMakerFPMMFundingRemovedBatch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		"funder",
-		"amountsRemoved",
-		"collateralRemovedFromFeePool",
-		"sharesBurnt",
-	})
+	return b.columnNames
 }
 func (b *FixedProductMarketMakerFPMMFundingRemovedBatch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-	return append(inputs,
-		proto.InputColumn{Name: "funder", Data: &b.colFunder},
-		proto.InputColumn{Name: "amountsRemoved", Data: &b.colAmountsRemoved},
-		proto.InputColumn{Name: "collateralRemovedFromFeePool", Data: &b.colCollateralRemovedFromFeePool},
-		proto.InputColumn{Name: "sharesBurnt", Data: &b.colSharesBurnt},
-	)
+	return b.inputs
 }
 func (b *FixedProductMarketMakerFPMMFundingRemovedBatch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*FixedProductMarketMakerFPMMFundingRemoved)

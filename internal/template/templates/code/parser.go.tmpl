@@ -105,27 +105,20 @@ func _parseStatsFmtN(n int64) string {
 	return fmt.Sprintf("%.2fM", float64(n)/1e6)
 }
 
-// _pnow / _psince are the parse-profiling clock. parseProfilingEnabled is an
-// untyped constant defined in a build-tagged companion file: false by default,
-// true under -tags sqdparseprof. With the default build the compiler folds these
-// to a zero Time and a literal 0, so the per-line / per-event timing calls and
-// the [PARSE 10s] summary block compile out entirely (no time.Now syscalls in
-// the hot loop). Build with -tags sqdparseprof to re-enable instrumentation.
-func _pnow() time.Time {
-	if parseProfilingEnabled {
-		return time.Now()
-	}
-	return time.Time{}
-}
-
-func _psince(t time.Time) int64 {
-	if parseProfilingEnabled {
-		return int64(time.Since(t))
-	}
-	return 0
-}
+// _pinit, _pnow, and _psince (the parse-profiling clock) are defined in the
+// build-tagged companion files alongside parseProfilingEnabled
+// (parse_profiling.go / parse_profiling_enabled.go), not here. parser.go is
+// compiled into every build regardless of the sqdparseprof tag, so its imports
+// can't be conditional — defining the tsc-backed clock here would make every
+// build, including the profiling-disabled default, import "github.com/templexxx/tsc"
+// and pay its package init() (a blocking ~2s TSC calibration) just by linking
+// it in. Keeping the clock in the tagged files means the default build never
+// references tsc at all.
 
 func parseJSONL(data []byte, batches *InsertBatches, ring *OrderedHistoricRingBuffer, protoRing *ProtoRingBuffer, onBlock func(*ParsedBlock) error, onProtoBlock func(*ProtoEventBlock) error, endBlock uint64, onLine func(*ParsedBlock, *ProtoEventBlock, parsedLineMeta) error) (uint64, error) {
+	if parseProfilingEnabled {
+		_pinit() // once per process, not once per parseJSONL call (sync.OnceFunc)
+	}
 	var topics [4]string
 	var dataHex string
 	var dataBytes []byte

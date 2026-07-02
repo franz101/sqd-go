@@ -34,6 +34,7 @@ type parsedArgs struct {
 	initStartBlk string
 	initEndBlk   string
 	cpuprofile   string
+	fgprofile    string
 	pageSize     string
 }
 
@@ -103,6 +104,12 @@ func parseArgs(args []string) (*parsedArgs, error) {
 				return nil, fmt.Errorf("--cpuprofile requires a value")
 			}
 			p.cpuprofile = args[i]
+		case "--fgprofile":
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("--fgprofile requires a value")
+			}
+			p.fgprofile = args[i]
 		case "--no-proto":
 			p.protoMode = false
 		case "--no-cold-cache":
@@ -206,14 +213,14 @@ func Run(args []string) int {
 		if p.state && os.Getenv(stateChildEnv) == "" {
 			return runStateRebuild(args, p.project)
 		}
-		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
+		return runStartPipeline(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.fgprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 
 	case "dev":
 		if p.project == "" {
 			fmt.Fprintln(os.Stderr, "usage: sqd-go dev <project-dir|config.yaml|config.yml> [--restart]")
 			return 2
 		}
-		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
+		return runDev(p.project, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.fgprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 
 	case "stop":
 		return runStop()
@@ -232,7 +239,7 @@ func Run(args []string) int {
 		return 0
 
 	default:
-		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
+		return runStartPipeline(p.command, p.restart, p.protoMode, p.noColdCache, p.initStartBlk, p.initEndBlk, p.initChainID, p.cpuprofile, p.fgprofile, p.pageSize, p.parallelFetch, p.reindexFrom, p.prefetch, p.noReplay)
 	}
 }
 

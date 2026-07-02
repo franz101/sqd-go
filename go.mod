@@ -9,12 +9,14 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.1.6
 	github.com/consensys/gnark-crypto v0.20.1
 	github.com/ethereum/go-ethereum v1.17.4
+	github.com/felixge/fgprof v0.9.5
 	github.com/greatroar/blobloom v0.8.1
 	github.com/holiman/uint256 v1.3.2
 	github.com/klauspost/compress v1.18.6
 	github.com/mailru/easyjson v0.9.2
 	github.com/shopspring/decimal v1.4.0
 	github.com/stretchr/testify v1.11.1
+	github.com/templexxx/tsc v1.3.0
 	github.com/tylertreat/boomfilters v0.0.0-20251117164519-53813c36cc1b
 	github.com/valyala/fastjson v1.6.10
 	go.mills.io/bitcask/v2 v2.1.5
@@ -47,6 +49,7 @@ require (
 	github.com/gofrs/flock v0.12.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
+	github.com/google/pprof v0.0.0-20240227163752-401108e1b7e7 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-immutable-radix/v2 v2.0.0 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
@@ -69,7 +72,6 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/templexxx/cpu v0.1.1 // indirect
-	github.com/templexxx/tsc v1.3.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect

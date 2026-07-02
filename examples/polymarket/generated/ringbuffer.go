@@ -476,7 +476,6 @@ func (r *OrderedHistoricRingBuffer) IterateOrdered() iter.Seq[*ParsedBlock] {
 	}
 }
 
-
 // =============================================================================
 // V2: Proto ring buffer (columnar storage, ~50x memory reduction)
 // =============================================================================

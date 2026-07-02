@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
@@ -145,17 +146,35 @@ func clickHouseColumnNames(valueColumns []string) []string {
 	return names
 }
 
-func InsertEventBatch(ctx context.Context, conn *ch.Client, db string, batch ClickHouseEventBatch) error {
-	if batch.Rows() == 0 {
-		return nil
+// insertQueryCache caches the fully quoted "INSERT INTO db.table (cols) VALUES"
+// body per (db, table): the column list is fixed per table, so re-quoting and
+// re-formatting it on every insert call is pure per-call allocation. Keyed by
+// db+table since the same generated batch type could in principle be inserted
+// against more than one database name within a process. sync.Map because
+// insert calls may run from more than one goroutine (e.g. async insert).
+var insertQueryCache sync.Map
+
+func insertQueryFor(db string, batch ClickHouseEventBatch) string {
+	key := db + "\x00" + batch.TableName()
+	if v, ok := insertQueryCache.Load(key); ok {
+		return v.(string)
 	}
 	cols := batch.ColumnNames()
 	quoted := make([]string, 0, len(cols))
 	for _, col := range cols {
 		quoted = append(quoted, quoteIdent(col))
 	}
+	query := fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES", quoteIdent(db), quoteIdent(batch.TableName()), strings.Join(quoted, ", "))
+	actual, _ := insertQueryCache.LoadOrStore(key, query)
+	return actual.(string)
+}
+
+func InsertEventBatch(ctx context.Context, conn *ch.Client, db string, batch ClickHouseEventBatch) error {
+	if batch.Rows() == 0 {
+		return nil
+	}
 	return conn.Do(ctx, ch.Query{
-		Body:  fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES", quoteIdent(db), quoteIdent(batch.TableName()), strings.Join(quoted, ", ")),
+		Body:  insertQueryFor(db, batch),
 		Input: batch.Inputs(),
 	})
 }
@@ -261,6 +280,13 @@ type {{.GoTypeName}}Batch struct {
 {{- range .Args}}
 	col{{.GoFieldName}} {{.ProtoColumnType}}
 {{- end}}
+	// columnNames/inputs are computed once in New{{.GoTypeName}}Batch and
+	// reused for the batch's lifetime: column identity (names, &colX
+	// pointers) never changes across Reset(), only the data inside each
+	// column does, so rebuilding these slices on every ColumnNames()/Inputs()
+	// call (formerly once per insert) was pure allocation noise.
+	columnNames []string
+	inputs      []proto.InputColumn
 }
 
 func New{{.GoTypeName}}Batch() *{{.GoTypeName}}Batch {
@@ -270,6 +296,21 @@ func New{{.GoTypeName}}Batch() *{{.GoTypeName}}Batch {
 {{- if .ProtoColumnInit}}
 	b.col{{.GoFieldName}} = {{.ProtoColumnInit}}
 {{- end}}
+{{- end}}
+	b.columnNames = clickHouseColumnNames([]string{
+		{{- range .Args}}
+		"{{.ColumnName}}",
+		{{- end}}
+	})
+	inputs := b.common.Inputs()
+{{- if eq (len .Args) 0}}
+	b.inputs = inputs
+{{- else}}
+	b.inputs = append(inputs,
+		{{- range .Args}}
+		proto.InputColumn{Name: "{{.ColumnName}}", Data: &b.col{{.GoFieldName}}},
+		{{- end}}
+	)
 {{- end}}
 	return b
 }
@@ -283,25 +324,11 @@ func (b *{{.GoTypeName}}Batch) Reset() {
 {{- end}}
 }
 func (b *{{.GoTypeName}}Batch) ColumnNames() []string {
-	return clickHouseColumnNames([]string{
-		{{- range .Args}}
-		"{{.ColumnName}}",
-		{{- end}}
-	})
+	return b.columnNames
 }
 func (b *{{.GoTypeName}}Batch) Inputs() []proto.InputColumn {
-	inputs := b.common.Inputs()
-{{- if eq (len .Args) 0}}
-	return inputs
+	return b.inputs
 }
-{{- else}}
-	return append(inputs,
-		{{- range .Args}}
-		proto.InputColumn{Name: "{{.ColumnName}}", Data: &b.col{{.GoFieldName}}},
-		{{- end}}
-	)
-}
-{{- end}}
 func (b *{{.GoTypeName}}Batch) Append(meta EventMeta, value any) bool {
 	ev, ok := value.(*{{.GoTypeName}})
 	if !ok {

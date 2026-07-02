@@ -73,18 +73,88 @@ func recoveryDialConn(ctx context.Context) (*ch.Client, error) {
 	})
 }
 
-func recoveryRecencyClause() string {
-	// SQD_RECOVERY_MIN_BLOCK floor, read inline (see recoveryDialConn).
-	var mb uint64
-	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			mb = uint64(n)
+// recoveryManualFloor returns the operator-supplied SQD_RECOVERY_MIN_BLOCK
+// floor, or (0, false) if unset/invalid. It always wins over the auto-computed
+// quantile floor, preserving exact prior behavior for anyone still setting it.
+func recoveryManualFloor() (uint64, bool) {
+	v := os.Getenv("SQD_RECOVERY_MIN_BLOCK")
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return uint64(n), true
+}
+
+// recoveryAutoFloorDisabled reports whether SQD_RECOVERY_AUTO_FLOOR=0 (or
+// "false") opts out of the quantile-based floor, restoring the old
+// unconditional full-table-scan recovery behavior.
+func recoveryAutoFloorDisabled() bool {
+	v := os.Getenv("SQD_RECOVERY_AUTO_FLOOR")
+	return v == "0" || strings.EqualFold(v, "false")
+}
+
+// recoveryQuantile is the quantile level used to auto-derive a recovery floor:
+// the table is split into a "keys-only" tail (older than the floor, added to
+// the negative filter without fetching values) and a recent head (loaded with
+// full values). The default 0.95 means the most recent ~5% of rows by recency
+// column get full value loads. Override with SQD_RECOVERY_QUANTILE.
+func recoveryQuantile() float64 {
+	if v := os.Getenv("SQD_RECOVERY_QUANTILE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f < 1 {
+			return f
 		}
 	}
-	if mb == 0 {
+	return 0.95
+}
+
+// recoveryFloorFor returns the recovery floor for one hot-state table's
+// recency column (either the user-defined "updated_at_block" version column,
+// or the codegen-injected "block_number" fallback — see recoveryColumnFor in
+// hot_state.go). SQD_RECOVERY_MIN_BLOCK always wins when set. Otherwise this
+// asks ClickHouse for the recoveryQuantile() of the column directly: a single
+// numeric-column aggregate scan (quantile() is reservoir-sampled, so it never
+// reads the whole table), not the multi-column ORDER BY ... LIMIT 1 BY the
+// bucketed recovery query needs. That turns the always-full-table-scan default
+// into a bounded "recent tail" scan without requiring an operator to compute
+// and pass a floor by hand on every restart.
+//
+// A query failure or empty table fails open (floor=0, meaning "no filter" —
+// the original full-scan behavior), so a broken auto-floor can only slow
+// recovery back down, never corrupt state: floor=0 makes
+// recoveryRecencyClauseFor/recoveryPreFloorClauseFor both no-ops, so every key
+// still goes through the normal (slow) full-value load and lands in the
+// negative filter, same as if auto-floor never ran.
+func recoveryFloorFor(ctx context.Context, conn *ch.Client, db, table, column string) uint64 {
+	if mb, ok := recoveryManualFloor(); ok {
+		return mb
+	}
+	if recoveryAutoFloorDisabled() {
+		return 0
+	}
+	// count()=0 is checked before quantile() is converted to UInt64: quantile()
+	// over zero rows returns NaN (not NULL), and toUInt64(NaN) raises a
+	// CANNOT_CONVERT_TYPE exception rather than coalescing — confirmed against a
+	// live server. Branching on count() avoids ever evaluating that conversion.
+	var q proto.ColUInt64
+	err := conn.Do(ctx, ch.Query{
+		Body: fmt.Sprintf("SELECT if(count() = 0, 0, toUInt64(quantile(%v)(%s))) AS q FROM %s.%s",
+			recoveryQuantile(), quoteIdent(column), quoteIdent(db), quoteIdent(table)),
+		Result: proto.Results{{Name: "q", Data: &q}},
+	})
+	if err != nil || q.Rows() == 0 {
+		return 0
+	}
+	return q.Row(0)
+}
+
+func recoveryRecencyClauseFor(floor uint64, column string) string {
+	if floor == 0 {
 		return ""
 	}
-	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " >= " + strconv.FormatUint(mb, 10)
+	return " AND " + quoteIdent("t") + "." + quoteIdent(column) + " >= " + strconv.FormatUint(floor, 10)
 }
 
 func recoverColdParallel[T any](
@@ -200,17 +270,11 @@ func flushAsyncInserts(ctx context.Context, conn *ch.Client) error {
 	return conn.Do(ctx, ch.Query{Body: "SYSTEM FLUSH ASYNC INSERT QUEUE"})
 }
 
-func recoveryPreFloorClause() (clause string, active bool) {
-	var mb uint64
-	if v := os.Getenv("SQD_RECOVERY_MIN_BLOCK"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			mb = uint64(n)
-		}
-	}
-	if mb == 0 {
+func recoveryPreFloorClauseFor(floor uint64, column string) (clause string, active bool) {
+	if floor == 0 {
 		return "", false
 	}
-	return " AND " + quoteIdent("t") + "." + quoteIdent("updated_at_block") + " < " + strconv.FormatUint(mb, 10), true
+	return " AND " + quoteIdent("t") + "." + quoteIdent(column) + " < " + strconv.FormatUint(floor, 10), true
 }
 
 func recoverFilterKeysParallel[K any](
@@ -705,7 +769,7 @@ func NewMemoryConditionBatch() *MemoryConditionBatch {
 	return b
 }
 
-func (b *MemoryConditionBatch) TableName() string { return "memory_conditions" }
+func (b *MemoryConditionBatch) TableName() string { return "memory_conditions_log" }
 
 func (b *MemoryConditionBatch) Rows() int { return b.colID.Rows() }
 
@@ -717,7 +781,8 @@ func (b *MemoryConditionBatch) Append(item MemoryCondition) {
 	b.colQuestionID.Append(item.QuestionID.Bytes())
 	b.colOutcomeSlotCount.Append(item.OutcomeSlotCount)
 	b.colResolved.Append(hotStateBool(item.Resolved))
-	b.colPayouts.Append(hotStateUInt256Slice(item.Payouts, b.scratchPayouts))
+	b.scratchPayouts = hotStateUInt256Slice(item.Payouts, b.scratchPayouts)
+	b.colPayouts.Append(b.scratchPayouts)
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
 	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
@@ -735,6 +800,7 @@ func (b *MemoryConditionBatch) Insert(ctx context.Context, conn *ch.Client, db s
 }
 
 func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
+	floor := recoveryFloorFor(ctx, conn, db, "memory_conditions_log", "updated_at_block")
 	run := func(ctx context.Context, conn *ch.Client, bucket int, emit func(MemoryCondition)) error {
 		var (
 			colID               proto.ColFixedStr
@@ -768,7 +834,7 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`oracle` AS `oracle`, `t`.`question_id` AS `question_id`, `t`.`outcome_slot_count` AS `outcome_slot_count`, `t`.`resolved` AS `resolved`, `t`.`payouts` AS `payouts`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_conditions"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`oracle` AS `oracle`, `t`.`question_id` AS `question_id`, `t`.`outcome_slot_count` AS `outcome_slot_count`, `t`.`resolved` AS `resolved`, `t`.`payouts` AS `payouts`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_conditions_log"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClauseFor(floor, "updated_at_block")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryCondition{
 					ID:               common.BytesToHash(colID.Row(i)),
@@ -792,7 +858,7 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 		// recovery floor are excluded from the value load above and would otherwise be
 		// absent from the filter, making the authoritative skip-CH gate reset a real
 		// pre-existing position to zero. Add their keys only (values not needed).
-		if preClause, active := recoveryPreFloorClause(); active {
+		if preClause, active := recoveryPreFloorClauseFor(floor, "updated_at_block"); active {
 			if err := recoverFilterKeysParallel(ctx, conn, recoveryBucketCount, c.cold, func(ctx context.Context, conn *ch.Client, bucket int, emit func(ConditionsClockKey)) error {
 				var (
 					colID proto.ColFixedStr
@@ -801,7 +867,7 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 				results := proto.Results{
 					{Name: "id", Data: &colID},
 				}
-				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_conditions"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_conditions_log"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 					for i := 0; i < block.Rows; i++ {
 						emit(ConditionsClockKey{
 							ID: common.BytesToHash(colID.Row(i)),
@@ -827,11 +893,19 @@ func (c *ConditionsClockCache) Recover(ctx context.Context, conn *ch.Client, db 
 }
 
 type MemoryConditionBatchResolver struct {
-	cache          *ConditionsClockCache
+	cache *ConditionsClockCache
+	// mu protects only misses. Cross-block resolve pipelining (State.StartPrune's
+	// sibling for resolve — see State.StartResolvePending) can call Queue and
+	// Resolve on the same resolver from two goroutines at once: real-apply's
+	// lazy fallback path (state.go's GetValue) for the in-flight block racing
+	// the next block's prefetch dry-run dispatch. Resolve detaches misses into a
+	// local batch under the lock and does all the dedup/query work — including
+	// the network round trip — outside it, so pipelined resolves never
+	// serialize on each other; only the brief append/detach does. Metrics stay
+	// single-owner/unprotected: EnableMetrics is test/diagnostic-only and never
+	// combined with pipelining in this codebase.
+	mu             sync.Mutex
 	misses         []ConditionsClockKey
-	uniqueKeys     map[ConditionsClockKey]struct{}
-	uniqueList     []ConditionsClockKey
-	foundKeys      map[ConditionsClockKey]struct{}
 	metricsEnabled bool
 	metrics        BatchResolverMetrics
 	hot            *HotState
@@ -869,12 +943,16 @@ func (r *MemoryConditionBatchResolver) Queue(key ConditionsClockKey) {
 		if r.metricsEnabled {
 			r.metrics.QueuedMisses++
 		}
+		r.mu.Lock()
 		r.misses = append(r.misses, key)
+		r.mu.Unlock()
 	}
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
 func (r *MemoryConditionBatchResolver) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.misses)
 }
 
@@ -906,23 +984,28 @@ func (r *MemoryConditionBatchResolver) SnapshotAndResetMetrics() BatchResolverMe
 }
 
 func (r *MemoryConditionBatchResolver) Resolve(ctx context.Context, conn *ch.Client, db string) error {
+	// Detach the pending batch under the lock, then do everything else —
+	// dedup, query, and the network round trip — on this goroutine's own local
+	// copy. Queue (from a concurrently-pipelined next block, or this block's
+	// own lazy fallback) can keep appending into a fresh misses slice the
+	// instant this unlocks, without waiting on the round trip below.
+	r.mu.Lock()
 	if len(r.misses) == 0 {
+		r.mu.Unlock()
 		return nil
 	}
+	batch := r.misses
+	r.misses = nil
+	r.mu.Unlock()
 
-	if r.uniqueKeys == nil {
-		r.uniqueKeys = make(map[ConditionsClockKey]struct{})
-	}
-	clear(r.uniqueKeys)
-	uniqueList := r.uniqueList[:0]
-	for _, key := range r.misses {
-		if _, ok := r.uniqueKeys[key]; !ok {
-			r.uniqueKeys[key] = struct{}{}
+	uniqueKeys := make(map[ConditionsClockKey]struct{}, len(batch))
+	uniqueList := make([]ConditionsClockKey, 0, len(batch))
+	for _, key := range batch {
+		if _, ok := uniqueKeys[key]; !ok {
+			uniqueKeys[key] = struct{}{}
 			uniqueList = append(uniqueList, key)
 		}
 	}
-	r.uniqueList = uniqueList
-	r.misses = r.misses[:0]
 
 	if len(uniqueList) == 0 {
 		return nil
@@ -938,7 +1021,7 @@ func (r *MemoryConditionBatchResolver) Resolve(ctx context.Context, conn *ch.Cli
 		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
 	}
 
-	queryStr := fmt.Sprintf("SELECT `id`, `oracle`, `question_id`, `outcome_slot_count`, `resolved`, `payouts`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_conditions WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+	queryStr := fmt.Sprintf("SELECT `id`, `oracle`, `question_id`, `outcome_slot_count`, `resolved`, `payouts`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_conditions_log WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
 
 	var (
 		colID               proto.ColFixedStr
@@ -972,11 +1055,7 @@ func (r *MemoryConditionBatchResolver) Resolve(ctx context.Context, conn *ch.Cli
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	if r.foundKeys == nil {
-		r.foundKeys = make(map[ConditionsClockKey]struct{})
-	}
-	clear(r.foundKeys)
-	foundKeys := r.foundKeys
+	foundKeys := make(map[ConditionsClockKey]struct{}, len(uniqueList))
 	q := ch.Query{
 		Body:   queryStr,
 		Result: results,
@@ -1331,7 +1410,7 @@ func NewMemoryUserPositionBatch() *MemoryUserPositionBatch {
 	return b
 }
 
-func (b *MemoryUserPositionBatch) TableName() string { return "memory_user_positions" }
+func (b *MemoryUserPositionBatch) TableName() string { return "memory_user_positions_log" }
 
 func (b *MemoryUserPositionBatch) Rows() int { return b.colUser.Rows() }
 
@@ -1361,6 +1440,7 @@ func (b *MemoryUserPositionBatch) Insert(ctx context.Context, conn *ch.Client, d
 }
 
 func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
+	floor := recoveryFloorFor(ctx, conn, db, "memory_user_positions_log", "updated_at_block")
 	run := func(ctx context.Context, conn *ch.Client, bucket int, emit func(MemoryUserPosition)) error {
 		var (
 			colUser           proto.ColFixedStr
@@ -1392,7 +1472,7 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`user` DESC, `t`.`token_id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_user_positions"), recoveryFixedStringRange("`t`.`user`", bucket, 20)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id`, `t`.`amount` AS `amount`, `t`.`avg_price` AS `avg_price`, `t`.`realized_pn_l` AS `realized_pn_l`, `t`.`total_bought` AS `total_bought`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`user` DESC, `t`.`token_id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`user`, `t`.`token_id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_user_positions_log"), recoveryFixedStringRange("`t`.`user`", bucket, 20)+recoveryRecencyClauseFor(floor, "updated_at_block")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryUserPosition{
 					User:           common.BytesToAddress(colUser.Row(i)),
@@ -1416,7 +1496,7 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 		// recovery floor are excluded from the value load above and would otherwise be
 		// absent from the filter, making the authoritative skip-CH gate reset a real
 		// pre-existing position to zero. Add their keys only (values not needed).
-		if preClause, active := recoveryPreFloorClause(); active {
+		if preClause, active := recoveryPreFloorClauseFor(floor, "updated_at_block"); active {
 			if err := recoverFilterKeysParallel(ctx, conn, recoveryBucketCount, c.cold, func(ctx context.Context, conn *ch.Client, bucket int, emit func(UserPositionsClockKey)) error {
 				var (
 					colUser    proto.ColFixedStr
@@ -1428,7 +1508,7 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 					{Name: "user", Data: &colUser},
 					{Name: "token_id", Data: &colTokenID},
 				}
-				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`user`, `t`.`token_id`", quoteIdent(db), quoteIdent("memory_user_positions"), recoveryFixedStringRange("`t`.`user`", bucket, 20)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`user` AS `user`, `t`.`token_id` AS `token_id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`user`, `t`.`token_id`", quoteIdent(db), quoteIdent("memory_user_positions_log"), recoveryFixedStringRange("`t`.`user`", bucket, 20)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 					for i := 0; i < block.Rows; i++ {
 						emit(UserPositionsClockKey{
 							User:    common.BytesToAddress(colUser.Row(i)),
@@ -1455,11 +1535,19 @@ func (c *UserPositionsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 }
 
 type MemoryUserPositionBatchResolver struct {
-	cache          *UserPositionsClockCache
+	cache *UserPositionsClockCache
+	// mu protects only misses. Cross-block resolve pipelining (State.StartPrune's
+	// sibling for resolve — see State.StartResolvePending) can call Queue and
+	// Resolve on the same resolver from two goroutines at once: real-apply's
+	// lazy fallback path (state.go's GetValue) for the in-flight block racing
+	// the next block's prefetch dry-run dispatch. Resolve detaches misses into a
+	// local batch under the lock and does all the dedup/query work — including
+	// the network round trip — outside it, so pipelined resolves never
+	// serialize on each other; only the brief append/detach does. Metrics stay
+	// single-owner/unprotected: EnableMetrics is test/diagnostic-only and never
+	// combined with pipelining in this codebase.
+	mu             sync.Mutex
 	misses         []UserPositionsClockKey
-	uniqueKeys     map[UserPositionsClockKey]struct{}
-	uniqueList     []UserPositionsClockKey
-	foundKeys      map[UserPositionsClockKey]struct{}
 	metricsEnabled bool
 	metrics        BatchResolverMetrics
 	hot            *HotState
@@ -1497,12 +1585,16 @@ func (r *MemoryUserPositionBatchResolver) Queue(key UserPositionsClockKey) {
 		if r.metricsEnabled {
 			r.metrics.QueuedMisses++
 		}
+		r.mu.Lock()
 		r.misses = append(r.misses, key)
+		r.mu.Unlock()
 	}
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
 func (r *MemoryUserPositionBatchResolver) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.misses)
 }
 
@@ -1534,23 +1626,28 @@ func (r *MemoryUserPositionBatchResolver) SnapshotAndResetMetrics() BatchResolve
 }
 
 func (r *MemoryUserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.Client, db string) error {
+	// Detach the pending batch under the lock, then do everything else —
+	// dedup, query, and the network round trip — on this goroutine's own local
+	// copy. Queue (from a concurrently-pipelined next block, or this block's
+	// own lazy fallback) can keep appending into a fresh misses slice the
+	// instant this unlocks, without waiting on the round trip below.
+	r.mu.Lock()
 	if len(r.misses) == 0 {
+		r.mu.Unlock()
 		return nil
 	}
+	batch := r.misses
+	r.misses = nil
+	r.mu.Unlock()
 
-	if r.uniqueKeys == nil {
-		r.uniqueKeys = make(map[UserPositionsClockKey]struct{})
-	}
-	clear(r.uniqueKeys)
-	uniqueList := r.uniqueList[:0]
-	for _, key := range r.misses {
-		if _, ok := r.uniqueKeys[key]; !ok {
-			r.uniqueKeys[key] = struct{}{}
+	uniqueKeys := make(map[UserPositionsClockKey]struct{}, len(batch))
+	uniqueList := make([]UserPositionsClockKey, 0, len(batch))
+	for _, key := range batch {
+		if _, ok := uniqueKeys[key]; !ok {
+			uniqueKeys[key] = struct{}{}
 			uniqueList = append(uniqueList, key)
 		}
 	}
-	r.uniqueList = uniqueList
-	r.misses = r.misses[:0]
 
 	if len(uniqueList) == 0 {
 		return nil
@@ -1566,7 +1663,7 @@ func (r *MemoryUserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.
 		values = append(values, "("+fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.User.Hex(), "0x"))+", "+fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.TokenID.Hex(), "0x"))+")")
 	}
 
-	queryStr := fmt.Sprintf("SELECT `user`, `token_id`, `amount`, `avg_price`, `realized_pn_l`, `total_bought`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_user_positions WHERE (`user`, `token_id`) IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `user`, `token_id`", quoteIdent(db), strings.Join(values, ", "))
+	queryStr := fmt.Sprintf("SELECT `user`, `token_id`, `amount`, `avg_price`, `realized_pn_l`, `total_bought`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_user_positions_log WHERE (`user`, `token_id`) IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `user`, `token_id`", quoteIdent(db), strings.Join(values, ", "))
 
 	var (
 		colUser           proto.ColFixedStr
@@ -1598,11 +1695,7 @@ func (r *MemoryUserPositionBatchResolver) Resolve(ctx context.Context, conn *ch.
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	if r.foundKeys == nil {
-		r.foundKeys = make(map[UserPositionsClockKey]struct{})
-	}
-	clear(r.foundKeys)
-	foundKeys := r.foundKeys
+	foundKeys := make(map[UserPositionsClockKey]struct{}, len(uniqueList))
 	q := ch.Query{
 		Body:   queryStr,
 		Result: results,
@@ -2029,7 +2122,7 @@ func NewMemoryMarketBatch() *MemoryMarketBatch {
 	return b
 }
 
-func (b *MemoryMarketBatch) TableName() string { return "memory_markets" }
+func (b *MemoryMarketBatch) TableName() string { return "memory_markets_log" }
 
 func (b *MemoryMarketBatch) Rows() int { return b.colID.Rows() }
 
@@ -2038,7 +2131,8 @@ func (b *MemoryMarketBatch) Reset() { b.input.Reset() }
 func (b *MemoryMarketBatch) Append(item MemoryMarket) {
 	b.colID.Append(item.ID.Bytes())
 	b.colQuestionCount.Append(item.QuestionCount)
-	b.colQuestionIDs.Append(hotStateHashSliceBytes(item.QuestionIDs, b.scratchQuestionIDs))
+	b.scratchQuestionIDs = hotStateHashSliceBytes(item.QuestionIDs, b.scratchQuestionIDs)
+	b.colQuestionIDs.Append(b.scratchQuestionIDs)
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
 	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
@@ -2056,6 +2150,7 @@ func (b *MemoryMarketBatch) Insert(ctx context.Context, conn *ch.Client, db stri
 }
 
 func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
+	floor := recoveryFloorFor(ctx, conn, db, "memory_markets_log", "updated_at_block")
 	run := func(ctx context.Context, conn *ch.Client, bucket int, emit func(MemoryMarket)) error {
 		var (
 			colID             proto.ColFixedStr
@@ -2081,7 +2176,7 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_markets"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_markets_log"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClauseFor(floor, "updated_at_block")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryMarket{
 					ID:             common.BytesToHash(colID.Row(i)),
@@ -2102,7 +2197,7 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 		// recovery floor are excluded from the value load above and would otherwise be
 		// absent from the filter, making the authoritative skip-CH gate reset a real
 		// pre-existing position to zero. Add their keys only (values not needed).
-		if preClause, active := recoveryPreFloorClause(); active {
+		if preClause, active := recoveryPreFloorClauseFor(floor, "updated_at_block"); active {
 			if err := recoverFilterKeysParallel(ctx, conn, recoveryBucketCount, c.cold, func(ctx context.Context, conn *ch.Client, bucket int, emit func(MarketsClockKey)) error {
 				var (
 					colID proto.ColFixedStr
@@ -2111,7 +2206,7 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 				results := proto.Results{
 					{Name: "id", Data: &colID},
 				}
-				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_markets"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_markets_log"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 					for i := 0; i < block.Rows; i++ {
 						emit(MarketsClockKey{
 							ID: common.BytesToHash(colID.Row(i)),
@@ -2137,11 +2232,19 @@ func (c *MarketsClockCache) Recover(ctx context.Context, conn *ch.Client, db str
 }
 
 type MemoryMarketBatchResolver struct {
-	cache          *MarketsClockCache
+	cache *MarketsClockCache
+	// mu protects only misses. Cross-block resolve pipelining (State.StartPrune's
+	// sibling for resolve — see State.StartResolvePending) can call Queue and
+	// Resolve on the same resolver from two goroutines at once: real-apply's
+	// lazy fallback path (state.go's GetValue) for the in-flight block racing
+	// the next block's prefetch dry-run dispatch. Resolve detaches misses into a
+	// local batch under the lock and does all the dedup/query work — including
+	// the network round trip — outside it, so pipelined resolves never
+	// serialize on each other; only the brief append/detach does. Metrics stay
+	// single-owner/unprotected: EnableMetrics is test/diagnostic-only and never
+	// combined with pipelining in this codebase.
+	mu             sync.Mutex
 	misses         []MarketsClockKey
-	uniqueKeys     map[MarketsClockKey]struct{}
-	uniqueList     []MarketsClockKey
-	foundKeys      map[MarketsClockKey]struct{}
 	metricsEnabled bool
 	metrics        BatchResolverMetrics
 	hot            *HotState
@@ -2179,12 +2282,16 @@ func (r *MemoryMarketBatchResolver) Queue(key MarketsClockKey) {
 		if r.metricsEnabled {
 			r.metrics.QueuedMisses++
 		}
+		r.mu.Lock()
 		r.misses = append(r.misses, key)
+		r.mu.Unlock()
 	}
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
 func (r *MemoryMarketBatchResolver) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.misses)
 }
 
@@ -2216,23 +2323,28 @@ func (r *MemoryMarketBatchResolver) SnapshotAndResetMetrics() BatchResolverMetri
 }
 
 func (r *MemoryMarketBatchResolver) Resolve(ctx context.Context, conn *ch.Client, db string) error {
+	// Detach the pending batch under the lock, then do everything else —
+	// dedup, query, and the network round trip — on this goroutine's own local
+	// copy. Queue (from a concurrently-pipelined next block, or this block's
+	// own lazy fallback) can keep appending into a fresh misses slice the
+	// instant this unlocks, without waiting on the round trip below.
+	r.mu.Lock()
 	if len(r.misses) == 0 {
+		r.mu.Unlock()
 		return nil
 	}
+	batch := r.misses
+	r.misses = nil
+	r.mu.Unlock()
 
-	if r.uniqueKeys == nil {
-		r.uniqueKeys = make(map[MarketsClockKey]struct{})
-	}
-	clear(r.uniqueKeys)
-	uniqueList := r.uniqueList[:0]
-	for _, key := range r.misses {
-		if _, ok := r.uniqueKeys[key]; !ok {
-			r.uniqueKeys[key] = struct{}{}
+	uniqueKeys := make(map[MarketsClockKey]struct{}, len(batch))
+	uniqueList := make([]MarketsClockKey, 0, len(batch))
+	for _, key := range batch {
+		if _, ok := uniqueKeys[key]; !ok {
+			uniqueKeys[key] = struct{}{}
 			uniqueList = append(uniqueList, key)
 		}
 	}
-	r.uniqueList = uniqueList
-	r.misses = r.misses[:0]
 
 	if len(uniqueList) == 0 {
 		return nil
@@ -2248,7 +2360,7 @@ func (r *MemoryMarketBatchResolver) Resolve(ctx context.Context, conn *ch.Client
 		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
 	}
 
-	queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_markets WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+	queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_markets_log WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
 
 	var (
 		colID             proto.ColFixedStr
@@ -2274,11 +2386,7 @@ func (r *MemoryMarketBatchResolver) Resolve(ctx context.Context, conn *ch.Client
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	if r.foundKeys == nil {
-		r.foundKeys = make(map[MarketsClockKey]struct{})
-	}
-	clear(r.foundKeys)
-	foundKeys := r.foundKeys
+	foundKeys := make(map[MarketsClockKey]struct{}, len(uniqueList))
 	q := ch.Query{
 		Body:   queryStr,
 		Result: results,
@@ -2701,7 +2809,7 @@ func NewMemoryNegRiskEventBatch() *MemoryNegRiskEventBatch {
 	return b
 }
 
-func (b *MemoryNegRiskEventBatch) TableName() string { return "memory_neg_risk_events" }
+func (b *MemoryNegRiskEventBatch) TableName() string { return "memory_neg_risk_events_log" }
 
 func (b *MemoryNegRiskEventBatch) Rows() int { return b.colID.Rows() }
 
@@ -2710,7 +2818,8 @@ func (b *MemoryNegRiskEventBatch) Reset() { b.input.Reset() }
 func (b *MemoryNegRiskEventBatch) Append(item MemoryNegRiskEvent) {
 	b.colID.Append(item.ID.Bytes())
 	b.colQuestionCount.Append(item.QuestionCount)
-	b.colQuestionIDs.Append(hotStateHashSliceBytes(item.QuestionIDs, b.scratchQuestionIDs))
+	b.scratchQuestionIDs = hotStateHashSliceBytes(item.QuestionIDs, b.scratchQuestionIDs)
+	b.colQuestionIDs.Append(b.scratchQuestionIDs)
 	b.colUpdatedAtBlock.Append(item.UpdatedAtBlock)
 	b.colUpdatedAt.AppendRaw(proto.DateTime64(item.UpdatedAt))
 	b.colBlockNumber.Append(item.BlockNumber)
@@ -2728,6 +2837,7 @@ func (b *MemoryNegRiskEventBatch) Insert(ctx context.Context, conn *ch.Client, d
 }
 
 func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
+	floor := recoveryFloorFor(ctx, conn, db, "memory_neg_risk_events_log", "updated_at_block")
 	run := func(ctx context.Context, conn *ch.Client, bucket int, emit func(MemoryNegRiskEvent)) error {
 		var (
 			colID             proto.ColFixedStr
@@ -2753,7 +2863,7 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_neg_risk_events"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`question_count` AS `question_count`, `t`.`question_ids` AS `question_ids`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_neg_risk_events_log"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+recoveryRecencyClauseFor(floor, "updated_at_block")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryNegRiskEvent{
 					ID:             common.BytesToHash(colID.Row(i)),
@@ -2774,7 +2884,7 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 		// recovery floor are excluded from the value load above and would otherwise be
 		// absent from the filter, making the authoritative skip-CH gate reset a real
 		// pre-existing position to zero. Add their keys only (values not needed).
-		if preClause, active := recoveryPreFloorClause(); active {
+		if preClause, active := recoveryPreFloorClauseFor(floor, "updated_at_block"); active {
 			if err := recoverFilterKeysParallel(ctx, conn, recoveryBucketCount, c.cold, func(ctx context.Context, conn *ch.Client, bucket int, emit func(NegRiskEventsClockKey)) error {
 				var (
 					colID proto.ColFixedStr
@@ -2783,7 +2893,7 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 				results := proto.Results{
 					{Name: "id", Data: &colID},
 				}
-				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_neg_risk_events"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_neg_risk_events_log"), recoveryFixedStringRange("`t`.`id`", bucket, 32)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 					for i := 0; i < block.Rows; i++ {
 						emit(NegRiskEventsClockKey{
 							ID: common.BytesToHash(colID.Row(i)),
@@ -2809,11 +2919,19 @@ func (c *NegRiskEventsClockCache) Recover(ctx context.Context, conn *ch.Client, 
 }
 
 type MemoryNegRiskEventBatchResolver struct {
-	cache          *NegRiskEventsClockCache
+	cache *NegRiskEventsClockCache
+	// mu protects only misses. Cross-block resolve pipelining (State.StartPrune's
+	// sibling for resolve — see State.StartResolvePending) can call Queue and
+	// Resolve on the same resolver from two goroutines at once: real-apply's
+	// lazy fallback path (state.go's GetValue) for the in-flight block racing
+	// the next block's prefetch dry-run dispatch. Resolve detaches misses into a
+	// local batch under the lock and does all the dedup/query work — including
+	// the network round trip — outside it, so pipelined resolves never
+	// serialize on each other; only the brief append/detach does. Metrics stay
+	// single-owner/unprotected: EnableMetrics is test/diagnostic-only and never
+	// combined with pipelining in this codebase.
+	mu             sync.Mutex
 	misses         []NegRiskEventsClockKey
-	uniqueKeys     map[NegRiskEventsClockKey]struct{}
-	uniqueList     []NegRiskEventsClockKey
-	foundKeys      map[NegRiskEventsClockKey]struct{}
 	metricsEnabled bool
 	metrics        BatchResolverMetrics
 	hot            *HotState
@@ -2851,12 +2969,16 @@ func (r *MemoryNegRiskEventBatchResolver) Queue(key NegRiskEventsClockKey) {
 		if r.metricsEnabled {
 			r.metrics.QueuedMisses++
 		}
+		r.mu.Lock()
 		r.misses = append(r.misses, key)
+		r.mu.Unlock()
 	}
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
 func (r *MemoryNegRiskEventBatchResolver) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.misses)
 }
 
@@ -2888,23 +3010,28 @@ func (r *MemoryNegRiskEventBatchResolver) SnapshotAndResetMetrics() BatchResolve
 }
 
 func (r *MemoryNegRiskEventBatchResolver) Resolve(ctx context.Context, conn *ch.Client, db string) error {
+	// Detach the pending batch under the lock, then do everything else —
+	// dedup, query, and the network round trip — on this goroutine's own local
+	// copy. Queue (from a concurrently-pipelined next block, or this block's
+	// own lazy fallback) can keep appending into a fresh misses slice the
+	// instant this unlocks, without waiting on the round trip below.
+	r.mu.Lock()
 	if len(r.misses) == 0 {
+		r.mu.Unlock()
 		return nil
 	}
+	batch := r.misses
+	r.misses = nil
+	r.mu.Unlock()
 
-	if r.uniqueKeys == nil {
-		r.uniqueKeys = make(map[NegRiskEventsClockKey]struct{})
-	}
-	clear(r.uniqueKeys)
-	uniqueList := r.uniqueList[:0]
-	for _, key := range r.misses {
-		if _, ok := r.uniqueKeys[key]; !ok {
-			r.uniqueKeys[key] = struct{}{}
+	uniqueKeys := make(map[NegRiskEventsClockKey]struct{}, len(batch))
+	uniqueList := make([]NegRiskEventsClockKey, 0, len(batch))
+	for _, key := range batch {
+		if _, ok := uniqueKeys[key]; !ok {
+			uniqueKeys[key] = struct{}{}
 			uniqueList = append(uniqueList, key)
 		}
 	}
-	r.uniqueList = uniqueList
-	r.misses = r.misses[:0]
 
 	if len(uniqueList) == 0 {
 		return nil
@@ -2920,7 +3047,7 @@ func (r *MemoryNegRiskEventBatchResolver) Resolve(ctx context.Context, conn *ch.
 		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
 	}
 
-	queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_neg_risk_events WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+	queryStr := fmt.Sprintf("SELECT `id`, `question_count`, `question_ids`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_neg_risk_events_log WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
 
 	var (
 		colID             proto.ColFixedStr
@@ -2946,11 +3073,7 @@ func (r *MemoryNegRiskEventBatchResolver) Resolve(ctx context.Context, conn *ch.
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	if r.foundKeys == nil {
-		r.foundKeys = make(map[NegRiskEventsClockKey]struct{})
-	}
-	clear(r.foundKeys)
-	foundKeys := r.foundKeys
+	foundKeys := make(map[NegRiskEventsClockKey]struct{}, len(uniqueList))
 	q := ch.Query{
 		Body:   queryStr,
 		Result: results,
@@ -3293,7 +3416,7 @@ func NewMemoryFixedProductMarketMakerBatch() *MemoryFixedProductMarketMakerBatch
 }
 
 func (b *MemoryFixedProductMarketMakerBatch) TableName() string {
-	return "memory_fixed_product_market_makers"
+	return "memory_fixed_product_market_makers_log"
 }
 
 func (b *MemoryFixedProductMarketMakerBatch) Rows() int { return b.colID.Rows() }
@@ -3321,6 +3444,7 @@ func (b *MemoryFixedProductMarketMakerBatch) Insert(ctx context.Context, conn *c
 }
 
 func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *ch.Client, db string) error {
+	floor := recoveryFloorFor(ctx, conn, db, "memory_fixed_product_market_makers_log", "updated_at_block")
 	run := func(ctx context.Context, conn *ch.Client, bucket int, emit func(MemoryFixedProductMarketMaker)) error {
 		var (
 			colID              proto.ColFixedStr
@@ -3347,7 +3471,7 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 			{Name: "transaction_index", Data: &colTxIndex},
 			{Name: "log_index", Data: &colLogIndex},
 		}
-		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`condition_id` AS `condition_id`, `t`.`collateral_token` AS `collateral_token`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers"), recoveryFixedStringRange("`t`.`id`", bucket, 20)+recoveryRecencyClause()), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+		return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id`, `t`.`condition_id` AS `condition_id`, `t`.`collateral_token` AS `collateral_token`, `t`.`updated_at_block` AS `updated_at_block`, `t`.`updated_at` AS `updated_at`, `t`.`block_number` AS `block_number`, `t`.`transaction_index` AS `transaction_index`, `t`.`log_index` AS `log_index` FROM %s.%s AS `t` WHERE %s ORDER BY `t`.`id` DESC, `t`.`block_number` DESC, `t`.`transaction_index` DESC, `t`.`log_index` DESC LIMIT 1 BY `t`.`id` SETTINGS optimize_read_in_order = 1", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers_log"), recoveryFixedStringRange("`t`.`id`", bucket, 20)+recoveryRecencyClauseFor(floor, "updated_at_block")), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				emit(MemoryFixedProductMarketMaker{
 					ID:              common.BytesToAddress(colID.Row(i)),
@@ -3368,7 +3492,7 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 		// recovery floor are excluded from the value load above and would otherwise be
 		// absent from the filter, making the authoritative skip-CH gate reset a real
 		// pre-existing position to zero. Add their keys only (values not needed).
-		if preClause, active := recoveryPreFloorClause(); active {
+		if preClause, active := recoveryPreFloorClauseFor(floor, "updated_at_block"); active {
 			if err := recoverFilterKeysParallel(ctx, conn, recoveryBucketCount, c.cold, func(ctx context.Context, conn *ch.Client, bucket int, emit func(FixedProductMarketMakersClockKey)) error {
 				var (
 					colID proto.ColFixedStr
@@ -3377,7 +3501,7 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 				results := proto.Results{
 					{Name: "id", Data: &colID},
 				}
-				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers"), recoveryFixedStringRange("`t`.`id`", bucket, 20)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
+				return conn.Do(ctx, ch.Query{Body: fmt.Sprintf("SELECT `t`.`id` AS `id` FROM %s.%s AS `t` WHERE %s GROUP BY `t`.`id`", quoteIdent(db), quoteIdent("memory_fixed_product_market_makers_log"), recoveryFixedStringRange("`t`.`id`", bucket, 20)+preClause), Result: results, OnResult: func(ctx context.Context, block proto.Block) error {
 					for i := 0; i < block.Rows; i++ {
 						emit(FixedProductMarketMakersClockKey{
 							ID: common.BytesToAddress(colID.Row(i)),
@@ -3403,11 +3527,19 @@ func (c *FixedProductMarketMakersClockCache) Recover(ctx context.Context, conn *
 }
 
 type MemoryFixedProductMarketMakerBatchResolver struct {
-	cache          *FixedProductMarketMakersClockCache
+	cache *FixedProductMarketMakersClockCache
+	// mu protects only misses. Cross-block resolve pipelining (State.StartPrune's
+	// sibling for resolve — see State.StartResolvePending) can call Queue and
+	// Resolve on the same resolver from two goroutines at once: real-apply's
+	// lazy fallback path (state.go's GetValue) for the in-flight block racing
+	// the next block's prefetch dry-run dispatch. Resolve detaches misses into a
+	// local batch under the lock and does all the dedup/query work — including
+	// the network round trip — outside it, so pipelined resolves never
+	// serialize on each other; only the brief append/detach does. Metrics stay
+	// single-owner/unprotected: EnableMetrics is test/diagnostic-only and never
+	// combined with pipelining in this codebase.
+	mu             sync.Mutex
 	misses         []FixedProductMarketMakersClockKey
-	uniqueKeys     map[FixedProductMarketMakersClockKey]struct{}
-	uniqueList     []FixedProductMarketMakersClockKey
-	foundKeys      map[FixedProductMarketMakersClockKey]struct{}
 	metricsEnabled bool
 	metrics        BatchResolverMetrics
 	hot            *HotState
@@ -3445,12 +3577,16 @@ func (r *MemoryFixedProductMarketMakerBatchResolver) Queue(key FixedProductMarke
 		if r.metricsEnabled {
 			r.metrics.QueuedMisses++
 		}
+		r.mu.Lock()
 		r.misses = append(r.misses, key)
+		r.mu.Unlock()
 	}
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
 func (r *MemoryFixedProductMarketMakerBatchResolver) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.misses)
 }
 
@@ -3482,23 +3618,28 @@ func (r *MemoryFixedProductMarketMakerBatchResolver) SnapshotAndResetMetrics() B
 }
 
 func (r *MemoryFixedProductMarketMakerBatchResolver) Resolve(ctx context.Context, conn *ch.Client, db string) error {
+	// Detach the pending batch under the lock, then do everything else —
+	// dedup, query, and the network round trip — on this goroutine's own local
+	// copy. Queue (from a concurrently-pipelined next block, or this block's
+	// own lazy fallback) can keep appending into a fresh misses slice the
+	// instant this unlocks, without waiting on the round trip below.
+	r.mu.Lock()
 	if len(r.misses) == 0 {
+		r.mu.Unlock()
 		return nil
 	}
+	batch := r.misses
+	r.misses = nil
+	r.mu.Unlock()
 
-	if r.uniqueKeys == nil {
-		r.uniqueKeys = make(map[FixedProductMarketMakersClockKey]struct{})
-	}
-	clear(r.uniqueKeys)
-	uniqueList := r.uniqueList[:0]
-	for _, key := range r.misses {
-		if _, ok := r.uniqueKeys[key]; !ok {
-			r.uniqueKeys[key] = struct{}{}
+	uniqueKeys := make(map[FixedProductMarketMakersClockKey]struct{}, len(batch))
+	uniqueList := make([]FixedProductMarketMakersClockKey, 0, len(batch))
+	for _, key := range batch {
+		if _, ok := uniqueKeys[key]; !ok {
+			uniqueKeys[key] = struct{}{}
 			uniqueList = append(uniqueList, key)
 		}
 	}
-	r.uniqueList = uniqueList
-	r.misses = r.misses[:0]
 
 	if len(uniqueList) == 0 {
 		return nil
@@ -3514,7 +3655,7 @@ func (r *MemoryFixedProductMarketMakerBatchResolver) Resolve(ctx context.Context
 		values = append(values, fmt.Sprintf("unhex('%s')", strings.TrimPrefix(key.ID.Hex(), "0x")))
 	}
 
-	queryStr := fmt.Sprintf("SELECT `id`, `condition_id`, `collateral_token`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_fixed_product_market_makers WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
+	queryStr := fmt.Sprintf("SELECT `id`, `condition_id`, `collateral_token`, `updated_at_block`, `updated_at`, `block_number`, `transaction_index`, `log_index` FROM %s.memory_fixed_product_market_makers_log WHERE `id` IN (%s) ORDER BY `block_number` DESC, `transaction_index` DESC, `log_index` DESC LIMIT 1 BY `id`", quoteIdent(db), strings.Join(values, ", "))
 
 	var (
 		colID              proto.ColFixedStr
@@ -3541,11 +3682,7 @@ func (r *MemoryFixedProductMarketMakerBatchResolver) Resolve(ctx context.Context
 		{Name: "transaction_index", Data: &colTxIndex},
 		{Name: "log_index", Data: &colLogIndex},
 	}
-	if r.foundKeys == nil {
-		r.foundKeys = make(map[FixedProductMarketMakersClockKey]struct{})
-	}
-	clear(r.foundKeys)
-	foundKeys := r.foundKeys
+	foundKeys := make(map[FixedProductMarketMakersClockKey]struct{}, len(uniqueList))
 	q := ch.Query{
 		Body:   queryStr,
 		Result: results,
@@ -3815,11 +3952,19 @@ func (c *ConditionPreparationsClockCache) Len() uint64 {
 }
 
 type ConditionalTokensConditionPreparationBatchResolver struct {
-	cache          *ConditionPreparationsClockCache
+	cache *ConditionPreparationsClockCache
+	// mu protects only misses. Cross-block resolve pipelining (State.StartPrune's
+	// sibling for resolve — see State.StartResolvePending) can call Queue and
+	// Resolve on the same resolver from two goroutines at once: real-apply's
+	// lazy fallback path (state.go's GetValue) for the in-flight block racing
+	// the next block's prefetch dry-run dispatch. Resolve detaches misses into a
+	// local batch under the lock and does all the dedup/query work — including
+	// the network round trip — outside it, so pipelined resolves never
+	// serialize on each other; only the brief append/detach does. Metrics stay
+	// single-owner/unprotected: EnableMetrics is test/diagnostic-only and never
+	// combined with pipelining in this codebase.
+	mu             sync.Mutex
 	misses         []ConditionPreparationsClockKey
-	uniqueKeys     map[ConditionPreparationsClockKey]struct{}
-	uniqueList     []ConditionPreparationsClockKey
-	foundKeys      map[ConditionPreparationsClockKey]struct{}
 	metricsEnabled bool
 	metrics        BatchResolverMetrics
 	hot            *HotState
@@ -3857,12 +4002,16 @@ func (r *ConditionalTokensConditionPreparationBatchResolver) Queue(key Condition
 		if r.metricsEnabled {
 			r.metrics.QueuedMisses++
 		}
+		r.mu.Lock()
 		r.misses = append(r.misses, key)
+		r.mu.Unlock()
 	}
 }
 
 // Pending reports how many missed keys are queued for the next Resolve.
 func (r *ConditionalTokensConditionPreparationBatchResolver) Pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.misses)
 }
 
@@ -3894,23 +4043,28 @@ func (r *ConditionalTokensConditionPreparationBatchResolver) SnapshotAndResetMet
 }
 
 func (r *ConditionalTokensConditionPreparationBatchResolver) Resolve(ctx context.Context, conn *ch.Client, db string) error {
+	// Detach the pending batch under the lock, then do everything else —
+	// dedup, query, and the network round trip — on this goroutine's own local
+	// copy. Queue (from a concurrently-pipelined next block, or this block's
+	// own lazy fallback) can keep appending into a fresh misses slice the
+	// instant this unlocks, without waiting on the round trip below.
+	r.mu.Lock()
 	if len(r.misses) == 0 {
+		r.mu.Unlock()
 		return nil
 	}
+	batch := r.misses
+	r.misses = nil
+	r.mu.Unlock()
 
-	if r.uniqueKeys == nil {
-		r.uniqueKeys = make(map[ConditionPreparationsClockKey]struct{})
-	}
-	clear(r.uniqueKeys)
-	uniqueList := r.uniqueList[:0]
-	for _, key := range r.misses {
-		if _, ok := r.uniqueKeys[key]; !ok {
-			r.uniqueKeys[key] = struct{}{}
+	uniqueKeys := make(map[ConditionPreparationsClockKey]struct{}, len(batch))
+	uniqueList := make([]ConditionPreparationsClockKey, 0, len(batch))
+	for _, key := range batch {
+		if _, ok := uniqueKeys[key]; !ok {
+			uniqueKeys[key] = struct{}{}
 			uniqueList = append(uniqueList, key)
 		}
 	}
-	r.uniqueList = uniqueList
-	r.misses = r.misses[:0]
 
 	if len(uniqueList) == 0 {
 		return nil
@@ -3953,11 +4107,7 @@ func (r *ConditionalTokensConditionPreparationBatchResolver) Resolve(ctx context
 		{Name: "questionId", Data: &colQuestionID},
 		{Name: "outcomeSlotCount", Data: &colOutcomeSlotCount},
 	}
-	if r.foundKeys == nil {
-		r.foundKeys = make(map[ConditionPreparationsClockKey]struct{})
-	}
-	clear(r.foundKeys)
-	foundKeys := r.foundKeys
+	foundKeys := make(map[ConditionPreparationsClockKey]struct{}, len(uniqueList))
 	q := ch.Query{
 		Body:   queryStr,
 		Result: results,
@@ -4007,21 +4157,37 @@ type HotState struct {
 	Conditions                       *ConditionsClockCache
 	ConditionsResolver               *MemoryConditionBatchResolver
 	dirtyConditions                  map[ConditionsClockKey]struct{}
+	jrnSeenConditions                map[ConditionsClockKey]struct{}
+	jrnConditions                    []ConditionsUndo
 	UserPositions                    *UserPositionsClockCache
 	UserPositionsResolver            *MemoryUserPositionBatchResolver
 	dirtyUserPositions               map[UserPositionsClockKey]struct{}
+	jrnSeenUserPositions             map[UserPositionsClockKey]struct{}
+	jrnUserPositions                 []UserPositionsUndo
 	Markets                          *MarketsClockCache
 	MarketsResolver                  *MemoryMarketBatchResolver
 	dirtyMarkets                     map[MarketsClockKey]struct{}
+	jrnSeenMarkets                   map[MarketsClockKey]struct{}
+	jrnMarkets                       []MarketsUndo
 	NegRiskEvents                    *NegRiskEventsClockCache
 	NegRiskEventsResolver            *MemoryNegRiskEventBatchResolver
 	dirtyNegRiskEvents               map[NegRiskEventsClockKey]struct{}
+	jrnSeenNegRiskEvents             map[NegRiskEventsClockKey]struct{}
+	jrnNegRiskEvents                 []NegRiskEventsUndo
 	FixedProductMarketMakers         *FixedProductMarketMakersClockCache
 	FixedProductMarketMakersResolver *MemoryFixedProductMarketMakerBatchResolver
 	dirtyFixedProductMarketMakers    map[FixedProductMarketMakersClockKey]struct{}
+	jrnSeenFixedProductMarketMakers  map[FixedProductMarketMakersClockKey]struct{}
+	jrnFixedProductMarketMakers      []FixedProductMarketMakersUndo
 	ConditionPreparations            *ConditionPreparationsClockCache
 	ConditionPreparationsResolver    *ConditionalTokensConditionPreparationBatchResolver
 	mu                               sync.Mutex
+	// journalOn enables rollback pre-image capture in Update*: the first write
+	// to a key per journal segment records the key's prior value (or absence)
+	// so State can rewind the hot state across a reorg from a small on-disk
+	// journal instead of full in-memory snapshots (O(keys touched) per segment
+	// instead of O(entire hot state)).
+	journalOn bool
 	// coldAuthoritative is set when the cold tier was opened against an empty
 	// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,
 	// so the lazy state Get skips the ClickHouse point-SELECT entirely.
@@ -4040,7 +4206,7 @@ type HotState struct {
 	resolveAsyncEnabled bool
 	resolveInProgress   bool
 	resolveDone         chan resolveResult
-	resolveConn         *ch.Client
+	resolveConns        []*ch.Client
 	resolveDB           string
 	resolveCtx          context.Context
 	resolveCancel       context.CancelFunc
@@ -4188,6 +4354,184 @@ func (s *HotState) RecordMode() bool {
 	return s != nil && s.recordMode
 }
 
+// ConditionsUndo is one rollback-journal record: the value of Key before its
+// first write in the current journal segment. Had=false means the key was
+// absent from hot+cold at capture time; a rewind then deletes it and reads
+// fall through to the rolled-back database (correct: the fork rollback runs
+// before the state rewind).
+type ConditionsUndo struct {
+	Key ConditionsClockKey
+	Val MemoryCondition
+	Had bool
+}
+
+// UserPositionsUndo is one rollback-journal record: the value of Key before its
+// first write in the current journal segment. Had=false means the key was
+// absent from hot+cold at capture time; a rewind then deletes it and reads
+// fall through to the rolled-back database (correct: the fork rollback runs
+// before the state rewind).
+type UserPositionsUndo struct {
+	Key UserPositionsClockKey
+	Val MemoryUserPosition
+	Had bool
+}
+
+// MarketsUndo is one rollback-journal record: the value of Key before its
+// first write in the current journal segment. Had=false means the key was
+// absent from hot+cold at capture time; a rewind then deletes it and reads
+// fall through to the rolled-back database (correct: the fork rollback runs
+// before the state rewind).
+type MarketsUndo struct {
+	Key MarketsClockKey
+	Val MemoryMarket
+	Had bool
+}
+
+// NegRiskEventsUndo is one rollback-journal record: the value of Key before its
+// first write in the current journal segment. Had=false means the key was
+// absent from hot+cold at capture time; a rewind then deletes it and reads
+// fall through to the rolled-back database (correct: the fork rollback runs
+// before the state rewind).
+type NegRiskEventsUndo struct {
+	Key NegRiskEventsClockKey
+	Val MemoryNegRiskEvent
+	Had bool
+}
+
+// FixedProductMarketMakersUndo is one rollback-journal record: the value of Key before its
+// first write in the current journal segment. Had=false means the key was
+// absent from hot+cold at capture time; a rewind then deletes it and reads
+// fall through to the rolled-back database (correct: the fork rollback runs
+// before the state rewind).
+type FixedProductMarketMakersUndo struct {
+	Key FixedProductMarketMakersClockKey
+	Val MemoryFixedProductMarketMaker
+	Had bool
+}
+
+// journalBatch holds the pre-image records captured since the last seal, one
+// slice per entity. Value copies only — safe to encode off the hot ring.
+type journalBatch struct {
+	Conditions               []ConditionsUndo
+	UserPositions            []UserPositionsUndo
+	Markets                  []MarketsUndo
+	NegRiskEvents            []NegRiskEventsUndo
+	FixedProductMarketMakers []FixedProductMarketMakersUndo
+}
+
+func (b *journalBatch) empty() bool {
+	if b == nil {
+		return true
+	}
+	return true && len(b.Conditions) == 0 && len(b.UserPositions) == 0 && len(b.Markets) == 0 && len(b.NegRiskEvents) == 0 && len(b.FixedProductMarketMakers) == 0
+}
+
+// SetJournal toggles rollback pre-image capture (see journalOn). Turning it
+// off drops any captured records.
+func (s *HotState) SetJournal(on bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.journalOn = on
+	if on {
+		if s.jrnSeenConditions == nil {
+			s.jrnSeenConditions = make(map[ConditionsClockKey]struct{})
+		}
+		if s.jrnSeenUserPositions == nil {
+			s.jrnSeenUserPositions = make(map[UserPositionsClockKey]struct{})
+		}
+		if s.jrnSeenMarkets == nil {
+			s.jrnSeenMarkets = make(map[MarketsClockKey]struct{})
+		}
+		if s.jrnSeenNegRiskEvents == nil {
+			s.jrnSeenNegRiskEvents = make(map[NegRiskEventsClockKey]struct{})
+		}
+		if s.jrnSeenFixedProductMarketMakers == nil {
+			s.jrnSeenFixedProductMarketMakers = make(map[FixedProductMarketMakersClockKey]struct{})
+		}
+		return
+	}
+	s.jrnSeenConditions = nil
+	s.jrnConditions = nil
+	s.jrnSeenUserPositions = nil
+	s.jrnUserPositions = nil
+	s.jrnSeenMarkets = nil
+	s.jrnMarkets = nil
+	s.jrnSeenNegRiskEvents = nil
+	s.jrnNegRiskEvents = nil
+	s.jrnSeenFixedProductMarketMakers = nil
+	s.jrnFixedProductMarketMakers = nil
+}
+
+// journalCollect moves the captured pre-image records out of the hot state and
+// resets the per-segment dedup, starting a new journal segment. MUST be called
+// from the single consumer goroutine (same discipline as snapshotDirty).
+func (s *HotState) journalCollect() *journalBatch {
+	jb := &journalBatch{}
+	if s == nil {
+		return jb
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	jb.Conditions = s.jrnConditions
+	s.jrnConditions = nil
+	if len(s.jrnSeenConditions) > 0 {
+		clear(s.jrnSeenConditions)
+	}
+	jb.UserPositions = s.jrnUserPositions
+	s.jrnUserPositions = nil
+	if len(s.jrnSeenUserPositions) > 0 {
+		clear(s.jrnSeenUserPositions)
+	}
+	jb.Markets = s.jrnMarkets
+	s.jrnMarkets = nil
+	if len(s.jrnSeenMarkets) > 0 {
+		clear(s.jrnSeenMarkets)
+	}
+	jb.NegRiskEvents = s.jrnNegRiskEvents
+	s.jrnNegRiskEvents = nil
+	if len(s.jrnSeenNegRiskEvents) > 0 {
+		clear(s.jrnSeenNegRiskEvents)
+	}
+	jb.FixedProductMarketMakers = s.jrnFixedProductMarketMakers
+	s.jrnFixedProductMarketMakers = nil
+	if len(s.jrnSeenFixedProductMarketMakers) > 0 {
+		clear(s.jrnSeenFixedProductMarketMakers)
+	}
+	return jb
+}
+
+// journalApply rewinds one segment: every record restores its key to the
+// pre-segment value (or deletes it). Records are deduplicated per segment so
+// application order does not matter.
+func (s *HotState) journalApply(jb *journalBatch) {
+	if s == nil || jb == nil {
+		return
+	}
+	for i := range jb.Conditions {
+		u := &jb.Conditions[i]
+		s.RestoreMemoryCondition(u.Key, u.Val, u.Had)
+	}
+	for i := range jb.UserPositions {
+		u := &jb.UserPositions[i]
+		s.RestoreMemoryUserPosition(u.Key, u.Val, u.Had)
+	}
+	for i := range jb.Markets {
+		u := &jb.Markets[i]
+		s.RestoreMemoryMarket(u.Key, u.Val, u.Had)
+	}
+	for i := range jb.NegRiskEvents {
+		u := &jb.NegRiskEvents[i]
+		s.RestoreMemoryNegRiskEvent(u.Key, u.Val, u.Had)
+	}
+	for i := range jb.FixedProductMarketMakers {
+		u := &jb.FixedProductMarketMakers[i]
+		s.RestoreMemoryFixedProductMarketMaker(u.Key, u.Val, u.Had)
+	}
+}
+
 func (s *HotState) ResolveAllPending(ctx context.Context, conn *ch.Client, db string) error {
 	if s == nil || conn == nil {
 		return nil
@@ -4230,8 +4574,8 @@ type resolveResult struct {
 	err error
 }
 
-func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, db string) bool {
-	if s == nil || conn == nil || !s.resolveAsyncEnabled {
+func (s *HotState) StartResolveAllPending(ctx context.Context, conns []*ch.Client, db string) bool {
+	if s == nil || len(conns) == 0 || !s.resolveAsyncEnabled {
 		return false
 	}
 	if s == nil || s.resolveInProgress {
@@ -4258,7 +4602,7 @@ func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, 
 	}
 	s.mu.Lock()
 	s.resolveInProgress = true
-	s.resolveConn = conn
+	s.resolveConns = conns
 	s.resolveDB = db
 	s.resolveCtx, s.resolveCancel = context.WithCancel(ctx)
 	s.mu.Unlock()
@@ -4271,7 +4615,7 @@ func (s *HotState) StartResolveAllPending(ctx context.Context, conn *ch.Client, 
 				s.resolveDone <- resolveResult{err: fmt.Errorf("resolve panic: %v", r)}
 			}
 		}()
-		err := s.resolveAllParallel(s.resolveCtx, conn, db)
+		err := s.resolveAllParallel(s.resolveCtx, conns, db)
 		s.resolveDone <- resolveResult{err: err}
 	}()
 	return true
@@ -4313,7 +4657,15 @@ func (s *HotState) WaitResolveAllPending(ctx context.Context) error {
 	}
 }
 
-func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db string) error {
+// resolveAllParallel resolves every entity with pending misses concurrently,
+// one goroutine per entity, each borrowing its own *ch.Client from conns for
+// the duration of its Resolve call. ch-go connections are not safe for
+// concurrent use from multiple goroutines (a shared connection here would
+// interleave requests and responses across resolvers and could silently
+// hand back the wrong entity's data), so connPool below guarantees each
+// in-flight job holds a connection exclusively; its buffer size also caps
+// concurrency at len(conns), since that's the hard resource limit.
+func (s *HotState) resolveAllParallel(ctx context.Context, conns []*ch.Client, db string) error {
 	type resolveJob struct {
 		name    string
 		resolve func(context.Context, *ch.Client, string) error
@@ -4362,11 +4714,13 @@ func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db s
 	if len(jobs) == 0 {
 		return nil
 	}
-	concurrency := asyncResolveConcurrency()
-	if concurrency > len(jobs) {
-		concurrency = len(jobs)
+	if len(conns) == 0 {
+		return fmt.Errorf("resolveAllParallel: no connections available")
 	}
-	sem := make(chan struct{}, concurrency)
+	connPool := make(chan *ch.Client, len(conns))
+	for _, c := range conns {
+		connPool <- c
+	}
 	var wg sync.WaitGroup
 	errMu := sync.Mutex{}
 	var firstErr error
@@ -4374,11 +4728,11 @@ func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db s
 		wg.Add(1)
 		go func(j resolveJob) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 			if ctx.Err() != nil {
 				return
 			}
+			conn := <-connPool
+			defer func() { connPool <- conn }()
 			if err := j.resolve(ctx, conn, db); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -4395,36 +4749,76 @@ func (s *HotState) resolveAllParallel(ctx context.Context, conn *ch.Client, db s
 func (s *HotState) UpdateMemoryCondition(value MemoryCondition) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := NewConditionsClockKey(value)
+	if s.journalOn {
+		if _, seen := s.jrnSeenConditions[key]; !seen {
+			old, had := s.Conditions.Get(key)
+			s.jrnConditions = append(s.jrnConditions, ConditionsUndo{Key: key, Val: old, Had: had})
+			s.jrnSeenConditions[key] = struct{}{}
+		}
+	}
 	s.Conditions.Set(value)
-	s.dirtyConditions[NewConditionsClockKey(value)] = struct{}{}
+	s.dirtyConditions[key] = struct{}{}
 }
 
 func (s *HotState) UpdateMemoryUserPosition(value MemoryUserPosition) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := NewUserPositionsClockKey(value)
+	if s.journalOn {
+		if _, seen := s.jrnSeenUserPositions[key]; !seen {
+			old, had := s.UserPositions.Get(key)
+			s.jrnUserPositions = append(s.jrnUserPositions, UserPositionsUndo{Key: key, Val: old, Had: had})
+			s.jrnSeenUserPositions[key] = struct{}{}
+		}
+	}
 	s.UserPositions.Set(value)
-	s.dirtyUserPositions[NewUserPositionsClockKey(value)] = struct{}{}
+	s.dirtyUserPositions[key] = struct{}{}
 }
 
 func (s *HotState) UpdateMemoryMarket(value MemoryMarket) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := NewMarketsClockKey(value)
+	if s.journalOn {
+		if _, seen := s.jrnSeenMarkets[key]; !seen {
+			old, had := s.Markets.Get(key)
+			s.jrnMarkets = append(s.jrnMarkets, MarketsUndo{Key: key, Val: old, Had: had})
+			s.jrnSeenMarkets[key] = struct{}{}
+		}
+	}
 	s.Markets.Set(value)
-	s.dirtyMarkets[NewMarketsClockKey(value)] = struct{}{}
+	s.dirtyMarkets[key] = struct{}{}
 }
 
 func (s *HotState) UpdateMemoryNegRiskEvent(value MemoryNegRiskEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := NewNegRiskEventsClockKey(value)
+	if s.journalOn {
+		if _, seen := s.jrnSeenNegRiskEvents[key]; !seen {
+			old, had := s.NegRiskEvents.Get(key)
+			s.jrnNegRiskEvents = append(s.jrnNegRiskEvents, NegRiskEventsUndo{Key: key, Val: old, Had: had})
+			s.jrnSeenNegRiskEvents[key] = struct{}{}
+		}
+	}
 	s.NegRiskEvents.Set(value)
-	s.dirtyNegRiskEvents[NewNegRiskEventsClockKey(value)] = struct{}{}
+	s.dirtyNegRiskEvents[key] = struct{}{}
 }
 
 func (s *HotState) UpdateMemoryFixedProductMarketMaker(value MemoryFixedProductMarketMaker) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := NewFixedProductMarketMakersClockKey(value)
+	if s.journalOn {
+		if _, seen := s.jrnSeenFixedProductMarketMakers[key]; !seen {
+			old, had := s.FixedProductMarketMakers.Get(key)
+			s.jrnFixedProductMarketMakers = append(s.jrnFixedProductMarketMakers, FixedProductMarketMakersUndo{Key: key, Val: old, Had: had})
+			s.jrnSeenFixedProductMarketMakers[key] = struct{}{}
+		}
+	}
 	s.FixedProductMarketMakers.Set(value)
-	s.dirtyFixedProductMarketMakers[NewFixedProductMarketMakersClockKey(value)] = struct{}{}
+	s.dirtyFixedProductMarketMakers[key] = struct{}{}
 }
 
 // commitBatches holds the column batches snapshotted from the dirty sets, ready to

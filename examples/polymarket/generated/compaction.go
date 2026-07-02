@@ -11,13 +11,43 @@ import (
 	"github.com/ClickHouse/ch-go"
 )
 
-// CompactionPruneState removes superseded rows from hot-state tables. For each
-// table with a primary key, it deletes rows whose block_number is below a
-// rolling threshold (blockNumber - 1000) and that are not the latest version of
-// their primary-key group. This keeps ClickHouse tables bounded during long
-// backfill runs while preserving the most recent state for each entity.
-func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64) error {
-	if store == nil || store.Conn() == nil {
+// CompactionPruneState bounds hot-state ("_log") tables during long backfills
+// while retaining a block-bucketed history for downstream time-series work
+// (e.g. points accrual). retainInterval is the snapshot granularity: for each
+// primary key it keeps ONE row per intDiv(block_number, retainInterval) bucket
+// (the latest write in the bucket) and deletes the intra-bucket redundant rows.
+// The paired "_live" view still resolves to a single current row per key via
+// LIMIT 1 BY, so callers wanting current state never see the retained history.
+//
+// PRIMARY KEY is the pk/sk only; block_number/transaction_index/log_index live
+// exclusively in ORDER BY and here in the bucket/keep-set expressions — never in
+// the key — so a bucket's "latest" is well-defined by (block, tx, log) order.
+//
+// No OPTIMIZE TABLE ... FINAL after the DELETE: ClickHouse's lightweight
+// delete masks rows (_row_exists) so plain SELECTs already exclude them
+// without a merge, and background merges reclaim the masked rows over time.
+// FINAL forces an immediate full-table rewrite — on large "_log" tables that
+// took minutes and dominated backfill throughput for no correctness benefit.
+func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64, retainInterval uint64) error {
+	if store == nil {
+		return nil
+	}
+	// retainInterval == 0 means "no bucket size configured" — disable pruning
+	// rather than risk intDiv-by-zero in ClickHouse.
+	if retainInterval == 0 {
+		return nil
+	}
+	// Prefer a dedicated prune connection over the consumer's hot Conn so this
+	// query set (a DELETE mutation per table, which can still take a while on
+	// large tables) never blocks lazy state resolves sharing Conn. See
+	// State.StartPrune, which is what actually moves this call off the
+	// consumer's hot path; the connection split here also protects Conn from
+	// this goroutine on its own.
+	conn := store.Conn()
+	if pruneStore, ok := store.(interface{ PruneConn() *ch.Client }); ok && pruneStore.PruneConn() != nil {
+		conn = pruneStore.PruneConn()
+	}
+	if conn == nil {
 		return nil
 	}
 	db := store.DB()
@@ -25,60 +55,47 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 	if blockNumber <= 1000 {
 		return nil
 	}
+	// Never prune within 1000 blocks of the sync head: this margin is far past
+	// EVM finality (~2 epochs), so the pruned region is always finalized and a
+	// reorg (which only rolls back block_number > lastBlock) can never touch it.
+	// This is the "never prune above finalized head" guarantee.
 	pruneThreshold := blockNumber - 1000
-	// Only re-collapse primary keys touched since the last prune (block_number >
-	// activeLower). BOTH subqueries — the active-key set "(pk) IN (...)" and the
-	// keep-set "(pk,version) NOT IN (...)" — use "ORDER BY pk [,version DESC] LIMIT 1
-	// BY pk", which streams one row per key in primary-key order (the table is sorted
-	// by (pk..., block_number, ...)), so memory is O(active keys), not O(all keys).
-	// CRITICAL: the active-key set must NOT use "GROUP BY pk". GROUP BY builds an
-	// AggregatingTransform hash table over the whole window in one shot, and mutations
-	// (lightweight DELETE = UPDATE _row_exists) IGNORE max_bytes_before_external_group_by,
-	// so it cannot spill — a 1M-block window of memory_user_positions OOM'd ClickHouse
-	// at 70+ GiB (Code 241, AggregatingTransform) and crash-looped the prune. LIMIT 1 BY
-	// over the PK-sorted read stream gives the same distinct keys with O(1) per-group
-	// memory and no aggregation. The sources are bounded on
-	// BOTH ends: block_number > activeLower (the caller clamps this to blockNumber -
-	// pruneInterval, so the lower bound is a recent window) AND block_number <=
-	// blockNumber. The upper bound is essential: without it, a run whose current
-	// block is far below the table's max block (e.g. a --reindex-from re-applied over
-	// a table that still holds higher-block rows from a prior run) would aggregate
-	// every key from activeLower up to the table's true max in one mutation — 100M+
-	// keys — and OOM ClickHouse (mutations ignore the spill SETTINGS). Bounding the
-	// keep-set to [activeLower, blockNumber] is safe: the DELETE only removes rows
-	// with block_number < threshold (< blockNumber), so any row above blockNumber is
-	// never a deletion candidate and never needs protecting by the keep-set; within
-	// the window, block numbers are monotonic per key, so LIMIT 1 BY still picks each
-	// active key's latest in-window version. Older versions of active keys are still
-	// deleted (the DELETE range is block_number < threshold, not just the window);
-	// keys NOT touched since the last prune were already reduced to their latest by an
-	// earlier prune, so nothing leaks.
+	// The prune only touches the current window (activeLower, blockNumber]:
+	//   - active-key set "(pk) IN (...)": keys written since the last prune, via
+	//     "ORDER BY pk LIMIT 1 BY pk" over the PK-sorted read stream (O(1) memory
+	//     per key — NOT "GROUP BY pk", which builds an AggregatingTransform hash
+	//     over the whole window and, because mutations ignore
+	//     max_bytes_before_external_group_by, cannot spill and OOM'd ClickHouse at
+	//     70+ GiB on a 1M-block window).
+	//   - keep-set "(pk,block,tx,log) NOT IN (...)": the latest row per
+	//     (pk, bucket) in the window, via "LIMIT 1 BY pk, intDiv(block, N)". Rows
+	//     in earlier windows (block <= activeLower) were already compacted to one
+	//     row per bucket by prior prunes, so the DELETE is lower-bounded to
+	//     block_number > activeLower and never re-touches — or erases — them.
+	// Both subqueries are bounded on BOTH ends (activeLower < block <= blockNumber);
+	// the caller clamps activeLower to blockNumber - pruneInterval so the window is
+	// at most one interval wide and memory is O(active keys × buckets-per-window).
 	activeLower := lowerBlock
 
 	queries := []string{
-		// memory_conditions (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_conditions\x60 WHERE block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_conditions\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_conditions\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_conditions\x60 FINAL", db),
-		// memory_user_positions (pk: user, token_id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_user_positions\x60 WHERE block_number < %[2]d AND (user, token_id) IN (SELECT user, token_id FROM \x60%[1]s\x60.\x60memory_user_positions\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY user, token_id LIMIT 1 BY user, token_id) AND (user, token_id, block_number, transaction_index, log_index) NOT IN (SELECT user, token_id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_user_positions\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY user, token_id, block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY user, token_id) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_user_positions\x60 FINAL", db),
-		// memory_markets (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_markets\x60 WHERE block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_markets\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_markets\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_markets\x60 FINAL", db),
-		// memory_neg_risk_events (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_neg_risk_events\x60 WHERE block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_neg_risk_events\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_neg_risk_events\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_neg_risk_events\x60 FINAL", db),
-		// memory_fixed_product_market_makers (pk: id)
-		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers\x60 WHERE block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60memory_fixed_product_market_makers\x60 FINAL", db),
+		// memory_conditions_log (pk: id) — keep one row per (pk, intDiv(block_number, retainInterval)) bucket
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_conditions_log\x60 WHERE block_number > %[3]d AND block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_conditions_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_conditions_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, intDiv(block_number, %[5]d), block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id, intDiv(block_number, %[5]d)) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber, retainInterval),
+		// memory_user_positions_log (pk: user, token_id) — keep one row per (pk, intDiv(block_number, retainInterval)) bucket
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_user_positions_log\x60 WHERE block_number > %[3]d AND block_number < %[2]d AND (user, token_id) IN (SELECT user, token_id FROM \x60%[1]s\x60.\x60memory_user_positions_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY user, token_id LIMIT 1 BY user, token_id) AND (user, token_id, block_number, transaction_index, log_index) NOT IN (SELECT user, token_id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_user_positions_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY user, token_id, intDiv(block_number, %[5]d), block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY user, token_id, intDiv(block_number, %[5]d)) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber, retainInterval),
+		// memory_markets_log (pk: id) — keep one row per (pk, intDiv(block_number, retainInterval)) bucket
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_markets_log\x60 WHERE block_number > %[3]d AND block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_markets_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_markets_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, intDiv(block_number, %[5]d), block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id, intDiv(block_number, %[5]d)) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber, retainInterval),
+		// memory_neg_risk_events_log (pk: id) — keep one row per (pk, intDiv(block_number, retainInterval)) bucket
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_neg_risk_events_log\x60 WHERE block_number > %[3]d AND block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_neg_risk_events_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_neg_risk_events_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, intDiv(block_number, %[5]d), block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id, intDiv(block_number, %[5]d)) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber, retainInterval),
+		// memory_fixed_product_market_makers_log (pk: id) — keep one row per (pk, intDiv(block_number, retainInterval)) bucket
+		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers_log\x60 WHERE block_number > %[3]d AND block_number < %[2]d AND (id) IN (SELECT id FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id LIMIT 1 BY id) AND (id, block_number, transaction_index, log_index) NOT IN (SELECT id, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60memory_fixed_product_market_makers_log\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY id, intDiv(block_number, %[5]d), block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY id, intDiv(block_number, %[5]d)) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber, retainInterval),
 	}
 
 	start := time.Now()
 	for _, q := range queries {
-		if err := store.Conn().Do(ctx, ch.Query{Body: q}); err != nil {
+		if err := conn.Do(ctx, ch.Query{Body: q}); err != nil {
 			return fmt.Errorf("compaction prune error executing query: %w", err)
 		}
 	}
-	log.Printf("[AUTOMATED COMPACTION] ClickHouse tables pruned and optimized in %s", time.Since(start).Round(time.Millisecond))
+	log.Printf("[AUTOMATED COMPACTION] ClickHouse tables pruned in %s (retain interval %d blocks)", time.Since(start).Round(time.Millisecond), retainInterval)
 	return nil
 }

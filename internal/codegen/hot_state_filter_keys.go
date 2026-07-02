@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 
 	"github.com/franz101/sqd-go/internal/template"
@@ -13,6 +14,7 @@ type clockFilterKeysData struct {
 	TableName string
 	SQL       string
 	WhereExpr string
+	Column    string
 	PKFields  []clockFilterFieldData
 }
 
@@ -27,26 +29,23 @@ type clockFilterFieldData struct {
 }
 
 // renderClockFilterKeysPass emits a recovery pass that adds the KEYS of positions
-// last updated below SQD_RECOVERY_MIN_BLOCK to the cold tier's negative filter,
-// without loading their values. The recency-bounded value load
-// (recoverColdParallel) only adds keys for updated_at_block >= floor; the
-// authoritative skip-CH gate (coldAuthoritative && !ColdMightContain) would then
-// treat a real, pre-floor position as brand-new on a hot+cold miss, skip
-// ClickHouse, and overwrite it with zero. This keys-only pass closes that gap so
-// the filter is complete (every key that exists in ClickHouse is "maybe present")
-// while the cold VALUE store stays bounded by the floor.
+// older than the recovery floor (recoveryColumnFor < floor — see hot_state.go)
+// to the cold tier's negative filter, without loading their values. The
+// recency-bounded value load (recoverColdParallel) only adds keys for
+// recoveryColumnFor >= floor; the authoritative skip-CH gate
+// (coldAuthoritative && !ColdMightContain) would then treat a real, pre-floor
+// position as brand-new on a hot+cold miss, skip ClickHouse, and overwrite it
+// with zero. This keys-only pass closes that gap so the filter is complete
+// (every key that exists in ClickHouse is "maybe present") while the cold VALUE
+// store stays bounded by the floor.
 //
-// No-op for entities without an updated_at_block column (the recency clause never
-// applied, so the value load already covered every key).
+// No-op for entities with no recency column at all (recoverWhereExpr never
+// applies a filter either, so the value load already covers every key). In
+// practice this never happens for a non-event table — block_number is always
+// present (addRequiredBlockFields) — but the check stays defensive.
 func renderClockFilterKeysPass(b *bytes.Buffer, spec hotStateSpec) {
-	hasUpdatedAt := false
-	for _, f := range spec.table.Fields {
-		if f.ColumnName == "updated_at_block" {
-			hasUpdatedAt = true
-			break
-		}
-	}
-	if !hasUpdatedAt {
+	col := recoveryColumnFor(spec.table)
+	if col == "" {
 		return
 	}
 
@@ -90,6 +89,7 @@ func renderClockFilterKeysPass(b *bytes.Buffer, spec hotStateSpec) {
 		TableName: spec.table.Name,
 		SQL:       sql,
 		WhereExpr: recoverBucketWhereExpr(spec.table),
+		Column:    strconv.Quote(col),
 		PKFields:  fields,
 	}
 
