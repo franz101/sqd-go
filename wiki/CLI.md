@@ -94,7 +94,8 @@ Shows usage text.
 | `CLICKHOUSE_USER` | `default` | ClickHouse user |
 | `CLICKHOUSE_PASSWORD` | `sqd-clickhouse` | ClickHouse password |
 | `CLICKHOUSE_DATABASE` | project name | ClickHouse database name |
-| `STATE_SNAPSHOT_INTERVAL` | `4000` | Blocks between state snapshots |
+| `SQD_COMMIT_INTERVAL` | `5000` | Blocks between durable commits of derived state (commit fires on this or `SQD_COMMIT_MAX_INTERVAL`, whichever first) |
+| `SQD_COMMIT_MAX_INTERVAL` | `3s` | Max wall-clock between commits (Go duration or bare seconds) |
 | `CLICKHOUSE_PRUNE_INTERVAL` | `100000` | Blocks between compaction/prune cycles |
 | `SQD_STATE_CACHE_CAPACITY` | `100000` | The maximum number of entries to keep in the in-memory hot CLOCK cache per entity. |
 | `SQD_PARSE_WORKERS` | `runtime.NumCPU()` (capped at 16) | Goroutines used to parse a fetched page concurrently. `1` disables parallel parsing. |

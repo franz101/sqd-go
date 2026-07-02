@@ -90,13 +90,27 @@ type State struct {
 	// flight (see StartPrune). Single-slot, like commitDone: only one prune
 	// runs at a time.
 	pruneDone chan statePruneResult
-	// snapshotsEnabled gates in-memory fork-recovery snapshots. They are only
-	// consumed by RestoreToBlock during a reorg (cursor mode, above the finalized
-	// head); during finalized backfill they are pure GC/memory churn, so the
-	// ingestion layer disables them there. Default true (safe).
+	// snapshotsEnabled gates the on-disk rollback journal (fork recovery). It is
+	// only consumed by RestoreToBlock during a reorg (cursor mode, above the
+	// finalized head); during finalized backfill it is pure overhead, so the
+	// ingestion layer disables it there. Default true (safe).
 	snapshotsEnabled bool
-	snapshots []memorySnapshot
-	snapshotIdx int
+	// rollbackDir holds the journal: one <endBlock>.jsonl.zst per sealed
+	// segment (zstd-compressed JSONL, header line first). Lazily created on the
+	// first seal, wiped on reset. Override with SQD_ROLLBACK_DIR; the default
+	// lives under os.TempDir() suffixed with the pid.
+	rollbackDir string
+	// rollbackFloor is the exclusive lower bound of the in-flight segment: the
+	// block the state rewinds to after applying the not-yet-sealed records.
+	rollbackFloor uint64
+	// rollbackSealed lists sealed segment end blocks, ascending. Segments at or
+	// below the finalized head are deleted by PruneRollback (reorgs can never
+	// rewind below finality).
+	rollbackSealed []uint64
+	// rollbackFailed latches a journal write/read failure: RestoreToBlock then
+	// errors and the ingestion layer falls back to a full LoadFromDatabase
+	// reload (the failsafe path).
+	rollbackFailed bool
 }
 
 type stateCommitResult struct {
@@ -109,14 +123,20 @@ type statePruneResult struct {
 	err error
 }
 
-type memorySnapshot struct {
-	blockNumber uint64
-{{- range .Snapshots}}
-	{{.Field}} []{{.GoTypeName}}
-{{- end}}
+// rollbackHeader is the first JSONL line of every journal segment file:
+// applying the segment rewinds the state from End to Start (exclusive floor).
+type rollbackHeader struct {
+	Start uint64 `json:"start"`
+	End uint64 `json:"end"`
 }
 
-const maxSnapshots = 128
+// rollbackRow is one pre-image record in a journal segment file.
+type rollbackRow struct {
+	Cache string `json:"cache"`
+	Had bool `json:"had"`
+	Key json.RawMessage `json:"key"`
+	Val json.RawMessage `json:"val,omitempty"`
+}
 
 func NewState() *State {
 	return NewStateWithCapacity(DefaultClockCacheCapacity)
@@ -127,7 +147,8 @@ func NewState() *State {
 // lets the hot-tier size be tuned per run. (The production wiring should read an
 // env override in the template; this constructor is the mechanism.)
 func NewStateWithCapacity(capacity uint64) *State {
-	s := &State{HotState: NewHotState(capacity), snapshots: make([]memorySnapshot, maxSnapshots), snapshotsEnabled: true}
+	s := &State{HotState: NewHotState(capacity), snapshotsEnabled: true}
+	s.HotState.SetJournal(true)
 {{- range .Handles}}
 	s.{{.Name}} = {{.StateType}}{state: s}
 {{- end}}
@@ -211,8 +232,8 @@ func (s *State) CommitInFlight() bool {
 	return s != nil && s.commitDone != nil
 }
 
-// StartPrune runs CompactionPruneState (DELETE + OPTIMIZE TABLE ... FINAL on
-// hot-state tables) in a background goroutine, off the consumer/fold hot path.
+// StartPrune runs CompactionPruneState (a DELETE mutation on hot-state
+// tables) in a background goroutine, off the consumer/fold hot path.
 // Unlike StartCommit, prune touches no in-memory HotState — it only deletes and
 // reorganizes rows already durably committed in ClickHouse — so it is safe to
 // run fully concurrently with the consumer continuing to process blocks via
@@ -291,13 +312,13 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 	if os.Getenv("TEST_MODE") == "1" || os.Getenv("CI") == "1" {
 		s.LastSyncBlock = blockNumber
 		s.LastPruneBlock = blockNumber
-		s.SaveSnapshot(blockNumber)
+		s.rollbackReset(blockNumber)
 		return nil
 	}
 	if s.HotState == nil {
 		s.LastSyncBlock = blockNumber
 		s.LastPruneBlock = blockNumber
-		s.SaveSnapshot(blockNumber)
+		s.rollbackReset(blockNumber)
 		return nil
 	}
 
@@ -343,85 +364,341 @@ func (s *State) LoadFromClickHouse(ctx context.Context, blockNumber uint64) erro
 
 	s.LastSyncBlock = blockNumber
 	s.LastPruneBlock = blockNumber
-	s.SaveSnapshot(blockNumber)
+	// A fresh journal lineage starts here: pre-reload segments describe a state
+	// that no longer exists and must never be applied to the reloaded one.
+	s.rollbackReset(blockNumber)
 	return nil
 }
 
+// SaveSnapshot seals the in-flight rollback-journal segment at blockNumber:
+// the pre-image records captured since the previous seal are written to
+// <rollbackDir>/<blockNumber>.jsonl.zst. Unlike the old in-memory snapshot
+// ring (a full hot-state deep copy per commit, ~O(entire state)), the journal
+// is O(keys touched in the segment) in both CPU and bytes.
 func (s *State) SaveSnapshot(blockNumber uint64) {
-	if s == nil || s.HotState == nil || len(s.snapshots) == 0 || !s.snapshotsEnabled {
+	if s == nil || s.HotState == nil {
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	s.saveSnapshotLocked(blockNumber)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.snapshotsEnabled {
+		return
+	}
+	batch := s.HotState.journalCollect()
+	if s.rollbackFailed {
+		return // journal broken: drop records; a reorg falls back to a DB reload
+	}
+	if blockNumber <= s.rollbackFloor {
+		if !batch.empty() {
+			// Records captured for a segment that cannot be sealed (non-advancing
+			// seal block). Should not happen; latch failure so a reorg takes the
+			// safe fallback instead of trusting a journal with a hole.
+			log.Printf("rollback journal: dropping %s records at non-advancing seal block %d (floor %d)", "in-flight", blockNumber, s.rollbackFloor)
+			s.rollbackFailed = true
+		}
+		return
+	}
+	if err := s.writeRollbackSegmentLocked(batch, s.rollbackFloor, blockNumber); err != nil {
+		log.Printf("rollback journal: seal segment (%d,%d] failed: %v — reorg recovery will fall back to database reload", s.rollbackFloor, blockNumber, err)
+		s.rollbackFailed = true
+		return
+	}
+	s.rollbackSealed = append(s.rollbackSealed, blockNumber)
+	s.rollbackFloor = blockNumber
 }
 
-// SetSnapshotsEnabled toggles in-memory fork-recovery snapshots. The ingestion
-// layer disables them during finalized backfill (no reorgs) to remove the
-// dominant GC/memory cost; cursor mode keeps them for reorg recovery.
+// SetSnapshotsEnabled toggles the rollback journal. The ingestion layer
+// disables it during finalized backfill (no reorgs) to remove the capture
+// cost; cursor mode enables it near the finalized head for reorg recovery.
+// Enabling starts a fresh journal lineage at the current cursor: segments from
+// a previous enabled period cannot be applied to the current state.
 func (s *State) SetSnapshotsEnabled(enabled bool) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.snapshotsEnabled == enabled {
+		return
+	}
 	s.snapshotsEnabled = enabled
-	s.mu.Unlock()
+	if s.HotState != nil {
+		s.HotState.SetJournal(enabled)
+	}
+	s.rollbackResetLocked(s.LastSyncBlock)
 }
 
-func (s *State) saveSnapshotLocked(blockNumber uint64) {
-	idx := s.snapshotIdx % len(s.snapshots)
-	snap := memorySnapshot{blockNumber: blockNumber}
-{{- range .Snapshots}}
-	s.HotState.{{.BaseName}}.Range(func(_ {{.KeyType}}, v {{.GoTypeName}}) bool {
-		snap.{{.Field}} = append(snap.{{.Field}}, v)
-		return true
-	})
-{{- end}}
-	s.snapshots[idx] = snap
-	s.snapshotIdx++
-}
-
-func (s *State) RestoreToBlock(blockNumber uint64) (uint64, error) {
+// rollbackReset abandons the current journal lineage and starts a new one
+// whose floor is blockNumber. Called after a full state reload from the
+// database: the on-disk segments describe the pre-reload lineage and must not
+// be applied to the reloaded state.
+func (s *State) rollbackReset(blockNumber uint64) {
 	if s == nil {
-		return blockNumber, nil
+		return
 	}
-	var best *memorySnapshot
-	bestIdx := -1
-	for i := range s.snapshots {
-		snap := &s.snapshots[i]
-		if snap.blockNumber == 0 || snap.blockNumber > blockNumber {
-			continue
-		}
-		if best == nil || snap.blockNumber > best.blockNumber {
-			best = snap
-			bestIdx = i
-		}
-	}
-	if best == nil {
-		return 0, fmt.Errorf("no snapshot found at or below block %d", blockNumber)
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Detach the cold tier before discarding the hot state: its entries reflect
+	s.rollbackResetLocked(blockNumber)
+}
+
+func (s *State) rollbackResetLocked(blockNumber uint64) {
+	if s.HotState != nil {
+		_ = s.HotState.journalCollect() // drop in-flight records from the old lineage
+	}
+	if s.rollbackDir != "" {
+		_ = os.RemoveAll(s.rollbackDir)
+	}
+	s.rollbackDir = ""
+	s.rollbackSealed = s.rollbackSealed[:0]
+	s.rollbackFloor = blockNumber
+	s.rollbackFailed = false
+}
+
+// ensureRollbackDirLocked resolves and (re)creates the journal directory on
+// the first seal of a lineage. SQD_ROLLBACK_DIR overrides the location; the
+// default is pid-suffixed under os.TempDir() so a restarted process never
+// mistakes a dead run's segments for its own (stale siblings are swept).
+func (s *State) ensureRollbackDirLocked() error {
+	if s.rollbackDir != "" {
+		return nil
+	}
+	dir := os.Getenv("SQD_ROLLBACK_DIR")
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), fmt.Sprintf("sqd-rollback-%d", os.Getpid()))
+		if matches, err := filepath.Glob(filepath.Join(os.TempDir(), "sqd-rollback-*")); err == nil {
+			for _, m := range matches {
+				if m != dir {
+					_ = os.RemoveAll(m)
+				}
+			}
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	s.rollbackDir = dir
+	return nil
+}
+
+func rollbackSegmentFile(dir string, end uint64) string {
+	return filepath.Join(dir, fmt.Sprintf("%d.jsonl.zst", end))
+}
+
+// writeRollbackSegmentLocked persists one sealed segment as zstd-compressed
+// JSONL: a header line, then one pre-image record per line. Written to a temp
+// file and renamed so a crash never leaves a half-written segment behind.
+func (s *State) writeRollbackSegmentLocked(batch *journalBatch, start, end uint64) error {
+	if err := s.ensureRollbackDirLocked(); err != nil {
+		return err
+	}
+	final := rollbackSegmentFile(s.rollbackDir, end)
+	tmp := final + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	zw, err := zstd.NewWriter(f)
+	if err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	bw := bufio.NewWriter(zw)
+	enc := json.NewEncoder(bw)
+	err = enc.Encode(rollbackHeader{Start: start, End: end})
+{{- range .Snapshots}}
+	for i := range batch.{{.BaseName}} {
+		if err != nil {
+			break
+		}
+		u := &batch.{{.BaseName}}[i]
+		err = encodeRollbackRow(enc, {{printf "%q" .BaseName}}, u.Key, u.Val, u.Had)
+	}
+{{- end}}
+	if e := bw.Flush(); err == nil {
+		err = e
+	}
+	if e := zw.Close(); err == nil {
+		err = e
+	}
+	if e := f.Close(); err == nil {
+		err = e
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, final)
+}
+
+func encodeRollbackRow(enc *json.Encoder, cache string, key any, val any, had bool) error {
+	kb, err := json.Marshal(key)
+	if err != nil {
+		return err
+	}
+	row := rollbackRow{Cache: cache, Had: had, Key: kb}
+	if had {
+		vb, err := json.Marshal(val)
+		if err != nil {
+			return err
+		}
+		row.Val = vb
+	}
+	return enc.Encode(&row)
+}
+
+// applyRollbackRow restores one key to its pre-segment value (Had=true) or
+// deletes it (Had=false; the read then falls through to the rolled-back
+// database).
+func (s *State) applyRollbackRow(row *rollbackRow) error {
+	switch row.Cache {
+{{- range .Snapshots}}
+	case {{printf "%q" .BaseName}}:
+		var key {{.KeyType}}
+		if err := json.Unmarshal(row.Key, &key); err != nil {
+			return fmt.Errorf("decode %s key: %w", row.Cache, err)
+		}
+		var val {{.GoTypeName}}
+		if row.Had {
+			if err := json.Unmarshal(row.Val, &val); err != nil {
+				return fmt.Errorf("decode %s value: %w", row.Cache, err)
+			}
+		}
+		s.HotState.Restore{{.GoTypeName}}(key, val, row.Had)
+		return nil
+{{- end}}
+	}
+	return fmt.Errorf("unknown rollback cache %q", row.Cache)
+}
+
+// applyRollbackSegment reloads the sealed segment ending at end from disk and
+// applies its records, rewinding the state to the segment's start. Returns the
+// new floor.
+func (s *State) applyRollbackSegment(end uint64) (uint64, error) {
+	if s.rollbackDir == "" {
+		return 0, fmt.Errorf("no rollback journal directory")
+	}
+	f, err := os.Open(rollbackSegmentFile(s.rollbackDir, end))
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return 0, err
+	}
+	defer zr.Close()
+	sc := bufio.NewScanner(zr)
+	sc.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("rollback segment %d: empty file", end)
+	}
+	var hdr rollbackHeader
+	if err := json.Unmarshal(sc.Bytes(), &hdr); err != nil {
+		return 0, fmt.Errorf("rollback segment %d: decode header: %w", end, err)
+	}
+	if hdr.End != end || hdr.Start >= end {
+		return 0, fmt.Errorf("rollback segment %d: bad header (start %d, end %d)", end, hdr.Start, hdr.End)
+	}
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var row rollbackRow
+		if err := json.Unmarshal(line, &row); err != nil {
+			return 0, fmt.Errorf("rollback segment %d: decode row: %w", end, err)
+		}
+		if err := s.applyRollbackRow(&row); err != nil {
+			return 0, fmt.Errorf("rollback segment %d: %w", end, err)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0, err
+	}
+	return hdr.Start, nil
+}
+
+func (s *State) dropRollbackSegmentsAboveLocked(floor uint64) {
+	kept := s.rollbackSealed[:0]
+	for _, end := range s.rollbackSealed {
+		if end > floor {
+			if s.rollbackDir != "" {
+				_ = os.Remove(rollbackSegmentFile(s.rollbackDir, end))
+			}
+			continue
+		}
+		kept = append(kept, end)
+	}
+	s.rollbackSealed = kept
+}
+
+// RestoreToBlock rewinds the hot state to blockNumber by applying rollback-
+// journal segments newest-first (the reload-from-disk path). Returns the block
+// actually reached — the floor of the deepest applied segment, which can be
+// below blockNumber; the caller replays the gap from its replay buffer. Any
+// journal problem returns an error and the caller falls back to a full
+// LoadFromDatabase reload (failsafe).
+func (s *State) RestoreToBlock(blockNumber uint64) (uint64, error) {
+	if s == nil || s.HotState == nil {
+		return blockNumber, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.snapshotsEnabled {
+		return 0, fmt.Errorf("rollback journal disabled: cannot restore to block %d", blockNumber)
+	}
+	if s.rollbackFailed {
+		return 0, fmt.Errorf("rollback journal failed earlier: cannot restore to block %d", blockNumber)
+	}
+	// Detach the cold tier before rewinding the hot state: its entries reflect
 	// blocks > the restore point and must not survive a reorg. Post-restore reads
 	// fall back to ClickHouse (rolled back to the safe block) — correct.
 	_ = s.HotState.CloseColdCache()
-	s.HotState = NewHotState(DefaultClockCacheCapacity)
-{{- range .Snapshots}}
-	for _, val := range best.{{.Field}} {
-		s.HotState.{{.BaseName}}.Set(val)
-	}
-{{- end}}
-	s.LastSyncBlock = best.blockNumber
-	s.LastPruneBlock = best.blockNumber
-	for i := range s.snapshots {
-		if s.snapshots[i].blockNumber > blockNumber {
-			s.snapshots[i] = memorySnapshot{}
+	// The in-flight segment first: rewinds (rollbackFloor, consumer-now].
+	s.HotState.journalApply(s.HotState.journalCollect())
+	floor := s.rollbackFloor
+	for floor > blockNumber {
+		start, err := s.applyRollbackSegment(floor)
+		if err != nil {
+			s.rollbackFailed = true
+			return 0, fmt.Errorf("apply rollback segment ending at %d: %w", floor, err)
 		}
+		floor = start
 	}
-	s.snapshotIdx = bestIdx + 1
-	return best.blockNumber, nil
+	// Segments above the restore point describe the abandoned branch.
+	s.dropRollbackSegmentsAboveLocked(floor)
+	s.rollbackFloor = floor
+	s.LastSyncBlock = floor
+	s.LastPruneBlock = floor
+	return floor, nil
+}
+
+// PruneRollback deletes sealed journal segments ending at or below the
+// finalized head: a reorg can never rewind below finality, so they are
+// unreachable. Called by the ingestion layer as finality advances.
+func (s *State) PruneRollback(finalizedBlock uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := 0
+	for i < len(s.rollbackSealed) && s.rollbackSealed[i] <= finalizedBlock {
+		if s.rollbackDir != "" {
+			_ = os.Remove(rollbackSegmentFile(s.rollbackDir, s.rollbackSealed[i]))
+		}
+		i++
+	}
+	if i > 0 {
+		s.rollbackSealed = append(s.rollbackSealed[:0], s.rollbackSealed[i:]...)
+	}
 }
 {{end}}
 

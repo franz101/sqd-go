@@ -12,8 +12,8 @@ import (
 // against a real, disposable ClickHouse (set SQD_PRUNE_CH_ADDR to run; skips
 // otherwise). This is the test-db coverage for the prune/hot-Conn decoupling:
 // before this, CompactionPruneState had zero test coverage anywhere in the
-// repo despite running DELETE + OPTIMIZE TABLE ... FINAL against production
-// hot-state tables every CLICKHOUSE_PRUNE_INTERVAL blocks.
+// repo despite running a DELETE mutation against production hot-state tables
+// every CLICKHOUSE_PRUNE_INTERVAL blocks.
 func TestGeneratedPruneRuntime(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
@@ -345,12 +345,12 @@ func TestPruneUsesPruneConnNotHotConn(t *testing.T) {
 }
 
 // TestPruneStartPollWaitLifecycle is the async dispatch test: StartPrune (a)
-// returns to the caller without waiting for the DELETE/OPTIMIZE round trip —
-// this is the actual "decouple from the consumer's hot path" property, since
-// the consumer/fold goroutine calls StartPrune and must keep processing
-// blocks rather than blocking for however long OPTIMIZE TABLE ... FINAL
-// takes — (b) refuses to start a second prune while one is in flight, and (c)
-// completes asynchronously, observable via PollPrune/WaitPrune, advancing
+// returns to the caller without waiting for the DELETE round trip — this is
+// the actual "decouple from the consumer's hot path" property, since the
+// consumer/fold goroutine calls StartPrune and must keep processing blocks
+// rather than blocking for however long the mutation takes — (b) refuses to
+// start a second prune while one is in flight, and (c) completes
+// asynchronously, observable via PollPrune/WaitPrune, advancing
 // LastPruneBlock only once the result is actually observed.
 func TestPruneStartPollWaitLifecycle(t *testing.T) {
 	conn, prune, db := pruneTestDial(t)
@@ -368,7 +368,7 @@ func TestPruneStartPollWaitLifecycle(t *testing.T) {
 	}
 	dispatchElapsed := time.Since(dispatchStart)
 	if dispatchElapsed > 200*time.Millisecond {
-		t.Errorf("StartPrune took %s to return, want it to dispatch and return near-instantly (it must not block on the DELETE/OPTIMIZE round trip)", dispatchElapsed)
+		t.Errorf("StartPrune took %s to return, want it to dispatch and return near-instantly (it must not block on the DELETE round trip)", dispatchElapsed)
 	}
 
 	if ok := state.StartPrune(context.Background(), store, 0, 2000, 100000); ok {

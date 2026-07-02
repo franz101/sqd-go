@@ -174,7 +174,7 @@ If codegen detects hot state tables, it generates a `Processor` struct that:
 2. Decodes raw logs into typed events via `UnpackLogWithMeta`
 3. Groups events by block, pushes to ring buffer
 4. Calls `CustomProcessFn` (your user-defined function) per block slot
-5. Auto-commits state at `STATE_SNAPSHOT_INTERVAL` blocks
+5. Auto-commits state at the commit interval (`SQD_COMMIT_INTERVAL` blocks / `SQD_COMMIT_MAX_INTERVAL`, whichever first)
 6. Auto-prunes ClickHouse at `CLICKHOUSE_PRUNE_INTERVAL` blocks
 
 ## Config: `state` Section

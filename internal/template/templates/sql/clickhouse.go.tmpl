@@ -1,34 +1,36 @@
+{{define "columnCodec"}}{{if .}} CODEC({{.}}){{end}}{{end}}
+
 {{define "createBlocksTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.blocks (
-    chain_id UInt64,
-    block_number UInt64,
-    block_timestamp DateTime64(3, 'UTC'),
-    block_hash String,
+    chain_id UInt64{{template "columnCodec" .Codec}},
+    block_number UInt64{{template "columnCodec" .Codec}},
+    block_timestamp DateTime64(3, 'UTC'){{template "columnCodec" .Codec}},
+    block_hash String{{template "columnCodec" .Codec}},
     {{- if .Collapsing}}
     sign Int8 DEFAULT 1,
     {{- end}}
-    inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
+    inserted_at DateTime64(3, 'UTC') DEFAULT now64(3){{template "columnCodec" .Codec}}
 ) ENGINE = {{.Engine}}
 ORDER BY (chain_id, block_number)
 {{end}}
 
 {{define "createLogsTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.logs (
-    chain_id UInt64,
-    block_number UInt64,
-    block_timestamp DateTime64(3, 'UTC'),
-    block_hash String,
-    transaction_hash FixedString(32),
-    transaction_index UInt64,
-    log_index UInt64,
-    address FixedString(20),
-    event_name LowCardinality(String),
-    topic0 FixedString(32),
-    params String,
+    chain_id UInt64{{template "columnCodec" .Codec}},
+    block_number UInt64{{template "columnCodec" .Codec}},
+    block_timestamp DateTime64(3, 'UTC'){{template "columnCodec" .Codec}},
+    block_hash String{{template "columnCodec" .Codec}},
+    transaction_hash FixedString(32){{template "columnCodec" .Codec}},
+    transaction_index UInt64{{template "columnCodec" .Codec}},
+    log_index UInt64{{template "columnCodec" .Codec}},
+    address FixedString(20){{template "columnCodec" .Codec}},
+    event_name LowCardinality(String){{template "columnCodec" .Codec}},
+    topic0 FixedString(32){{template "columnCodec" .Codec}},
+    params String{{template "columnCodec" .Codec}},
     {{- if .Collapsing}}
     sign Int8 DEFAULT 1,
     {{- end}}
-    inserted_at DateTime64(3, 'UTC') DEFAULT now64(3)
+    inserted_at DateTime64(3, 'UTC') DEFAULT now64(3){{template "columnCodec" .Codec}}
 ) ENGINE = {{.Engine}}
 ORDER BY (chain_id, block_number, transaction_index, log_index)
 {{end}}
@@ -49,23 +51,23 @@ ORDER BY (chain_id, updated_at)
 {{define "createEventTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.{{.TableIdent}} (
     {{- if .IncludeChainID}}
-    chain_id UInt64,
+    chain_id UInt64{{template "columnCodec" .Codec}},
     {{- end}}
-    block_number UInt64,
-    block_timestamp DateTime64(3, 'UTC'),
+    block_number UInt64{{template "columnCodec" .Codec}},
+    block_timestamp DateTime64(3, 'UTC'){{template "columnCodec" .Codec}},
     {{- if .IncludeBlockHash}}
-    block_hash FixedString(32),
+    block_hash FixedString(32){{template "columnCodec" .Codec}},
     {{- end}}
     {{- if .IncludeContractAddress}}
-    contract_address FixedString(20),
+    contract_address FixedString(20){{template "columnCodec" .Codec}},
     {{- end}}
     {{- if .IncludeTransactionHash}}
-    transaction_hash FixedString(32),
+    transaction_hash FixedString(32){{template "columnCodec" .Codec}},
     {{- end}}
-    transaction_index UInt64,
-    log_index UInt64
+    transaction_index UInt64{{template "columnCodec" .Codec}},
+    log_index UInt64{{template "columnCodec" .Codec}}
     {{- range .Columns}},
-    {{.ColumnIdent}} {{.ClickHouseType}}
+    {{.ColumnIdent}} {{.ClickHouseType}}{{template "columnCodec" $.Codec}}
     {{- end}}
     {{- if .Collapsing}},
     sign Int8 DEFAULT 1
@@ -152,7 +154,7 @@ LIMIT 1
 {{define "createCustomTable"}}
 CREATE TABLE IF NOT EXISTS {{.DatabaseIdent}}.{{.TableIdent}} (
 {{range $i, $col := .Columns}}
-{{- if $i}},{{"\n"}}{{- end}}  {{$col.NameIdent}} {{$col.Type}}{{- if $col.Default}} DEFAULT {{$col.Default}}{{- end}}
+{{- if $i}},{{"\n"}}{{- end}}  {{$col.NameIdent}} {{$col.Type}}{{- if $col.Default}} DEFAULT {{$col.Default}}{{- end}}{{template "columnCodec" $.Codec}}
 {{- end}}
 ) ENGINE = {{.Engine}}
 PRIMARY KEY ({{.PrimaryKey}})

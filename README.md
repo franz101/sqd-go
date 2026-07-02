@@ -75,7 +75,8 @@ The base of a project is the config.yml which is similar to the graph network.ya
 name: case_1_lbtc_event_only
 chains:
   - id: 1
-    start_block: 0
+    # LBTC was deployed around block 20.5M; do not scan from genesis.
+    start_block: 20600000
     end_block: 22200000
     contracts:
       - name: LBTC
@@ -83,6 +84,52 @@ chains:
         events:
           - event: Transfer(address indexed from, address indexed to, uint256 value)
 ```
+
+## Architecture
+
+```
+sqd-go/
+├── main.go                  # Entry point → internal/cli.Run(os.Args)
+├── compose.yml              # ClickHouse (+ Grafana) Docker stack
+├── Makefile                 # Build / test / codegen helpers
+│
+├── internal/                # Private implementation packages
+│   ├── cli/                 # Command routing: codegen · dev · start · stop · init
+│   ├── config/              # config.yaml / config.yml schema + loader
+│   ├── client/              # Subsquid portal HTTP wrapper (block/log fetch)
+│   ├── codegen/             # config → schema.sql, views.sql, events.go, parser.go,
+│   │                        #   inserter, hot-state, compaction, custom-table code
+│   ├── template/            # Embedded Go/SQL code templates (templates/code, /sql)
+│   ├── templating/          # `init`: scaffold a project from a raw ABI
+│   ├── parser/              # JSONL decoders, arena allocator, ABI event decoding
+│   ├── ingestion/           # Core indexing loop: checkpoints, parallel fetch,
+│   │                        #   recovery, replay, adaptive page size, fork handling
+│   ├── database/            # ClickHouse client + stateful batched inserter
+│   ├── monitoring/          # Opt-in runtime/throughput metrics → ClickHouse → Grafana
+│   ├── envconfig/           # Centralized SQD_* environment-variable config
+│   └── fork_sqd/            # Unfinalized-block / reorg tracking
+│
+├── sqd/                     # Public API surface generated projects compile against
+├── abiunpack/               # Zero-reflection, zero-alloc ABI decoding (public)
+├── coldcache/               # Pebble / flat cold tier under the hot caches (public)
+├── protomath/               # uint256 / Decimal256 math on ch-go proto values (public)
+│
+├── examples/                # Sample projects
+│   ├── uniswap/             # Uniswap V2/V3 event indexing
+│   └── polymarket/          # Polymarket CTF indexing + custom processor
+│       └── generated/       # Codegen output (events, parser, inserter, state, …)
+│
+├── grafana/                 # Provisioned dashboards + ClickHouse datasource
+├── clickhouse/              # ClickHouse user config (Grafana access)
+├── wiki/                    # CLI, config, and example documentation
+├── debugger/                # Ad-hoc block-fetch debugging tool
+└── benchmarks/ · experiments/   # Perf notes and reporting
+```
+
+The four top-level packages (`sqd`, `abiunpack`, `coldcache`, `protomath`) are
+**public**: a generated project and its hand-written `custom_processor.go` import
+these — not the module's `internal/` packages — so a project can be built as its
+own standalone Go module (Go forbids importing another module's `internal/`).
 
 ## Project Structure
 
@@ -94,7 +141,7 @@ chains:
   - `config/`: Configuration definitions.
   - `database/`: ClickHouse client wrapper and stateful batched inserter.
   - `ingestion/`: Core indexing loop and checkpoint management.
-  - `parser/`: Event decoders, JSONL parsers, and zero-reflection `abiunpack`.
+  - `parser/`: Event decoders, JSONL parsers, and ABI event decoding.
 
 ### `init` from scratch
 Scaffold a new project from a local ABI file.
@@ -102,4 +149,5 @@ Scaffold a new project from a local ABI file.
 ```bash
 go run . init contract-import local --abi erc20.json --name USDC --address 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
 ```
-This automatically generates a `config.yaml` with the configured events.
+This generates `config.yaml` plus template-driven `custom_schema.go` and
+`custom_processor.go` files using the ABI's actual generated event names.

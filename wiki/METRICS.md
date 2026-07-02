@@ -319,8 +319,8 @@ startup.
 | `SQD_PARALLEL_PAGE_SIZE` | `10000` (floor `1000`) | Blocks per worker page. Larger pages amortize request overhead but cost memory per in-flight page. |
 | `SQD_PARALLEL_RPS` | `5.0` (≤0 → `5.0`) | Target request rate to the portal. The gateway rate-limits around ~5 req/s; raising this risks throttling. |
 | `SQD_TARGET_FETCH_SECONDS` | `6` | Target latency per fetch; the fetcher adapts page sizing toward this. `0` disables the target. |
-| `SQD_COMMIT_INTERVAL` | `4096` | Blocks between checkpoint commits to ClickHouse. |
-| `SQD_COMMIT_MAX_INTERVAL` | `3s` | Max wall time between commits (Go duration or bare seconds), so sparse ranges still checkpoint. |
+| `SQD_COMMIT_INTERVAL` | `5000` | Blocks between durable commits of derived state to ClickHouse — the crash re-fetch budget (a crash re-processes at most this many blocks from the last checkpoint). Commit fires on this **or** `SQD_COMMIT_MAX_INTERVAL`, whichever first. See [CUSTOM_PROCESSOR.md](CUSTOM_PROCESSOR.md) for the full model. |
+| `SQD_COMMIT_MAX_INTERVAL` | `3s` | Max wall time between commits (Go duration or bare seconds), so the slow live tail becomes durable promptly instead of waiting for `SQD_COMMIT_INTERVAL` blocks. |
 | `SQD_RECOVERY_MIN_BLOCK` | unset (auto) | Manual override for the recovery floor (the recency-column value below which positions are loaded keys-only, not with full values). When unset, recovery computes this itself via `quantile(SQD_RECOVERY_QUANTILE)` against the table's recency column — no manual tuning needed; set this only to pin an exact value. |
 | `SQD_RECOVERY_QUANTILE` | `0.95` | Quantile level used to auto-derive the recovery floor when `SQD_RECOVERY_MIN_BLOCK` is unset. `0.95` keeps the most recent ~5% of rows in the full value load; the rest get keys-only negative-filter coverage. |
 | `SQD_RECOVERY_AUTO_FLOOR` | unset (on) | Set to `0`/`false` to disable the auto-computed floor entirely and restore the old unconditional full-table-scan recovery. |

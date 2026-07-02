@@ -102,7 +102,7 @@ The generated processor:
 4. Retrieves `ParsedBlock` which wraps decoded events with metadata
 5. Batches blocks in groups of 8 for prefetch (loads existing state from ClickHouse)
 6. Calls `CustomProcessFn` or `CustomProcessProtoFn` for each block
-7. At `STATE_SNAPSHOT_INTERVAL` (default 4000) blocks: saves snapshot, commits hot state to ClickHouse, prunes old rows
+7. At the commit interval (`SQD_COMMIT_INTERVAL` blocks, default 5000, **or** `SQD_COMMIT_MAX_INTERVAL`, default 3s — whichever first): saves a snapshot and commits hot state to ClickHouse. Pruning runs on its own separate cadence (`CLICKHOUSE_PRUNE_INTERVAL` blocks).
 
 ### `ParsedBlock.EventsIter()`
 
@@ -157,7 +157,7 @@ The prefetch system automatically queries ClickHouse for entity state matching k
 
 ### Snapshots and Fork Recovery
 
-The `State` maintains a 32-slot ring buffer of deep-copied snapshots, taken every `STATE_SNAPSHOT_INTERVAL` blocks. On fork recovery:
+The `State` maintains a 32-slot ring buffer of deep-copied snapshots, one taken at each commit (see the **Commit interval** section below). On fork recovery:
 
 1. `RestoreToBlock(safeBlock)` finds the newest snapshot ≤ `safeBlock`
 2. All entity maps are restored from the snapshot
@@ -166,17 +166,36 @@ The `State` maintains a 32-slot ring buffer of deep-copied snapshots, taken ever
 
 This avoids re-fetching from the network — the ring buffer holds the last N blocks of decoded events.
 
-### Commit and Persistence
+### Commit interval (when `Save()` becomes durable)
 
-At snapshot intervals, `State.Commit()` flushes all dirty entities to ClickHouse:
+`Save()` does **not** write to ClickHouse on the spot. It updates the in-memory hot-state
+cache (a CLOCK cache per entity) and marks the entity dirty. The runtime then commits the
+accumulated dirty state to ClickHouse on a **hybrid cadence** — it commits whenever *either*
+bound below is reached, whichever comes first:
+
+| Bound | Env var | Default | Role |
+|-------|---------|---------|------|
+| Blocks since last commit | `SQD_COMMIT_INTERVAL` | `5000` | The **crash re-fetch budget**: on a crash, at most this many blocks are re-fetched and re-processed from the last durable checkpoint. Dominates during backfill. |
+| Wall-clock since last commit | `SQD_COMMIT_MAX_INTERVAL` | `3s` | The **durability-latency bound**: keeps the slow live tail (a few blocks/sec) becoming durable promptly instead of waiting `SQD_COMMIT_INTERVAL` blocks (which at the head could be ~30 min). Dominates at the chain head. |
+
+If you come from Subsquid's `processor.run()`, this is the framework-managed equivalent of
+its end-of-batch `ctx.store.save([...])`: there you accumulate into maps across `ctx.blocks`
+and flush once per batch; here your per-block `Save()` accumulates in the hot cache and the
+runtime flushes on the interval above. You never write the commit yourself.
+
+The commit runs **asynchronously, off the block-processing hot path** (on a dedicated
+ClickHouse connection), so a multi-second flush doesn't stall parsing. Each commit appends the
+dirty rows to the per-entity `_log` history table via the ClickHouse native protocol (ch-go)
+with `async_insert=1, wait_for_async_insert=0` for throughput:
 
 ```go
-// Generated per-entity INSERT (appends to the _log history table):
-INSERT INTO <db>.user_positions_log (user, token_id, amount, ...) VALUES
-// Uses ClickHouse native protocol (ch-go) with async inserts
+INSERT INTO <db>.user_positions_log (address, total_in, total_out, ...) VALUES ...
 ```
 
-Settings: `async_insert=1`, `wait_for_async_insert=0` for maximum throughput.
+**The checkpoint never leads the durable horizon.** The ingestion checkpoint only advances to
+the highest block whose derived state has actually committed (`CommittedBlock()`), so a crash
+resumes from the last commit and re-fetches the bounded gap — un-committed `Save()`s are never
+silently lost. On a clean `--end-block` exit the runtime forces a final flush of the tail.
 
 ## Real-World Example: Uniswap PnL Transfer Tracker
 
@@ -225,7 +244,8 @@ func Process(state *generated.State, block *generated.ParsedBlock) error {
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STATE_SNAPSHOT_INTERVAL` | `4000` | Blocks between state snapshots/commits |
+| `SQD_COMMIT_INTERVAL` | `5000` | Blocks between durable commits of derived state (the crash re-fetch budget). Commit fires on this **or** `SQD_COMMIT_MAX_INTERVAL`, whichever first. |
+| `SQD_COMMIT_MAX_INTERVAL` | `3s` | Max wall-clock between commits (Go duration or bare seconds); keeps the slow live tail durable without waiting `SQD_COMMIT_INTERVAL` blocks. |
 | `CLICKHOUSE_PRUNE_INTERVAL` | `100000` | Blocks between compaction prune cycles |
 | `CLICKHOUSE_HTTP_PORT` | `8123` | Port for `LoadFromDatabase` HTTP queries |
 | `SQD_STATE_CACHE_CAPACITY` | `100000` | The maximum number of entries to keep in the in-memory hot CLOCK cache per entity |

@@ -23,6 +23,12 @@ import (
 // PRIMARY KEY is the pk/sk only; block_number/transaction_index/log_index live
 // exclusively in ORDER BY and here in the bucket/keep-set expressions — never in
 // the key — so a bucket's "latest" is well-defined by (block, tx, log) order.
+//
+// No OPTIMIZE TABLE ... FINAL after the DELETE: ClickHouse's lightweight
+// delete masks rows (_row_exists) so plain SELECTs already exclude them
+// without a merge, and background merges reclaim the masked rows over time.
+// FINAL forces an immediate full-table rewrite — on large "_log" tables that
+// took minutes and dominated backfill throughput for no correctness benefit.
 func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, blockNumber uint64, retainInterval uint64) error {
 	if store == nil {
 		return nil
@@ -33,10 +39,11 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 		return nil
 	}
 	// Prefer a dedicated prune connection over the consumer's hot Conn so this
-	// query set (which can run for minutes via OPTIMIZE TABLE ... FINAL) never
-	// blocks lazy state resolves sharing Conn. See State.StartPrune, which is
-	// what actually moves this call off the consumer's hot path; the connection
-	// split here also protects Conn from this goroutine on its own.
+	// query set (a DELETE mutation per table, which can still take a while on
+	// large tables) never blocks lazy state resolves sharing Conn. See
+	// State.StartPrune, which is what actually moves this call off the
+	// consumer's hot path; the connection split here also protects Conn from
+	// this goroutine on its own.
 	conn := store.Conn()
 	if pruneStore, ok := store.(interface{ PruneConn() *ch.Client }); ok && pruneStore.PruneConn() != nil {
 		conn = pruneStore.PruneConn()
@@ -76,7 +83,6 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 {{- if gt (len .PrimaryKey) 0}}
 		// {{.Name}} (pk: {{join .PrimaryKey ", "}}) — keep one row per (pk, intDiv(block_number, retainInterval)) bucket
 		fmt.Sprintf("DELETE FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number < %[2]d AND ({{join .PrimaryKey ", "}}) IN (SELECT {{join .PrimaryKey ", "}} FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}} LIMIT 1 BY {{join .PrimaryKey ", "}}) AND ({{join .PrimaryKey ", "}}, block_number, transaction_index, log_index) NOT IN (SELECT {{join .PrimaryKey ", "}}, block_number, transaction_index, log_index FROM \x60%[1]s\x60.\x60{{.Name}}\x60 WHERE block_number > %[3]d AND block_number <= %[4]d ORDER BY {{join .PrimaryKey ", "}}, intDiv(block_number, %[5]d), block_number DESC, transaction_index DESC, log_index DESC LIMIT 1 BY {{join .PrimaryKey ", "}}, intDiv(block_number, %[5]d)) SETTINGS lightweight_deletes_sync = 1, max_bytes_before_external_group_by = 536870912, max_bytes_before_external_sort = 536870912", db, pruneThreshold, activeLower, blockNumber, retainInterval),
-		fmt.Sprintf("OPTIMIZE TABLE \x60%s\x60.\x60{{.Name}}\x60 FINAL", db),
 {{- end}}
 {{- end}}
 	}
@@ -87,7 +93,7 @@ func CompactionPruneState(ctx context.Context, store Store, lowerBlock uint64, b
 			return fmt.Errorf("compaction prune error executing query: %w", err)
 		}
 	}
-	log.Printf("[AUTOMATED COMPACTION] ClickHouse tables pruned and optimized in %s (retain interval %d blocks)", time.Since(start).Round(time.Millisecond), retainInterval)
+	log.Printf("[AUTOMATED COMPACTION] ClickHouse tables pruned in %s (retain interval %d blocks)", time.Since(start).Round(time.Millisecond), retainInterval)
 	return nil
 }
 {{else}}

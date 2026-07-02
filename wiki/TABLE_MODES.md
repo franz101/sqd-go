@@ -9,10 +9,17 @@ behaviours layered on top of it.
 |------|-------------|----------------|---------------------------|--------|
 | **1. Shared** *(DEFAULT — current behaviour, unchanged)* | *(none)* | `(chain, contract, event)` | Opt-in via `include_metadata: [contract_address]` | **Shipped** |
 | **2. Address as extra field** | `address_field: always` | `(chain, contract, event)` — same as default | **Mandatory** (always emitted) | Documented below; small change |
-| **3. Per-address table** | `table_mode: per_address` | `(chain, contract, address, event)` — finer than default | Opt-in (inherits the Mode-2 knob) | **PROPOSED** — see [PER_ADDRESS_TABLES_PLAN.md](../PER_ADDRESS_TABLES_PLAN.md) |
+| **3. Per-address table** | `table_mode: per_address` | `(chain, contract, address, event)` — finer than default | Opt-in (inherits the Mode-2 knob) | **PROPOSED** — tracked in [#47](https://github.com/franz101/sqd-go/issues/47) |
+| **4. Merged table (schema union)** | `table: <name>` on events | one table per **group of events** — coarser than default | Opt-in (inherits the Mode-2 knob); a `source` discriminator column is always added | **PROPOSED** — see [TABLE_MEGAPLAN.md](../TABLE_MEGAPLAN.md) |
 
 Modes 2 and 3 are **orthogonal** — `address_field` (column) and `table_mode`
-(grouping) compose as a clean 2×2.
+(grouping) compose as a clean 2×2. Mode 4 moves the grouping in the *opposite*
+direction (coarser instead of finer): several events — even from different
+contracts, with slightly different field sets — share one physical table whose
+columns are the **union** of all sources' fields; each source inserts only its
+own columns and the rest are left blank (ClickHouse defaults, or real `NULL`s
+with `nulls: true`). Design, blockers, and the full test plan live in
+[TABLE_MEGAPLAN.md](../TABLE_MEGAPLAN.md).
 
 ---
 
@@ -146,7 +153,7 @@ names, the custom processor, or hot-state.
 
 ---
 
-## Mode 3 — Per-Address Table (PROPOSED)
+## Mode 3 — Per-Address Table (PROPOSED, not implemented)
 
 Splits the grouping one level finer: **one table per individual address**, even
 for a single multi-address contract entry, with human-readable names via aliases
@@ -154,8 +161,10 @@ for a single multi-address contract entry, with human-readable names via aliases
 grouping key, and — unlike Mode 2 — it has real coupling to the custom processor
 and the ingestion table index that must be handled carefully.
 
-The full design, config syntax, and the confirmed implementation blockers live in
-**[PER_ADDRESS_TABLES_PLAN.md](../PER_ADDRESS_TABLES_PLAN.md)**.
+This mode is **not part of the shipped include-address behaviour** documented
+above (Modes 1 and 2). Its full design — config syntax, the "keep the Go type name
+stable" decision, the table-name algorithm, and the five confirmed implementation
+blockers (B1–B5) — is tracked in **[#47](https://github.com/franz101/sqd-go/issues/47)**.
 
 ---
 
@@ -177,5 +186,5 @@ many different contracts write into the same `memory_*` entity.
 
 The **state templates** are entity-keyed and therefore unaffected by table modes.
 ⚠️ **However**, for Mode 3 the *data source* that feeds a hot-state entity is
-bound to events by name/type — see the plan's "Hot-state coupling" section, which
-is precisely why Mode 3 must keep generated Go type names stable.
+bound to events by name/type — see blockers B1/B2 in [#47](https://github.com/franz101/sqd-go/issues/47),
+which are precisely why Mode 3 must keep generated Go type names stable.

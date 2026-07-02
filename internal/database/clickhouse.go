@@ -75,6 +75,9 @@ type SyncState struct {
 type EnsureTablesOptions struct {
 	StoreBlocks bool
 	StoreLogs   bool
+	// Codec is the per-column compression codec (e.g. "ZSTD(1)") appended to
+	// every column, or "" for the server default. See config.ColumnCodec.
+	Codec string
 }
 
 // NewClickHouse connects to ClickHouse via the native protocol, creates the
@@ -261,10 +264,12 @@ func (s *Store) EnsureTablesWithOptions(ctx context.Context, collapsing bool, op
 		DatabaseIdent string
 		Engine        string
 		Collapsing    bool
+		Codec         string
 	}{
 		DatabaseIdent: db,
 		Engine:        engine,
 		Collapsing:    collapsing,
+		Codec:         opts.Codec,
 	}
 
 	if opts.StoreBlocks {

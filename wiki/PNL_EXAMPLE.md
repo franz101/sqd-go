@@ -136,7 +136,7 @@ func init() {
 
 **In-place mutation**: `uint256.Int` methods mutate in place. `pos.Balance.Sub(&pos.Balance, &e.Value)` subtracts value from the existing balance.
 
-**Save with metadata**: `state.UserPosition.Save(pos, e.EventMeta)` marks the entity dirty and records the block/tx/log ordering. The framework commits dirty entities to ClickHouse at `STATE_SNAPSHOT_INTERVAL` blocks (default 4000).
+**Save with metadata**: `state.UserPosition.Save(pos, e.EventMeta)` marks the entity dirty and records the block/tx/log ordering. The framework commits dirty entities to ClickHouse on the commit interval — every `SQD_COMMIT_INTERVAL` blocks (default 5000) or `SQD_COMMIT_MAX_INTERVAL` (default 3s), whichever first. See [Custom Processor → Commit interval](CUSTOM_PROCESSOR.md).
 
 **Skip zero address**: `Transfer` events with `from = 0x0` are mints, `to = 0x0` are burns. Skip the zero-address side to avoid a synthetic wallet.
 
@@ -206,7 +206,7 @@ SQD HTTP → zstd JSONL → Parse → Decode Transfer events
                                        ↓
                            state.UserPosition.Get / Save
                                        ↓
-                        Every 4000 blocks: Commit to ClickHouse
+                     Commit interval (SQD_COMMIT_INTERVAL 5000 / 3s): Commit to ClickHouse
                                        ↓
                         Every CLICKHOUSE_PRUNE_INTERVAL blocks: Prune _log to
                         one snapshot per (pk, N-block bucket)
@@ -220,26 +220,6 @@ SQD HTTP → zstd JSONL → Parse → Decode Transfer events
 6. **State**: CLOCK cache maps with O(1) get/save. On cache eviction, cold tier (Pebble) serves the entry
 7. **Commit**: Dirty entities flushed to ClickHouse via native protocol (async insert)
 8. **Prune**: Every `CLICKHOUSE_PRUNE_INTERVAL` blocks the `_log` table is compacted to one snapshot per `(primary key, intDiv(block_number, interval))` bucket — bounding growth while keeping a block-bucketed history for points/time-series. Only rows more than 1000 blocks below the sync head are touched, so pruning never crosses the finalized head.
-
-## Recent Enhancements (2026)
-
-### Improved State Management
-
-- **Bounded Pruning** - State pruning now uses windowed operations to prevent ClickHouse OOM during mutations
-- **Disk Spillover** - Large aggregation operations can temporarily spill to disk for memory management
-- **Better Recovery** - Provisional checkpoint persistence at reindex floor enables safer recovery after failures
-
-### Performance Optimizations
-
-- **Zero-Allocation Paths** - Hot state operations are verified zero-allocation for maximum throughput
-- **CLOCK Cache** - Improved cache eviction policies for better hit rates on hot entities
-- **Snapshot Optimization** - Reduced memory footprint during snapshot operations
-
-### Enhanced Error Handling
-
-- **Collateral Validation** - For Polymarket processors, automatic collateral validation prevents scaling errors
-- **Decimal Precision** - Improved decimal handling for financial calculations using `protomath.Decimal256`
-- **Type Safety** - Enhanced type checking for schema definitions to prevent runtime errors
 
 ## Recent Enhancements (2026)
 

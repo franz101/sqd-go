@@ -259,8 +259,8 @@ func commitCustomProcessing(ctx context.Context, store Store, state *State, bloc
 			activeLower = state.LastSyncBlock - pruneInterval
 		}
 		// Runs off the consumer's hot path on a dedicated connection (see
-		// State.StartPrune / database.Store.PruneConn) so a multi-minute OPTIMIZE
-		// TABLE ... FINAL no longer stalls block processing. Errors surface on a
+		// State.StartPrune / database.Store.PruneConn) so the DELETE mutation
+		// no longer stalls block processing. Errors surface on a
 		// later PollPrune call, same as async commit errors above. pruneInterval
 		// doubles as the retain interval: the prune keeps one snapshot row per
 		// (pk, intDiv(block_number, pruneInterval)) bucket (see CompactionPruneState),
@@ -432,7 +432,7 @@ func NewProcessor(protoMode bool) (*Processor, error) {
 	// Fail loudly on the most common silent-no-op: proto mode is on (the
 	// default) but the project only registered CustomProcessFn. In proto mode
 	// the runtime calls CustomProcessProtoFn, so Process would never run and the
-	// derived-state tables would stay empty with no error. See docs/GO_MODULES.md.
+	// derived-state tables would stay empty with no error. See wiki/GO_MODULES.md.
 	if protoMode && CustomProcessProtoFn == nil && CustomProcessFn != nil {
 		return nil, fmt.Errorf("proto mode is enabled but this project only registered generated.CustomProcessFn (CustomProcessProtoFn is nil): your Process() would never run and derived-state tables would stay empty. Re-run with --no-proto for the single-function path, or also set generated.CustomProcessProtoFn for proto mode")
 	}
@@ -1114,13 +1114,23 @@ func (p *Processor) Flush(ctx context.Context, store *sqd.Store, blockNumber uin
 	return p.State.LastSyncBlock, nil
 }
 
-// SetSnapshotsEnabled toggles in-memory fork-recovery snapshots. Disabled during
-// finalized backfill (no reorgs) to remove the dominant GC/memory cost.
+// SetSnapshotsEnabled toggles the fork-recovery rollback journal. Disabled
+// during finalized backfill (no reorgs) to remove the capture cost.
 func (p *Processor) SetSnapshotsEnabled(enabled bool) {
 	if p == nil || p.State == nil {
 		return
 	}
 	p.State.SetSnapshotsEnabled(enabled)
+}
+
+// PruneRollback drops rollback-journal segments ending at or below the
+// finalized head (a reorg can never rewind below finality). Forwarded from the
+// ingestion layer as finality advances.
+func (p *Processor) PruneRollback(finalizedBlock uint64) {
+	if p == nil || p.State == nil {
+		return
+	}
+	p.State.PruneRollback(finalizedBlock)
 }
 
 // EnablePrefetch turns on the two-pass batch prefetch (--prefetch): each block is

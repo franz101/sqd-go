@@ -641,6 +641,7 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 		Columns                []colData
 		Key                    string
 		PrimaryKey             string
+		Codec                  string
 	}
 
 	tmplData := struct {
@@ -653,6 +654,7 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 		IncludeBlockHash       bool
 		IncludeContractAddress bool
 		IncludeTransactionHash bool
+		Codec                  string
 	}{
 		DatabaseIdent:          quoteSQLIdent(cfg.Name),
 		StoreBlocks:            cfg.ShouldStoreBlocks(),
@@ -663,6 +665,7 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 		IncludeBlockHash:       cfg.MetadataIncluded("block_hash"),
 		IncludeContractAddress: cfg.MetadataIncluded("contract_address"),
 		IncludeTransactionHash: cfg.MetadataIncluded("transaction_hash"),
+		Codec:                  cfg.ColumnCodec(),
 	}
 
 	var b strings.Builder
@@ -706,6 +709,7 @@ func generateSchemaSQL(cfg *config.Config, events []eventSpec) string {
 			Columns:                cols,
 			Key:                    eventOrderBy(ev),
 			PrimaryKey:             eventPrimaryKey(ev),
+			Codec:                  tmplData.Codec,
 		}
 
 		b.WriteString(template.MustExecute("sql/createEventTable", evData))

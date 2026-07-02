@@ -27,9 +27,17 @@ func New{{.KeyType}}(value {{.GoTypeName}}) {{.KeyType}} {
 	{{.BaseName}}Resolver *{{.ResolverType}}
 {{- if not .IsEvent}}
 	dirty{{.BaseName}} map[{{.KeyType}}]struct{}
+	jrnSeen{{.BaseName}} map[{{.KeyType}}]struct{}
+	jrn{{.BaseName}} []{{.BaseName}}Undo
 {{- end}}
 {{- end}}
 	mu sync.Mutex
+	// journalOn enables rollback pre-image capture in Update*: the first write
+	// to a key per journal segment records the key's prior value (or absence)
+	// so State can rewind the hot state across a reorg from a small on-disk
+	// journal instead of full in-memory snapshots (O(keys touched) per segment
+	// instead of O(entire hot state)).
+	journalOn bool
 	// coldAuthoritative is set when the cold tier was opened against an empty
 	// ClickHouse (from-genesis backfill): a hot+cold miss is then provably new,
 	// so the lazy state Get skips the ClickHouse point-SELECT entirely.
@@ -155,6 +163,90 @@ func (s *HotState) SetRecordMode(on bool) {
 
 func (s *HotState) RecordMode() bool {
 	return s != nil && s.recordMode
+}
+
+{{range .Specs}}{{if not .IsEvent}}// {{.BaseName}}Undo is one rollback-journal record: the value of Key before its
+// first write in the current journal segment. Had=false means the key was
+// absent from hot+cold at capture time; a rewind then deletes it and reads
+// fall through to the rolled-back database (correct: the fork rollback runs
+// before the state rewind).
+type {{.BaseName}}Undo struct {
+	Key {{.KeyType}}
+	Val {{.GoTypeName}}
+	Had bool
+}
+
+{{end}}{{end}}// journalBatch holds the pre-image records captured since the last seal, one
+// slice per entity. Value copies only — safe to encode off the hot ring.
+type journalBatch struct {
+{{- range .Specs}}{{if not .IsEvent}}
+	{{.BaseName}} []{{.BaseName}}Undo
+{{- end}}{{end}}
+}
+
+func (b *journalBatch) empty() bool {
+	if b == nil {
+		return true
+	}
+	return true{{range .Specs}}{{if not .IsEvent}} && len(b.{{.BaseName}}) == 0{{end}}{{end}}
+}
+
+// SetJournal toggles rollback pre-image capture (see journalOn). Turning it
+// off drops any captured records.
+func (s *HotState) SetJournal(on bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.journalOn = on
+	if on {
+{{- range .Specs}}{{if not .IsEvent}}
+		if s.jrnSeen{{.BaseName}} == nil {
+			s.jrnSeen{{.BaseName}} = make(map[{{.KeyType}}]struct{})
+		}
+{{- end}}{{end}}
+		return
+	}
+{{- range .Specs}}{{if not .IsEvent}}
+	s.jrnSeen{{.BaseName}} = nil
+	s.jrn{{.BaseName}} = nil
+{{- end}}{{end}}
+}
+
+// journalCollect moves the captured pre-image records out of the hot state and
+// resets the per-segment dedup, starting a new journal segment. MUST be called
+// from the single consumer goroutine (same discipline as snapshotDirty).
+func (s *HotState) journalCollect() *journalBatch {
+	jb := &journalBatch{}
+	if s == nil {
+		return jb
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+{{- range .Specs}}{{if not .IsEvent}}
+	jb.{{.BaseName}} = s.jrn{{.BaseName}}
+	s.jrn{{.BaseName}} = nil
+	if len(s.jrnSeen{{.BaseName}}) > 0 {
+		clear(s.jrnSeen{{.BaseName}})
+	}
+{{- end}}{{end}}
+	return jb
+}
+
+// journalApply rewinds one segment: every record restores its key to the
+// pre-segment value (or deletes it). Records are deduplicated per segment so
+// application order does not matter.
+func (s *HotState) journalApply(jb *journalBatch) {
+	if s == nil || jb == nil {
+		return
+	}
+{{- range .Specs}}{{if not .IsEvent}}
+	for i := range jb.{{.BaseName}} {
+		u := &jb.{{.BaseName}}[i]
+		s.Restore{{.GoTypeName}}(u.Key, u.Val, u.Had)
+	}
+{{- end}}{{end}}
 }
 
 func (s *HotState) ResolveAllPending(ctx context.Context, conn *ch.Client, db string) error {
@@ -324,8 +416,16 @@ func (s *HotState) resolveAllParallel(ctx context.Context, conns []*ch.Client, d
 {{range .Specs}}{{if not .IsEvent}}func (s *HotState) Update{{.GoTypeName}}(value {{.GoTypeName}}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := New{{.KeyType}}(value)
+	if s.journalOn {
+		if _, seen := s.jrnSeen{{.BaseName}}[key]; !seen {
+			old, had := s.{{.BaseName}}.Get(key)
+			s.jrn{{.BaseName}} = append(s.jrn{{.BaseName}}, {{.BaseName}}Undo{Key: key, Val: old, Had: had})
+			s.jrnSeen{{.BaseName}}[key] = struct{}{}
+		}
+	}
 	s.{{.BaseName}}.Set(value)
-	s.dirty{{.BaseName}}[New{{.KeyType}}(value)] = struct{}{}
+	s.dirty{{.BaseName}}[key] = struct{}{}
 }
 
 {{end}}{{end}}// commitBatches holds the column batches snapshotted from the dirty sets, ready to

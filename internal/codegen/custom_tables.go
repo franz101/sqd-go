@@ -226,6 +226,7 @@ type customTableTmplData struct {
 	Columns       []customColumnTmplData
 	PrimaryKey    string
 	OrderBy       string
+	Codec         string
 }
 
 type customColumnTmplData struct {
@@ -255,6 +256,7 @@ func generateCustomSchemaSQL(cfg *config.Config, tables []customTableSpec) strin
 			Engine:        table.Engine,
 			PrimaryKey:    strings.Join(quoteEach(table.PrimaryKey), ", "),
 			OrderBy:       strings.Join(quoteEach(table.OrderBy), ", "),
+			Codec:         cfg.ColumnCodec(),
 		}
 		for _, col := range table.Columns {
 			tmpl.Columns = append(tmpl.Columns, customColumnTmplData{

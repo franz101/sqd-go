@@ -13,7 +13,7 @@ import (
 
 	// sqd is the PUBLIC facade. A custom processor imports this, never the
 	// module's internal/ packages, so an indexer project can build as its own
-	// standalone Go module. See docs/GO_MODULES.md.
+	// standalone Go module. See wiki/GO_MODULES.md.
 	"github.com/franz101/sqd-go/sqd"
 )
 
@@ -21,7 +21,7 @@ import (
 // hot-state entities declared in custom_schema.go) and the decoded ParsedBlock.
 // Iterate block.EventsIter() and type-switch on the generated event structs.
 // Every event embeds the always-present EventMeta fields (BlockNumber,
-// BlockTimestamp, TransactionIndex, LogIndex, ...) — see docs/EVENT_FIELDS.md.
+// BlockTimestamp, TransactionIndex, LogIndex, ...) — see wiki/EVENT_FIELDS.md.
 //
 // This processor tracks, per address, the cumulative LBTC sent and received.
 func Process(state *generated.State, block *generated.ParsedBlock) error {
