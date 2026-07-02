@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS %s.blocks (
 				DatabaseIdent string
 				Engine        string
 				Collapsing    bool
+				Codec         string
 			}{
 				DatabaseIdent: db,
 				Engine:        tt.engine,
@@ -120,6 +121,7 @@ func TestCreateLogsTable_Parity(t *testing.T) {
 				DatabaseIdent string
 				Engine        string
 				Collapsing    bool
+				Codec         string
 			}{
 				DatabaseIdent: db,
 				Engine:        tt.engine,
